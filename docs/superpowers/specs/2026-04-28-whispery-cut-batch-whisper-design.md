@@ -252,6 +252,14 @@ pub mod core;
 // API (so consumers don't need to add a separate `mediatime`
 // dependency just to name them; they may still do so to call
 // methods like `rescale_to`).
+//
+// SemVer note: re-exporting mediatime types ties whispery's public
+// API to mediatime's. A breaking change in mediatime (major-version
+// bump) is automatically a breaking change for whispery, so the
+// `mediatime` dependency is pinned to a single major in Cargo.toml
+// and bumping it requires a coordinated whispery major release.
+// Consumers can also depend on mediatime directly at the same major
+// to avoid type aliasing issues.
 pub use mediatime::{Timebase, Timestamp, TimeRange};
 
 pub use types::{
@@ -853,6 +861,9 @@ impl VadSegment {
     /// which break alignment and confuse downstream consumers.
     /// silero never produces zero-duration segments; the
     /// constructor surfaces programmer error at the boundary.
+    ///
+    /// `panic!` in `const fn` is stable on Rust ≥ 1.57; the
+    /// crate's MSRV (≥ 1.85, inherited from siblings) covers this.
     pub const fn new(start_sample: u64, end_sample: u64) -> Self;
 
     pub const fn start_sample(&self) -> u64;
@@ -2076,6 +2087,7 @@ These exercise specific defects caught during the design-review rounds; landing 
 - **Empty packet handling.** `push_samples(next_expected_starts_at(), &[])` returns `Ok(())` and does not advance state; `push_vad_segment` after still works.
 - **Zero-duration `VadSegment::new`.** Constructor panics; this is enforced via `#[should_panic]` test.
 - **PtsRegression in output-PTS space, not 16k space (M-δ).** Output_tb 30000/1001 (NTSC), strictly contiguous packet pushes for 100 packets via `next_expected_starts_at()` — assert no spurious `PtsRegression`.
+- **`Lang` canonicalisation invariant.** For every named variant `V` in Appendix C, assert `Lang::from_iso639_1(V.as_str()) == V` and that the result does NOT match the `Lang::Other(_)` pattern. The first half tests round-trip; the second pins the contract that named codes never end up in `Other`. A pure-`Other` round-trip — `Lang::from_iso639_1("zzz") == Lang::Other("zzz".into())` — is also asserted.
 
 ### 10.5 CI matrix
 
