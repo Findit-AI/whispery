@@ -65,23 +65,36 @@ The design is **backend-agnostic in the core**: swapping whisper-rs for candle-w
 - **Resampling.** Caller delivers 16 kHz; we do not own ffmpeg or libsamplerate logic.
 - **Async runner.** No `tokio` dependency in v1. The runner exposes a sync push + sync poll API.
 - **Live captioning latency profile.** We optimise for indexing throughput; v1 cuts at ≤ ~30 s chunks for max Whisper quality. Tuning a sub-second-latency profile is deferred to v1.x.
-- **DTW token timestamps.** Word-level timestamps come from forced alignment only; whisper.cpp's DTW path is not enabled.
 - **Auto-downloading wav2vec2 models.** Callers register paths explicitly. Auto-fetch is a v2 add-on that doesn't change the API.
 - **Bundled model files.** v1 ships with no checked-in GGUF or wav2vec2 weights. Callers point at on-disk model paths.
+
+- **DTW token timestamps.** v1 does not enable DTW. The reasoning is concrete: whisper.cpp's DTW path is set at `WhisperContext` construction (`WhisperContextParameters::dtw_parameters`) and is mutually exclusive with `flash_attn`; enabling it has measurable inference-time cost on larger models for a result that is *less accurate* than wav2vec2 forced alignment. v1's `Transcript.words` come exclusively from wav2vec2 + CTC. v2 may add DTW as an alignment-fallback option for languages without a registered wav2vec2 aligner; that decision is deferred and does not change the public surface.
 
 ### 1.6 Integration with diarization (speaker-agnostic by design)
 
 whispery is speaker-agnostic. Diarization runs as a sibling of whispery on the same source audio, not upstream or downstream of it; the indexer joins the two outputs by time-range overlap.
 
-**Join contract (verified against `dia` v0.1.0).** The findit-studio diarization crate `dia` (in `/Users/user/Develop/findit-studio/dia`) emits `DiarizedSpan` values with a `range: mediatime::TimeRange` at the **same 1/16000 timebase** as whispery's `Word.range`. The minimal join is therefore an interval-overlap test on the shared timebase — no rescaling, no anchor types, no whispery-side speaker awareness:
+**Join contract (verified against `dia` v0.1.0).** The findit-studio diarization crate `dia` (in `/Users/user/Develop/findit-studio/dia`) emits `DiarizedSpan` values with a `range()` accessor returning `mediatime::TimeRange` at the **1/16000 analysis timebase** (dia operates on resampled 16 kHz audio just like whispery internally does). Whispery's *output* `TimeRange`s are in the caller-chosen output timebase (§4.1) — typically the original media's timebase. The indexer therefore performs an interval-overlap test across timebases; `mediatime::TimeRange` supports cross-timebase comparison via 128-bit cross-multiply (no rescaling, no precision loss). Equivalent paths:
+
+- Indexer rescales each `DiarizedSpan.range()` to the output timebase before insertion into its overlap index.
+- Indexer keeps dia spans at 1/16000, rescales `Word.range()` to 1/16000 on each lookup.
+- Indexer uses mediatime's cross-timebase semantic comparison directly via `IntervalTree<TimeRange, ...>` — supported because `mediatime::TimeRange` implements `Ord` semantically (not by tuple).
+
+All three are sample-accurate when the output timebase is a clean multiple of 16 kHz (1/48000 = 3×, 1/8000 = ½×); see §4.1 for non-integer-ratio behaviour.
+
+dia exposes a sync push-callback streaming API (`Diarizer::process_samples<F>(.., emit: F)` where `F: FnMut(DiarizedSpan)`); the indexer collects emitted `DiarizedSpan`s into its own time-indexed structure and runs interval-overlap queries against it as `Transcript`s arrive. The lookup index, the overlap query, and the indexer-side row structure are entirely the indexer's glue — they are not part of any crate. Sketch (indexer code, *not* a whispery API):
 
 ```rust
-// indexer-side pseudo-code
+// Indexer collects dia spans into an interval index keyed by 1/16000 PTS.
+let mut spans_by_time = IntervalTree::<TimeRange, DiarizedSpan>::new();
+diarizer.process_samples(.., |span| spans_by_time.insert(span.range(), span))?;
+
+// As whispery emits transcripts, join each word against overlapping dia spans.
 for word in transcript.words() {
-    for span in dia_spans_overlapping(word.range()) {
+    for span in spans_by_time.overlapping(word.range()) {
         index.insert(WordRow {
             chunk_id: transcript.chunk_id(),
-            word_text: word.text(),
+            word_text: word.text().to_owned(),
             range: word.range(),
             speaker_id: Some(span.speaker_id()),
             speaker_first_seen: span.is_new_speaker(),
@@ -101,6 +114,9 @@ pub struct DiarizedSpan {
     activity_count: u32,
     clean_mask_fraction: f32,
 }
+// Access via accessors: span.range(), span.speaker_id(),
+// span.is_new_speaker(), span.average_activation(),
+// span.activity_count(), span.clean_mask_fraction().
 ```
 
 `Transcript.vad_segments()` is the secondary anchor when overlap is ambiguous (e.g., a word that straddles silence inside the merged chunk): the indexer should weight overlap with VAD segments more heavily than overlap with the chunk's outer `range`.
@@ -109,7 +125,7 @@ pub struct DiarizedSpan {
 
 - whispery does not consume `DiarizedSpan`s. It does not depend on the `dia` crate.
 - whispery does not assign or track speaker IDs. `dia`'s speaker IDs are session-local `u64`s; cross-file speaker stability is the indexer's concern (a global cluster table keyed by embeddings, owned outside both whispery and dia).
-- whispery does not need to expose phonetic-level timestamps or per-VAD-segment confidence. The 1/16000 sample-accurate `Word.range` is sufficient for `dia`'s overlap-based join.
+- whispery does not need to expose phonetic-level timestamps or per-VAD-segment confidence. The sample-accurate `Word.range` (in output timebase, derived from a 16 kHz analysis index — sub-sample-accurate when the output timebase is integer-ratio related to 16 kHz) is sufficient for dia's overlap-based join.
 
 This section pins the join contract; if a future `dia` revision introduces a different output shape, this spec must be revisited.
 
@@ -129,6 +145,29 @@ If a wrapper service is later required for IPC isolation, it is a separately-shi
 4. **Indexing-first.** Throughput over latency. Default chunk size is 30 s for Whisper quality; default worker count is `num_cpus` or a reasonable cap.
 5. **mediatime everywhere.** All emitted ranges are `mediatime::TimeRange` at a sample-rate-derived timebase. Downstream code that prefers ms or NTSC frame rate `rescale_to` it.
 6. **Backend-agnostic core.** The state machine emits commands ("please run whisper on these samples") and consumes results; it does not name `whisper-rs` or `ort`.
+
+### 2.1 Scope of inherited conventions
+
+This crate inherits *some* idioms from its sibling crates (silero, soundevents, textclap, dia) and introduces *others* unique to whispery. Being explicit so future maintainers don't pick precedents from a fictional version of the siblings:
+
+**Genuinely inherited from one or more siblings:**
+
+- Private fields with getter accessors (silero, soundevents, dia, textclap).
+- `thiserror`-derived error enums (all siblings).
+- Builder pattern with both consuming `with_*` and in-place `set_*` accessors (silero, soundevents).
+- `cfg`-gating for optional model bundling and feature-conditional public surface (silero, soundevents).
+- Crate-level `#![deny(missing_docs)]` and `#![forbid(unsafe_code)]` (silero).
+- ort version pin matching `=2.0.0-rc.12` (silero, soundevents, textclap, dia).
+- `mediatime::TimeRange` for emitted ranges (dia uses 1/16000; whispery uses the caller's output timebase per §4.1, but the type itself is the shared currency).
+
+**Whispery-original (not inherited):**
+
+- The Sans-I/O `core/` module split with feature-gated `runner/`. silero/soundevents are flat single-tier modules; dia uses Sans-I/O at the orchestrator level but does not split into a separate runner module. This split is whispery's choice driven by the cut/dispatch logic being meaningfully testable without ML deps.
+- `mediatime::Timestamp` in `push_samples` to anchor the output timebase. silero's interfaces use raw sample indices and have no mediatime types. The two-timebase model (§4.1) is whispery-specific.
+- `smol_str::SmolStr` for language codes and word text. textclap uses `smol_str` internally; siblings do not on their public surface.
+- `smallvec::SmallVec` for inline-sized parameter collections. No sibling exposes smallvec on its public surface; this is a whispery internal optimisation surfaced only on `AsrParams`.
+
+**Specifically not isomorphic despite naming similarity:** whispery's `VadSegment { start_sample: u64, end_sample: u64 }` carries the same 16 kHz sample indices silero produces, but in a two-field shape (no `sample_rate` because whispery requires 16 kHz throughout). silero's `SpeechSegment::new(start_sample, end_sample, sample_rate)` is three positional fields with `Copy`. Conversion at the boundary is one constructor call.
 
 ---
 
@@ -179,8 +218,8 @@ whispery/
 | Feature        | Default | Pulls                                        | Notes |
 |----------------|:-:|---------------------------------------------|-------|
 | `std`          | yes | `alloc` + `std`                              | Core compiles to no_std + alloc with this off; runner is std-only. |
-| `runner`       | yes | `whisper-rs ^0.13`, `crossbeam-channel ^0.5` | The bundled production runner. Whisper-rs version pinned to a specific compatible major; revisited per release. |
-| `alignment`    | no  | `ort = "2.0.0-rc.12"`, `tokenizers ^0.23`, `ndarray ^0.16` | **Opt-in.** Forced-alignment pieces in the runner. Pulls the heaviest deps in the tree (~150 MB of build artefacts). Without this feature, `Transcript.words` is always empty. ort version matches silero/soundevents/textclap. |
+| `runner`       | yes | `whisper-rs ^0.13`, `crossbeam-channel ^0.5`, `num_cpus ^1` | The bundled production runner. Whisper-rs version pinned to a specific compatible major; revisited per release. |
+| `alignment`    | no  | `ort = "=2.0.0-rc.12"`, `tokenizers ^0.23`, `ndarray ^0.16` | **Opt-in.** Forced-alignment pieces in the runner. Pulls the heaviest deps in the tree (~150 MB of build artefacts). Without this feature, `Transcript.words` is always empty. ort exact-pinned with `=` (Cargo's pre-release semantics would otherwise accept the 2.0.0 final and break siblings); same pin as silero/soundevents/textclap. |
 | `serde`        | no  | `serde ^1`                                   | Derive Serialize/Deserialize on public types. |
 | `arbitrary`    | no  | `arbitrary ^1`                               | Fuzz harnesses. |
 | `quickcheck`   | no  | `quickcheck ^1`                              | Property tests. |
@@ -203,7 +242,7 @@ pub use types::{
 pub use core::{
     Transcriber, TranscriberConfig, LanguagePolicy,
     Command, Event,
-    AsrParams, AsrResult, AsrTokenHint,
+    AsrParams, AsrResult, SamplingStrategy,
 };
 
 #[cfg(feature = "runner")]
@@ -212,7 +251,7 @@ pub mod runner;
 #[cfg(feature = "runner")]
 pub use runner::{
     ManagedTranscriber, ManagedTranscriberBuilder,
-    WhisperPoolConfig, Device,
+    WhisperPoolConfig,
     AsrParamsOverride, RunnerError,
 };
 
@@ -229,33 +268,101 @@ pub use runner::{
 
 The runner depends on the core; the core does not name anything in the runner. Enforced at module level: `core/` modules `use` only `crate::types`, `crate::time`, and standard alloc/core types. `runner/` modules may freely call into `core/`.
 
-**Backend invariant.** The core's `AsrParams`, `AsrResult`, and `AsrTokenHint` types contain only universal ASR knobs (language hint, beam size, suppress tokens, temperature schedule, no_speech_threshold). They must not name `whisper-rs` types directly, must not include whisper.cpp-specific config fields, and must not require the runner to extend them with whisper-only options. Any whisper-rs-specific tuning lives in the runner (`WhisperPoolConfig`) and is consumed by the runner's worker thread, not shipped through the state machine. This invariant is what makes a future swap to candle-whisper or a CTranslate2 binding a runner-only change.
+**Backend invariant.** The core's `AsrParams`, `AsrResult`, and `SamplingStrategy` types contain only universal ASR knobs (language hint, beam params, no_speech threshold, temperature ladder parameters). They must not name `whisper-rs` types directly, must not include whisper.cpp-specific config fields, and must not require the runner to extend them with whisper-only options. Any whisper-rs-specific tuning lives in the runner (`WhisperPoolConfig`) and is consumed by the runner's worker thread, not shipped through the state machine. This invariant is what makes a future swap to candle-whisper or a CTranslate2 binding a runner-only change. Each `AsrParams` field corresponds to either a whisper-rs `FullParams` setter or a parameter the runner consumes for its temperature retry loop; nothing aspirational lives there.
 
 ---
 
 ## 4. Public types
 
-### 4.1 Time
+### 4.1 Time — internal 16 kHz indexing, external caller-chosen timebase
 
-All emitted time ranges use a 16 kHz timebase, so PTS values are sample indices.
+Whispery operates on **two timebases**:
+
+- **Internal (analysis) timebase = 1/16 000.** All cut decisions, SampleBuffer indexing, and CTC alignment happen in 16 kHz sample-index space. This matches silero, soundevents, and dia internally.
+- **External (output) timebase = caller-chosen.** Every public `TimeRange` whispery emits — `Transcript.range`, `Word.range`, `Transcript.vad_segments`, error chunk identifiers — is in the **same timebase as the caller's input `Timestamp`s**. The caller establishes this when they make their first `push_samples` call; subsequent calls must use the same timebase.
+
+This matters because the indexer's downstream consumers (textclap at 48 kHz, lancedb rows that reference back to original media, the playback UI that seeks within the source file) want timestamps in the *original media's* time space, not in the resampled-for-analysis 16 kHz space. silero's `SpeechSegment` carries 16 kHz sample indices because silero is purely an analysis library; whispery sits one layer up and is responsible for translating analysis-time back to source-media time.
 
 ```rust
+use core::num::NonZeroU32;
+
+/// The internal analysis sample rate. All audio fed to whispery
+/// must already be resampled to this rate (caller's responsibility).
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 
-const SAMPLE_RATE_NZ: NonZeroU32 = match NonZeroU32::new(SAMPLE_RATE_HZ) {
-    Some(n) => n,
-    None => panic!("SAMPLE_RATE_HZ is nonzero"),
-};
+/// Const helper for NonZeroU32 conversion (panic-on-zero is fine for
+/// compile-time evaluation; the value is statically known nonzero).
+const fn nz(n: u32) -> NonZeroU32 {
+    match NonZeroU32::new(n) {
+        Some(n) => n,
+        None => panic!("expected nonzero u32"),
+    }
+}
 
-/// 1 / 16_000 — PTS values are sample counts.
-pub const TIMEBASE: mediatime::Timebase = mediatime::Timebase::new(1, SAMPLE_RATE_NZ);
+const SAMPLE_RATE_NZ: NonZeroU32 = nz(SAMPLE_RATE_HZ);
+
+/// Internal analysis timebase. Used by SampleBuffer, the cut state
+/// machine, and the alignment pipeline. Not visible on whispery's
+/// public output surface — every emitted `TimeRange` is in the
+/// caller's external timebase.
+pub const ANALYSIS_TIMEBASE: mediatime::Timebase =
+    mediatime::Timebase::new(1, SAMPLE_RATE_NZ);
 ```
 
-The `match` form for `NonZeroU32::new` keeps the constant evaluable on stable Rust without depending on `Option::unwrap`'s const stabilisation timeline. `mediatime::Timebase::new` is `const fn`; if a future mediatime release relaxes that, this becomes a `pub fn timebase() -> Timebase` accessor.
+`mediatime::Timebase::new` is `const fn` and accepts `(u32, NonZeroU32)`. The local `nz` helper sidesteps `Option::unwrap`'s const stabilisation timeline.
 
-**Round-trip constraint with downstream consumers.** textclap operates on 48 kHz audio and slices using the same time anchors. 48 000 / 16 000 = 3 exactly, so any `TimeRange` whispery emits at the 1/16000 timebase round-trips losslessly to a 1/48000 timebase via `mediatime::TimeRange::rescale_to`. Introducing a non-integer-ratio intermediate sample rate downstream would break this; documented here so future changes don't silently lose sample alignment.
+#### 4.1.1 The output timebase is fixed by the first `push_samples`
 
-Downstream consumers call `.rescale_to(other_tb)` to express the same instants in their preferred timebase (ms, NTSC frame rate, 48 kHz, etc.).
+`Transcriber::push_samples(&mut self, starts_at: mediatime::Timestamp, samples: &[f32])` accepts a `Timestamp` whose timebase is *whatever the caller chose for source-media time*. Common choices:
+
+- 1/48 000 — when the source media is sampled at 48 kHz (typical for textclap-aligned outputs).
+- 1/90 000 — MPEG-TS standard.
+- 1/1 000 — millisecond PTS.
+- 30 000/1 001 — NTSC frame rate, when transcripts must align to video frames.
+
+The first `push_samples` call records the caller's timebase as the **output timebase** for the entire `Transcriber` lifetime. Subsequent pushes that use a different timebase are rejected with `TranscriberError::InconsistentTimebase`. The output timebase is also exposed via `Transcriber::output_timebase()`.
+
+#### 4.1.2 Sample-index ↔ output-timebase translation
+
+Internally, whispery indexes samples by 16 kHz sample count from the start of the stream. To translate a 16 kHz sample index `s` to an output-timebase `Timestamp`, whispery uses `mediatime::Timebase::rescale_pts`:
+
+```rust
+// in Transcriber, after first push_samples
+let base_pts: i64        = starts_at.pts();             // output tb
+let output_tb: Timebase  = starts_at.timebase();
+// to translate sample index s (16 kHz) to output-tb pts:
+let output_pts = base_pts + Timebase::rescale_pts(s as i64, ANALYSIS_TIMEBASE, output_tb);
+```
+
+`rescale_pts` uses 128-bit cross-multiply; it's exact for integer-ratio rates (16k → 48k = 3×) and saturates for non-integer ratios (16k → 90k = 5.625×) at `i64::MAX/MIN` rather than erroring. The 16k → 48k path is exact and sample-aligned; non-integer ratios give the closest representable PTS, which for indexing pipelines is well below the user-visible threshold.
+
+#### 4.1.3 silero ↔ whispery boundary conversion
+
+The caller takes a `silero::SpeechSegment { start_sample, end_sample, sample_rate: SampleRate::Hz16000 }` and converts it to a whispery `VadSegment` carrying the same 16 kHz sample indices:
+
+```rust
+// indexer-side glue
+let v = VadSegment::new(
+    silero_segment.start_sample(),    // u64 at 16 kHz
+    silero_segment.end_sample(),      // u64 at 16 kHz
+);
+transcriber.push_vad_segment(v)?;
+```
+
+Whispery does the sample-index → output-timebase conversion internally when building MergedChunks and downstream `Transcript`s; the caller never touches output-timebase arithmetic for VAD inputs.
+
+**Working with mediatime instants.** `mediatime` does not implement `Add` / `Sub` operators on `Timestamp` or `Duration`; arithmetic uses methods:
+
+- `Timestamp::duration_since(&earlier) -> Option<core::time::Duration>` — Some when `self >= earlier`.
+- `Timestamp::saturating_sub_duration(d) -> Timestamp` — for backing off by a duration.
+- `Timestamp::rescale_to(target_timebase) -> Timestamp` — saturates to `i64::MAX/MIN` on overflow rather than returning an error.
+- `Timebase::rescale_pts(pts, from_tb, to_tb) -> i64` — same saturation semantics.
+
+`mediatime::Duration` does **not** exist as a separate type; durations are `core::time::Duration`. Internal references in earlier drafts to `mediatime::Duration` are wrong; everything that reads "Duration" in this doc means `core::time::Duration`.
+
+**TimeRange invariants.** `mediatime::TimeRange::new(start, end, tb)` panics if `end < start`; the half-open invariant is enforced at construction. Whispery requires that callers hand it `VadSegment`s with validated `start_sample <= end_sample` (silero already guarantees this). Internal code paths that build a `TimeRange` from arithmetic should use `try_new` and surface programmer errors via panic messages rather than `Result`.
+
+**Round-trip constraint with downstream consumers.** Common output timebases round-trip losslessly to the 1/16000 analysis timebase if the rate is a clean multiple (1/48000 = 3×, 1/8000 = ½×). Non-integer ratios (1/90000 MPEG-TS, NTSC frame rate) are saturated to the nearest representable PTS, which is sub-millisecond and well below indexing-pipeline tolerances. A defensive assertion in tests guards against PTS values approaching `i64::MAX`. Downstream consumers can always call `.rescale_to(other_tb)` if they need yet another timebase.
 
 ### 4.2 Transcript
 
@@ -283,10 +390,12 @@ impl Transcript {
 
     /// Verbatim Whisper output for this chunk: includes punctuation, casing,
     /// and any model-emitted special characters. This is the canonical text
-    /// surface; downstream BM25/FTS indexes this directly. Word-by-word
-    /// surface forms (typically lowercased and punctuation-stripped) live in
-    /// `words[].text()` and are derived from this via the alignment
-    /// normalisation pipeline (§6.3).
+    /// surface; downstream BM25/FTS indexes this directly. The word-level
+    /// `words[].text()` values are the matching original surface forms with
+    /// punctuation and casing preserved (§6.3.2 step 9), recovered after
+    /// CTC alignment runs over a normalised form internally; joining
+    /// `words[].text()` is therefore *almost* the same as `text()`, modulo
+    /// whitespace glue and any words alignment dropped on a low-confidence path.
     pub fn text(&self) -> &str;
 
     /// Word-level alignment results, in time order. Empty when:
@@ -336,14 +445,18 @@ pub struct Word {
 }
 
 impl Word {
-    /// Surface form of the word as it appears in the alignment input
-    /// (typically lowercased and punctuation-stripped). The full
-    /// punctuated/cased text for the chunk lives on
-    /// `Transcript::text()`.
+    /// Original surface form of the word, preserving casing and
+    /// punctuation as Whisper emitted them. Recovered after CTC
+    /// alignment via the normalisation map (§6.3.2 step 9); the
+    /// word that wav2vec2 actually aligned was the lowercased,
+    /// punctuation-stripped form. This is the value that should
+    /// be displayed in click-to-play UIs and fed to BM25 if a
+    /// per-word index is built.
     pub fn text(&self) -> &str;
 
-    /// Sample-accurate range of the word in source-audio sample space
-    /// (1/16000 timebase). Half-open.
+    /// Sample-accurate range of the word in the caller's output
+    /// timebase (the timebase of the first push_samples Timestamp;
+    /// see §4.1). Half-open.
     pub fn range(&self) -> mediatime::TimeRange;
 
     /// Alignment confidence in [0, 1], NaN-free. Defined as
@@ -361,6 +474,7 @@ impl Word {
 A newtype around `SmolStr`. Whisper.cpp returns ISO 639-1 strings; we accept and emit the same. There is **no sentinel value**; `Lang` only ever holds a real ISO code. The "match any registered language" concept lives in the type system as `AlignerKey::Any` (§6.3), not as a magic `Lang` value.
 
 ```rust
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Lang(smol_str::SmolStr);
 
 impl Lang {
@@ -375,6 +489,8 @@ impl Lang {
 
 impl Display for Lang { /* writes the ISO code */ }
 ```
+
+`Hash + Eq` are required because `Lang` (wrapped in `AlignerKey::Lang`) is a `HashMap` key in `AlignmentSet`. `Clone` because the runner clones it into `AsrParams.language_hint`.
 
 The `from_iso639_1` constructor validates against Whisper.cpp's supported language set (lookup table); unknown codes return `InvalidLang`. Callers that want to accept arbitrary tags use a private constructor.
 
@@ -416,8 +532,6 @@ pub enum WorkFailure {
 }
 
 pub enum AsrFailureKind {
-    /// Whisper produced no tokens (silent or unintelligible chunk).
-    EmptyOutput,
     /// All temperatures in the fallback schedule were tried and
     /// every result violated `compression_ratio_threshold` or
     /// `log_prob_threshold`.
@@ -428,6 +542,13 @@ pub enum AsrFailureKind {
     /// Backend (whisper-rs) returned an error during inference.
     BackendError,
 }
+
+// Note: there is no `EmptyOutput` variant. A whisper-rs result with
+// zero segments is normal output — usually a silent chunk — and is
+// represented as a `Transcript` with empty `text` and an elevated
+// `no_speech_prob`. Treating empty output as a failure would convert
+// every silent chunk into Event::Error and contradict the
+// `no_speech_prob` field's semantics.
 
 pub enum AlignmentFailureKind {
     /// Wav2vec2 ONNX inference failed.
@@ -463,6 +584,8 @@ pub enum RunnerError {
 ```
 
 All public error types `impl Error + Display + Debug` via `thiserror`.
+
+**Two distinct error channels.** `RunnerError` is for *runner-level* failures returned synchronously from `process_packet`, `signal_eof`, `drain`, `build`: model load failure, channel disconnects, backpressure, push-order violations. `WorkFailure` is for *per-chunk inference* failures surfaced asynchronously via `Event::Error { chunk_id, error: WorkFailure }` (drained by `poll_error`). The dispatch loop guarantees these channels stay decoupled — a single chunk's ASR or alignment failure never causes `process_packet` to error; only structural runtime failures do.
 
 ---
 
@@ -527,13 +650,33 @@ impl Transcriber {
 }
 ```
 
-`VadSegment` is whispery's own type, structurally identical to silero's `SpeechSegment`. We accept it as input but do not depend on the silero crate; the runner's `examples/managed_runner.rs` shows how to convert.
+`VadSegment` carries silero-native 16 kHz sample indices. Whispery accepts these as input (private fields with getters) and does the analysis-time → output-timebase conversion internally, so the caller never needs to do PTS arithmetic for VAD inputs.
 
 ```rust
 pub struct VadSegment {
-    pub range: mediatime::TimeRange,
+    start_sample: u64,    // 16 kHz analysis-frame index
+    end_sample: u64,      // 16 kHz analysis-frame index, exclusive
+}
+
+impl VadSegment {
+    /// Panics if `end_sample < start_sample`. silero already
+    /// guarantees `start <= end`; the constructor exists to
+    /// surface programmer error.
+    pub const fn new(start_sample: u64, end_sample: u64) -> Self;
+
+    pub const fn start_sample(&self) -> u64;
+    pub const fn end_sample(&self) -> u64;
+    pub const fn sample_count(&self) -> u64;       // end - start
 }
 ```
+
+Conversion from `silero::SpeechSegment`:
+
+```rust
+let v = VadSegment::new(s.start_sample(), s.end_sample());
+```
+
+(Whispery does *not* depend on the silero crate; example only.)
 
 ### 5.2 TranscriberConfig
 
@@ -597,80 +740,142 @@ Locking rationale: Whisper's language detection on a single < 30 s window is unr
 
 ### 5.3 Cut state machine (`core/cut.rs`)
 
-A direct port of WhisperX's `merge_chunks`, restated as an incremental state machine, with one extension: hard-splitting any single VAD segment longer than `chunk_size`.
+A direct port of WhisperX's `merge_chunks`, restated as an incremental state machine, with one extension: hard-splitting any single VAD segment longer than `chunk_size`. All internal arithmetic is in 16 kHz sample-index space (`SampleRange`); conversion to the output timebase happens at emission time via `SampleBuffer::samples_to_output_range`.
 
 State:
 
 ```rust
 struct Cut {
-    chunk_size: Duration,                // mediatime::Duration
+    chunk_size_samples: u64,    // chunk_size duration × 16 kHz (e.g., 30 s × 16k = 480_000)
 
     // The chunk currently accumulating (None when between chunks).
-    current_start: Option<mediatime::Timestamp>,
-    current_end: mediatime::Timestamp,
-    current_subs: Vec<mediatime::TimeRange>,
+    current_start: Option<u64>,        // 16 kHz sample index, inclusive
+    current_end: u64,                  // 16 kHz sample index, exclusive
+    current_subs: Vec<SubRange>,
+}
+
+pub(crate) struct SubRange {
+    pub range: SampleRange,             // 16 kHz indices
+    pub origin: SubOrigin,
+}
+
+pub(crate) enum SubOrigin {
+    /// Came directly from a VadSegment as pushed.
+    Vad { vad_seq: u32 },               // monotonic counter assigned by Cut on push
+    /// Result of hard-splitting a VadSegment longer than chunk_size.
+    /// The full original VAD segment can be reconstructed by joining
+    /// all SubRanges with the same `vad_seq`.
+    HardSplit { vad_seq: u32, part: u8, total_parts: u8 },
 }
 
 /// Output of the cut state machine. Crate-private; the public
 /// surface only sees the resulting Transcript.
 pub(crate) struct MergedChunk {
-    pub start: mediatime::Timestamp,
-    pub end: mediatime::Timestamp,
-    pub subs: Vec<mediatime::TimeRange>,
+    pub range: SampleRange,                  // 16 kHz indices
+    pub subs: Vec<SubRange>,                  // 16 kHz indices, with provenance
 }
 ```
 
+`SubRange` carries the origin tag so downstream code (notably the alignment pipeline) can distinguish "this is one logical VAD segment" from "this is one slice of a hard-split long VAD segment." `Transcript.vad_segments()` exposes only the *logical* (joined-by-vad_seq) VAD segments, in output timebase, since indexer-side consumers care about original speech intervals; the hard-split fragments are an internal cut-stage detail.
+
 Transitions:
 
-- `push_segment(seg)`:
-  1. **Pre-split overlong segments.** If `seg.range.duration() > chunk_size`, split it into `⌈duration / chunk_size⌉` contiguous sub-ranges of length ≤ `chunk_size` and feed them through the normal path one at a time. The sub-ranges are recorded in `current_subs` exactly like any other segment, so provenance is preserved and downstream consumers see the original-segment boundaries via the join of consecutive sub-ranges.
-  2. If `current_start` is None: set it to `seg.range.start()`.
-  3. If `(seg.range.end() - current_start) > chunk_size` *and* `(current_end - current_start) > 0`:
-     - Emit a `MergedChunk { start: current_start, end: current_end, subs: take(current_subs) }`.
-     - Reset: `current_start = Some(seg.range.start())`, `current_subs.clear()`.
-  4. Update `current_end = seg.range.end()`, `current_subs.push(seg.range)`.
+- `push_segment(seg: VadSegment)`:
+  1. Allocate a fresh `vad_seq` (monotonic counter). Compute `len = seg.end_sample() - seg.start_sample()`.
+  2. **Pre-split overlong segments.** If `len > chunk_size_samples`, split into `n = ceil(len / chunk_size_samples)` **equal-length** sub-ranges (last fragment may be shorter by ≤ n-1 samples due to integer-division rounding; equal-length is the contract). Push each sub-range through steps 3–5 in order, with `SubOrigin::HardSplit { vad_seq, part: i, total_parts: n }`. Otherwise the segment becomes a single `SubRange { origin: SubOrigin::Vad { vad_seq } }`.
+  3. If `current_start` is None: set it to the sub-range's start sample index.
+  4. If `(sub.end - current_start) > chunk_size_samples` *and* `(current_end - current_start) > 0`:
+     - Emit `MergedChunk { range: SampleRange::new(current_start.unwrap(), current_end), subs: take(current_subs) }`.
+     - Reset: `current_start = Some(sub.start)`, `current_subs.clear()`.
+  5. Update `current_end = sub.end`, `current_subs.push(sub)`.
 - `flush()` (called on EOF):
   - If `current_start` is Some: emit the trailing chunk, reset.
 
 The state machine guarantees:
 
-1. **Monotonicity.** Output `MergedChunk`s are non-overlapping and strictly ordered by start time.
-2. **Strict bound.** No emitted chunk spans more than `chunk_size`. The previous draft's bound (`chunk_size + max(seg_duration)`) was wrong: a single VAD segment longer than `chunk_size` would have been absorbed whole, because the `(current_end - current_start) > 0` guard fails on first entry to a new chunk. With the pre-split rule above, any segment whose duration exceeds `chunk_size` is broken into ≤ `chunk_size` pieces *before* the merge logic sees it, so the bound becomes a true `chunk_size`. This matters because Whisper's encoder is hard-capped at 30 s; a chunk over 30 s is silently truncated by whisper.cpp and alignment then runs against audio Whisper never transcribed.
-3. **Provenance preserved.** `subs` lists every VAD segment (or hard-split sub-segment) whose union forms the chunk; downstream consumers know the precise speech-only intervals.
+1. **Monotonicity.** Output `MergedChunk`s are non-overlapping and strictly ordered by start sample.
+2. **Strict bound.** No emitted `MergedChunk.range` spans more than `chunk_size_samples`. The previous draft's bound (`chunk_size + max(seg_duration)`) was wrong; the pre-split rule with **equal-length** fragments enforces a true ≤ `chunk_size` ceiling, never violated. This matters because Whisper's encoder is hard-capped at 30 s; a chunk over 30 s is silently truncated by whisper.cpp.
+3. **Equal-length hard-split contract.** The split rule is `ceil(len / chunk_size_samples)` equal-length parts (last may be ≤ the others by up to n-1 samples). An implementer producing "three 30 s parts plus a 1 s tail" violates this contract and §10's tests will fail.
+4. **Provenance reconstruction.** From `MergedChunk.subs`, downstream code can:
+   - Recover the union of speech intervals (logical VAD segments) by joining `SubRange`s sharing the same `vad_seq`.
+   - Distinguish hard-split fragments from real silero segments by inspecting `SubRange.origin`.
 
-This logic is purely arithmetic on integer PTS; allocations are bounded by `current_subs`.
+This logic is purely arithmetic on `u64` sample indices; allocations are bounded by `current_subs`.
 
 ### 5.4 Sample buffer (`core/buffer.rs`)
 
 ```rust
 pub(crate) struct SampleBuffer {
-    base_pts: i64,                       // PTS of samples[0] (1/16000 timebase)
-    next_pts: i64,                       // PTS of the next sample to be appended
+    /// Output timebase recorded from the first push_samples call.
+    /// All output TimeRanges are constructed in this timebase.
+    output_tb: mediatime::Timebase,
+    /// PTS (in output_tb) of samples[0]. Advances on trim.
+    base_pts_out: i64,
+    /// 16 kHz analysis-frame index of samples[0]. Advances on trim
+    /// in lockstep with base_pts_out — kept as the canonical
+    /// internal index for cut-side arithmetic.
+    base_sample_idx: u64,
+    /// Next 16 kHz sample index to be appended. Equals
+    /// base_sample_idx + samples.len() — kept explicitly to detect
+    /// gaps without walking the buffer.
+    next_sample_idx: u64,
     samples: Vec<f32>,
     cap: usize,
-    gap_tolerance: u64,
+    gap_tolerance_samples: u64,
 }
 ```
 
 Operations:
 
 - `append(starts_at: Timestamp, packet: &[f32]) -> Result<(), TranscriberError>`:
-  - On first call, set `base_pts = starts_at.pts()` and `next_pts = base_pts`.
-  - Compute `delta = starts_at.pts() - next_pts`:
+  - On first call, record `output_tb = starts_at.timebase()`, set `base_pts_out = starts_at.pts()`, set `base_sample_idx = 0` and `next_sample_idx = 0`.
+  - On subsequent calls, require `starts_at.timebase() == output_tb` (or `InconsistentTimebase`). Convert the incoming PTS to an *expected sample index* via the analysis ↔ output rescale, and compare to `next_sample_idx`:
+    ```rust
+    let expected_idx = base_sample_idx as i64
+        + Timebase::rescale_pts(
+              starts_at.pts() - base_pts_out,
+              output_tb,
+              ANALYSIS_TIMEBASE,
+          );
+    let delta = expected_idx - next_sample_idx as i64;
+    ```
     - `delta < 0`: PTS regression. Return `PtsRegression`.
-    - `delta == 0`: contiguous. Append `packet` directly.
-    - `0 < delta <= gap_tolerance`: forward gap inside tolerance. Zero-fill `delta` samples, then append `packet`. Increment `next_pts` by `delta + packet.len()`.
-    - `delta > gap_tolerance`: return `GapExceedsTolerance`. Caller is expected to handle a stream restart explicitly (e.g., flush, reset, re-init).
+    - `delta == 0`: contiguous. Append packet, advance `next_sample_idx`.
+    - `0 < delta <= gap_tolerance_samples`: forward gap inside tolerance. Zero-fill `delta` samples, append packet, advance `next_sample_idx` by `delta + packet.len()`.
+    - `delta > gap_tolerance_samples`: return `GapExceedsTolerance { gap_samples: delta as u64, tolerance_samples: gap_tolerance_samples }`. The state machine offers `Transcriber::restart_at(starts_at: Timestamp)` to recover (see below); without that, this is a fatal stream condition.
   - After append, if `samples.len() > cap`, return `Backpressure { buffered, cap }`.
-- `extract(range: TimeRange) -> Arc<[f32]>`:
-  - Slice `samples[(range.start_pts() - base_pts)..(range.end_pts() - base_pts)]`, copy into a fresh `Arc<[f32]>`.
-  - Returns the Arc; the original buffer is not mutated. Trim happens separately.
-- `trim_to(low_water: i64)`:
-  - Drop `samples[0..(low_water - base_pts)]`, advance `base_pts`. Used by the dispatch state machine after a chunk is fully emitted; the new low-water is the lowest in-flight chunk's start (or the lowest pending-cut chunk's start, whichever is smaller).
+- `extract(range_samples: SampleRange) -> Arc<[f32]>`:
+  - `range_samples` is internal-form (16 kHz indices). Slice `samples[(range.start - base_sample_idx) as usize .. (range.end - base_sample_idx) as usize]`, copy into a fresh `Arc<[f32]>`. The original buffer is not mutated.
+- `samples_to_output_range(range_samples: SampleRange) -> TimeRange`:
+  - Convert from analysis-time sample indices to output-timebase `TimeRange` for emission. Used when the dispatch state machine builds `Transcript.range`, `Word.range`, etc.
+  - `start_out = base_pts_out + Timebase::rescale_pts((range.start - base_sample_idx) as i64, ANALYSIS_TIMEBASE, output_tb)`; same for end. Construct `TimeRange::new(start_out, end_out, output_tb)`.
+- `trim_to(low_water_samples: u64)`:
+  - Drop `samples[0..(low_water_samples - base_sample_idx) as usize]`, advance `base_sample_idx` and recompute `base_pts_out` accordingly. Used by the dispatch state machine after a chunk is fully emitted.
 
-Forward-gap tolerance addresses real-world ffmpeg behaviour: container PTS offsets, cross-file stitching, occasional packet drops, resample boundaries. The default `gap_tolerance_samples = 3 200` (200 ms) silently zero-fills typical micro-gaps; anything larger is surfaced for explicit caller handling. Zero-fill is correct because the VAD stream is independent of the audio stream — silence-filled samples will not produce VAD speech segments and will not be cut into a Whisper chunk.
+Forward-gap tolerance addresses real-world ffmpeg behaviour: container PTS offsets, cross-file stitching, occasional packet drops, resample boundaries. The default `gap_tolerance_samples = 3 200` (200 ms at 16 kHz) silently zero-fills typical micro-gaps; anything larger is surfaced for explicit caller handling. Zero-fill is correct because the VAD stream is independent of the audio stream — silence-filled samples will not produce VAD speech segments and will not be cut into a Whisper chunk.
+
+#### 5.4.1 Recovery from `GapExceedsTolerance`
+
+`Transcriber::restart_at(starts_at: Timestamp) -> Result<(), TranscriberError>` is the explicit recovery path. It:
+
+1. Flushes the cut state machine (`Cut::flush()`), emitting any partial chunk it was accumulating.
+2. Drains in-flight work for the runner to reap (workers running on already-extracted chunks finish normally; their results still produce `Transcript`s via the in-order emit path).
+3. Re-anchors `base_pts_out`, `base_sample_idx`, and `next_sample_idx` such that the next `push_samples(starts_at, packet)` call is treated as a fresh contiguous start.
+
+`restart_at` is the *only* public API affordance for recovering from a gap; `signal_eof` is one-way and does not reset the buffer.
 
 The buffer is a flat `Vec<f32>` with periodic `drain(0..n)` on trim. For our packet rates (≪ 1 GB/s), the memmove cost is dominated by whisper inference time. A circular ring buffer is a future optimisation.
+
+Internal types:
+
+```rust
+pub(crate) struct SampleRange {
+    start: u64,    // 16 kHz analysis-frame index, inclusive
+    end: u64,      // 16 kHz analysis-frame index, exclusive
+}
+```
+
+`SampleRange` never crosses the public surface; only `TimeRange` (in output timebase) does.
 
 ### 5.5 Dispatch state machine (`core/dispatch.rs`)
 
@@ -745,12 +950,14 @@ Transitions:
 Invariants:
 
 1. **In-order emission.** `Event::Transcript` and `Event::Error` are produced in strict `chunk_id` order regardless of which inference worker finishes first. This is a contract; downstream BM25/FTS write order, future cross-file ranking, and any time-aligned join with diarization can rely on it.
-2. **Bounded memory under back-pressure.** `cut_pending` entries hold only descriptors; they cost O(1) audio. The single audio back-pressure path is `buffer_cap_samples`, which trips `push_samples` and lets the caller pause ingest.
-3. **No deadlock.** As long as workers are alive and inference completes, `flush_in_order_events()` always advances; promotions from `cut_pending` happen as soon as a slot frees.
+2. **chunk_id allocation is monotonic across success and failure.** Every `MergedChunk` emitted by Cut allocates exactly one `chunk_id`. Failures produce `Event::Error` carrying that same `chunk_id`; the next chunk's id is one larger. Consumers can rely on chunk_id sequences having no gaps (every id is either a Transcript or an Error).
+3. **flush-before-trim contract.** Every `inject_*_result` and `inject_failure` path follows the same shape: build the per-chunk outcome, set `phase = Ready { transcript } | FailedReady { failure }`, call `flush_in_order_events()`, *then* call `trim()`. This ordering matters because `trim()` removes records from `in_flight` and recomputes the low-water mark; flushing first ensures that any newly-emit-eligible chunks are surfaced before their state is dropped. Tests exercise this by injecting results out of order and asserting that `flush_in_order_events` runs before any `in_flight.remove(...)` on every code path.
+4. **Bounded memory under back-pressure.** `cut_pending` entries hold only descriptors; they cost O(1) audio. The single audio back-pressure path is `buffer_cap_samples`, which trips `push_samples` and lets the caller pause ingest.
+5. **No deadlock.** As long as workers are alive and inference completes, `flush_in_order_events()` always advances; promotions from `cut_pending` happen as soon as a slot frees. The runner's dispatch loop (§6.4.1) defends against the inline-send saturation deadlock by always draining results before retrying sends.
 
 ### 5.6 Command and Event
 
-The core's command and result types deliberately use ASR-prefixed names rather than Whisper-prefixed ones. This is the load-bearing piece of the §3.4 backend invariant: a future swap from whisper-rs to candle-whisper or a CTranslate2 binding only changes the runner's interpretation of these types, never the types themselves or the state machine that produces and consumes them.
+The core's command and result types deliberately use ASR-prefixed names rather than Whisper-prefixed ones. This is the load-bearing piece of the §3.4 backend invariant: a future swap from whisper-rs to candle-whisper or a CTranslate2 binding only changes the runner's interpretation of these types, never the types themselves or the state machine that produces and consumes them. Each `AsrParams` field corresponds to a knob exposed by whisper-rs 0.13.x's `FullParams` *or* is consumed by the runner's own retry loop; nothing lives here that the runner can't faithfully drive.
 
 ```rust
 pub enum Command {
@@ -767,7 +974,6 @@ pub enum Command {
         sub_segments: Vec<TimeRange>,    // for silence-aware alignment, §6.3
         text: smol_str::SmolStr,
         language: Lang,
-        token_hints: Vec<AsrTokenHint>,  // optional CTC seed
     },
 }
 
@@ -777,18 +983,81 @@ pub enum Event {
 }
 
 /// Universal ASR knobs. Backend-agnostic: contains no whisper-rs
-/// types and no whisper.cpp-specific fields. Whisper-only tuning
-/// lives in the runner's `WhisperPoolConfig`.
+/// types and no whisper.cpp-specific fields. Maps cleanly to
+/// whisper-rs 0.13.x's FullParams setters and the runner's own
+/// temperature retry loop.
 pub struct AsrParams {
+    /// Language hint passed to FullParams::set_language. None means
+    /// auto-detect (FullParams::set_detect_language(true)).
     pub language_hint: Option<Lang>,
-    pub beam_size: usize,
-    pub temperature_schedule: SmallVec<[f32; 6]>,
-    pub no_speech_threshold: f32,
+
+    /// Sampling strategy. The runner constructs a fresh FullParams
+    /// per chunk via FullParams::new(strategy.into_whisper_rs()).
+    pub strategy: SamplingStrategy,
+
+    /// Initial decoding temperature; first attempt of the runner's
+    /// retry ladder. Forwarded to whisper.cpp via the strategy's
+    /// implicit temperature (Greedy uses 0.0 by default; the
+    /// runner's ladder rebuilds FullParams with adjusted strategy
+    /// for each retry).
+    pub initial_temperature: f32,
+
+    /// Increment applied to temperature on each retry attempt.
+    /// Default 0.2 (matches WhisperX default ladder).
+    pub temperature_increment: f32,
+
+    /// Maximum total attempts (initial + retries). Default 6.
+    /// The retry ladder is implemented in the runner because
+    /// whisper-rs does not expose a temperature schedule; each
+    /// retry is a fresh state.full() call.
+    pub max_attempts: u8,
+
+    /// log_prob threshold; on a result with avg_logprob below
+    /// this, the runner moves to the next temperature. Default
+    /// -1.0 (WhisperX default).
     pub log_prob_threshold: f32,
+
+    /// Compression-ratio threshold; on a result with compression
+    /// ratio above this (degenerate / repetitive output), the
+    /// runner moves to the next temperature. Default 2.4.
     pub compression_ratio_threshold: f32,
-    pub suppress_tokens: SmallVec<[i32; 16]>,
-    pub condition_on_previous_text: bool,
+
+    /// no_speech threshold for marking a chunk as silence (the
+    /// chunk emits with empty text and `no_speech_prob` above
+    /// this is reported in `Transcript.no_speech_prob`). Default 0.6.
+    pub no_speech_threshold: f32,
+
+    /// Forwarded to FullParams::set_no_context. NOTE the polarity:
+    /// this matches whisper-rs's setter semantics (true = do not use
+    /// past transcription as initial prompt). Default true; v1 never
+    /// reuses cross-chunk context (each WhisperState::full call is
+    /// independent regardless of this setting). The flag controls
+    /// only whisper.cpp's intra-chunk decoder behaviour where it
+    /// uses prior segment text as a prompt for the next ~30-token
+    /// segment within the same encoder call.
+    pub no_context: bool,
+
+    /// Forwarded to FullParams::set_suppress_blank. Default true.
+    pub suppress_blank: bool,
+
+    /// Forwarded to FullParams::set_suppress_nst (suppress
+    /// non-speech tokens). Default false.
+    pub suppress_non_speech_tokens: bool,
+
+    /// Forwarded to FullParams::set_initial_prompt. Default None.
     pub initial_prompt: Option<smol_str::SmolStr>,
+
+    /// Forwarded to FullParams::set_n_threads (whisper.cpp's
+    /// in-call thread count, separate from the runner's worker
+    /// pool size). Default 1; the runner's parallelism comes from
+    /// multiple WhisperStates running concurrently on different
+    /// chunks, so over-subscribing in-call threads is wasteful.
+    pub n_threads: i32,
+}
+
+pub enum SamplingStrategy {
+    Greedy { best_of: i32 },
+    BeamSearch { beam_size: i32, patience: f32 },
 }
 
 /// Result of one chunk's ASR inference.
@@ -798,17 +1067,6 @@ pub struct AsrResult {
     pub avg_logprob: f32,
     pub no_speech_prob: f32,
     pub temperature: f32,         // final temperature used after fallback retries
-    pub tokens: Vec<AsrTokenHint>,
-}
-
-/// Optional per-token hint passed downstream to the aligner.
-/// Carries the timestamp Whisper believes the token spans (in
-/// 1/16000 timebase) plus the token's text. Used by the aligner
-/// to seed CTC search; if empty, the aligner falls back to a
-/// uniform prior.
-pub struct AsrTokenHint {
-    pub text: smol_str::SmolStr,
-    pub range: TimeRange,
 }
 
 #[cfg(feature = "alignment")]
@@ -817,11 +1075,47 @@ pub struct AlignmentResult {
 }
 ```
 
-The runner's job is to translate `AsrParams` into a `whisper_rs::FullParams` (or its candle/CT2 equivalent) and translate the backend's output back into `AsrResult`. This translation lives entirely in `runner/whisper_pool.rs`; the core never names whisper-rs.
+**Notes on what's *not* in this list, and why.**
 
-`AsrParams` defaults are set by the runner's builder, not by the core. The core just ships whatever the runner constructs through to the worker via `Command::RunAsr`.
+- No `suppress_tokens: Vec<TokenId>` field: whisper-rs 0.13.x exposes only `set_suppress_blank` and `set_suppress_nst` — no arbitrary token-id-array setter. If a future caller needs custom token suppression, this becomes a runner-only extension.
+- No `temperature_schedule: SmallVec<[f32; 6]>` field: whisper-rs does not surface a per-temperature ladder API. The runner implements the ladder by re-constructing `FullParams` with adjusted temperature inputs and calling `state.full()` per attempt; the parameters expressed as `(initial, increment, max_attempts)` faithfully describe that loop.
+- No `AsrTokenHint` / DTW token timestamps: v1 does not enable DTW (§1.5); wav2vec2 forced alignment does not need per-token seeds from Whisper. If the user later wants DTW as an alignment fallback, the addition is `AsrResult.dtw_token_timestamps: Vec<DtwToken>` plus a builder flag — additive.
+- No GPU-backend enum: whisper-rs selects backends via Cargo features (cuda/metal/vulkan/hipblas/openblas/coreml). Runtime `gpu_device: i32` is the only knob whisper-rs exposes and lives on `WhisperPoolConfig`, not on `AsrParams`.
 
-Per-chunk override of `AsrParams` is supported: `ManagedTranscriber::process_packet` accepts an optional `AsrParamsOverride` (a sparse struct of `Option<T>` fields layered onto the runner's defaults). This is how callers supply per-call language hints without re-building the runner.
+The runner's job is to translate `AsrParams` into `FullParams` (`runner/whisper_pool.rs`):
+
+```rust
+fn full_params_from(params: &AsrParams) -> FullParams<'static, 'static> {
+    let strategy = match params.strategy {
+        SamplingStrategy::Greedy { best_of } =>
+            whisper_rs::SamplingStrategy::Greedy { best_of },
+        SamplingStrategy::BeamSearch { beam_size, patience } =>
+            whisper_rs::SamplingStrategy::BeamSearch { beam_size, patience },
+    };
+    let mut p = FullParams::new(strategy);
+    p.set_n_threads(params.n_threads);
+    p.set_no_context(params.no_context);
+    p.set_suppress_blank(params.suppress_blank);
+    p.set_suppress_nst(params.suppress_non_speech_tokens);
+    if let Some(lang) = &params.language_hint {
+        p.set_language(Some(lang.as_str()));
+    } else {
+        p.set_detect_language(true);
+    }
+    if let Some(prompt) = &params.initial_prompt {
+        p.set_initial_prompt(prompt.as_str());
+    }
+    p.set_print_special(false);
+    p.set_print_progress(false);
+    p.set_print_realtime(false);
+    p.set_print_timestamps(false);
+    p
+}
+```
+
+This translation lives entirely in the runner; the core never names whisper-rs.
+
+`AsrParams` defaults are set by the runner's builder. Per-chunk override of `AsrParams` is supported: `ManagedTranscriber::process_packet` accepts an optional `AsrParamsOverride` (sparse `Option<T>` fields layered onto the runner's defaults). This is how callers supply per-call language hints without re-building the runner.
 
 ---
 
@@ -896,11 +1190,13 @@ impl ManagedTranscriberBuilder {
 
 /// Sparse override of AsrParams for per-packet customisation.
 /// Each `Some(_)` field replaces the corresponding default for any
-/// chunk produced from this packet.
+/// chunk produced from this packet. Fields cover the per-call
+/// adjustments callers most commonly need; bulk re-tuning is done
+/// via the builder's `asr_params(...)`.
 pub struct AsrParamsOverride {
     pub language_hint: Option<Option<Lang>>,
-    pub beam_size: Option<usize>,
-    pub temperature_schedule: Option<SmallVec<[f32; 6]>>,
+    pub strategy: Option<SamplingStrategy>,
+    pub initial_temperature: Option<f32>,
     pub initial_prompt: Option<Option<smol_str::SmolStr>>,
 }
 ```
@@ -913,19 +1209,30 @@ The builder's `build()` returns a `ManagedTranscriber` with worker threads spawn
 pub struct WhisperPoolConfig {
     pub worker_count: usize,
     pub model_path: PathBuf,
-    pub device: Device,
-    pub max_queued_chunks: usize,    // queue cap before process_packet blocks
-}
-
-pub enum Device {
-    Cpu,
-    Cuda { device_id: i32 },
-    Metal { device_id: Option<i32> },
-    Vulkan { device_id: i32 },
+    /// Forwarded to WhisperContextParameters::use_gpu. Default false.
+    /// When true, whisper-rs uses whichever backend was selected at
+    /// crate compile time (cuda/metal/vulkan/hipblas/openblas/coreml
+    /// Cargo features); there is no runtime backend enum.
+    pub use_gpu: bool,
+    /// Forwarded to WhisperContextParameters::gpu_device. Default 0.
+    /// Single-GPU index; whisper-rs does not expose multi-GPU
+    /// dispatch.
+    pub gpu_device: i32,
+    /// Forwarded to WhisperContextParameters::flash_attn. Default
+    /// false. Mutually exclusive with DTW (which is not enabled in v1).
+    pub flash_attn: bool,
+    /// Queue cap before process_packet blocks (when
+    /// `block_on_full_queue=true`) or returns Backpressure.
+    pub max_queued_chunks: usize,
+    /// Block process_packet when work_tx is full. Default true.
+    /// Set false to surface RunnerError::Backpressure for caller-side
+    /// pacing. See §6.4 for the contract on what state has been
+    /// consumed when Backpressure is returned.
+    pub block_on_full_queue: bool,
 }
 
 struct WhisperPool {
-    ctx: Arc<WhisperContext>,        // assumed shared if Send + Sync; see Open Risk §13.1
+    ctx: Arc<WhisperContext>,        // shared model; whisper-rs is officially thread-safe
     workers: Vec<JoinHandle<()>>,
     work_tx: crossbeam_channel::Sender<AsrWorkItem>,
     result_tx: crossbeam_channel::Sender<(ChunkId, Result<AsrResult, WorkFailure>)>,
@@ -935,24 +1242,63 @@ struct AsrWorkItem {
     chunk_id: ChunkId,
     samples: Arc<[f32]>,
     params: AsrParams,
+    asr_timeout: Duration,
 }
 ```
 
-**Worker count default.** `max(1, num_cpus::get_physical() / 2)` — leaves room for ffmpeg, silero, soundevents, lancedb, and the alignment worker.
+**Worker count default.**
 
-**Worker structure (proposed; subject to the §13.1 spike).** Each worker owns a `WhisperState` borrowed from a shared `Arc<WhisperContext>`. Workers run a loop: `recv work` → `state.full(samples, &asr_to_full_params(params))` → `send result`. The translation `asr_to_full_params` lives here in `runner/whisper_pool.rs`; this is the only place in the crate that names `whisper_rs::FullParams`.
+- **CPU backend** (no `cuda`/`metal`/`vulkan`/`hipblas` features): `max(1, num_cpus::get_physical() / 2)` — leaves room for ffmpeg, silero, soundevents, lancedb, and the alignment worker. Worker concurrency translates directly to throughput on CPU.
+- **GPU backend** (cuda/metal/vulkan/hipblas/coreml feature active): default `1`. whisper.cpp serialises on a single GPU regardless of how many `WhisperState`s are running concurrently — additional workers consume memory without adding throughput. Indexing pipelines that need parallel GPU inference need multi-GPU hardware *and* compile-time selection of a backend that supports per-stream isolation, which is out of scope for v1.
 
-**Memory implication if shared-context turns out to be unsafe.** If `WhisperContext` is found to be `!Send + !Sync` for the build features we need (or if `WhisperState<'a>` cannot be moved into worker threads even with self-referential helpers), the fallback is per-worker contexts. Memory then scales as `worker_count × model_size` — for the tiny model that's 4 × 75 = 300 MiB, manageable; for large that's 4 × 3 GiB = 12 GiB, which forces `worker_count = 1` on machines without enough RAM. This is not a correctness risk but it changes the deployment story; the §13.1 spike resolves it before we commit code.
+The runner detects the active backend at compile time via `cfg!(feature = "...")` and picks the appropriate default; the user can override via `WhisperPoolConfig::worker_count` if they have a specific reason.
 
-**Dispatch loop.** The `ManagedTranscriber` runs a small dispatch loop inline on the caller's thread inside `process_packet` and `poll_transcript`:
+**Worker structure.** whisper-rs 0.13.x's documentation states:
 
-1. Drain `Command`s out of `core`.
-2. For `RunAsr` commands, send to `whisper_pool.work_tx`.
-3. For `RunAlignment` commands, send to the alignment pool (if enabled).
-4. Drain `result_rx` (asr) and `align_rx` (alignment), call `core.inject_*_result` / `core.inject_failure`.
-5. Drain `Event`s, push them to `emit_tx`.
+> "Because the library is thread-safe, contexts can be shared across threads, while states are used to manage individual transcription tasks."
 
-The dispatch loop is single-threaded and inline; only the inference workers run in parallel. If `process_packet` discovers `whisper_pool.work_tx.is_full()` (i.e., `max_queued_chunks` reached), it blocks until a worker drains.
+Each worker owns its own `WhisperState` (via `WhisperContext::create_state`); the context is shared via `Arc<WhisperContext>` across all workers. `WhisperState` is owned (no lifetime parameter) so it moves into worker threads cleanly.
+
+Each worker runs a loop:
+
+```rust
+loop {
+    let job = recv work or break;
+    let state = self.state.lock();    // per-worker state, no contention
+    let result = run_with_temperature_ladder(state, &job, &self.ctx);
+    result_tx.send((job.chunk_id, result));
+}
+```
+
+`run_with_temperature_ladder` is the runner-level retry loop:
+
+```rust
+fn run_with_temperature_ladder(state, job, ctx) -> Result<AsrResult, WorkFailure> {
+    let p = &job.params;
+    let mut temperature = p.initial_temperature;
+    for attempt in 0..p.max_attempts {
+        let strategy = adjust_strategy_for_temperature(p.strategy, temperature);
+        let mut full = full_params_from(p, strategy);
+        // run inference, with a per-attempt timeout enforced via
+        // FullParams::set_abort_callback_safe (whisper-rs 0.13.x
+        // supports this; if attempt elapsed > job.asr_timeout, abort)
+        let outcome = state.full(full, job.samples.as_ref())?;
+        let logprob = compute_avg_logprob(state);
+        let cratio  = compute_compression_ratio(state);
+        if logprob >= p.log_prob_threshold && cratio <= p.compression_ratio_threshold {
+            return Ok(build_asr_result(state, temperature));
+        }
+        temperature += p.temperature_increment;
+    }
+    Err(WorkFailure::AsrFailed { kind: AsrFailureKind::AllTemperaturesFailed, message: ... })
+}
+```
+
+The runner owns the temperature ladder because whisper-rs does not expose per-temperature setters; each retry rebuilds `FullParams` and calls `state.full()` again. This is exactly how WhisperX implements its ladder.
+
+**Memory implication.** With shared `Arc<WhisperContext>`, model weights load once; per-worker memory is dominated by the `WhisperState`'s decoder workspace (~10–30 MiB depending on model size). Default 4 CPU workers × 20 MiB ≈ 80 MiB working memory plus model weights (75 MiB tiny – 3 GiB large). On GPU defaults (`worker_count = 1`), only one state's working memory exists.
+
+**Dispatch loop and back-pressure interactions.** The dispatch loop runs *inline* on the caller's thread inside `process_packet` and `poll_transcript`. See §6.4 for how it avoids the saturation deadlock that an unconditional inline send would cause.
 
 ### 6.3 Aligner and AlignmentSet
 
@@ -1026,13 +1372,17 @@ pub struct NormalizedText<'a> {
 pub struct AlignmentSetBuilder { /* … */ }
 ```
 
-#### 6.3.1 Lookup order
+#### 6.3.1 Lookup order and `Any` semantics
 
 For a chunk with detected language `L`, the alignment worker looks up:
 
 1. `AlignerKey::Lang(L)` — explicit registered aligner for the language.
-2. `AlignerKey::Any` — multilingual fallback aligner.
+2. `AlignerKey::Any` — multilingual fallback aligner (typically a multilingual XLSR / MMS model). Used **only for registry misses**, never as a recovery path after a registered aligner failed.
 3. Apply `fallback`: `SkipChunk` (emit empty `words`) or `Error` (emit `LanguageUnsupportedForAlignment`).
+
+**Failure on a registered aligner does NOT silently fall through to `Any`.** If `Lang(L)` is registered but its `Aligner::align` returns `WorkFailure::AlignmentFailed`, the failure is surfaced via `Event::Error` for that chunk; the `Any` aligner is not consulted. Silent fallback would mask data-quality bugs (e.g., the EN aligner crashing on CJK characters because language detection misfired) and produce systematically wrong word ranges without any signal to the indexer.
+
+If callers want a "try registered, then `Any` on any failure" behaviour, it has to be implemented at registry-construction time (e.g., wrap the language-specific aligner with a fallback shim that internally retries against the multilingual aligner before returning). Whispery's built-in semantics are strict: `Any` is the no-aligner fallback, not the failed-aligner fallback.
 
 #### 6.3.2 Alignment algorithm (silence-aware, normalisation-aware)
 
@@ -1040,31 +1390,38 @@ WhisperX's alignment quality story has three load-bearing pieces beyond the text
 
 For each chunk with non-empty text:
 
-0. **Mask non-speech regions.** Build `samples_for_aligner` as a copy of `samples` with sample positions outside the union of `sub_segments` zeroed. wav2vec2 distributes near-all probability to the blank token in long silence regions; CTC Viterbi paths are robust under this only if silence is *uniformly* silent. Zero-masking ensures non-speech regions don't contribute spurious phoneme probabilities and don't smear word boundaries onto silence.
-1. **Normalise text.** Run the language's `TextNormalizer` to produce `(normalized, original_words)`. Normalisation lowercases, strips punctuation, expands contractions per the language's rules, and produces a list of original-surface-form word slices in order.
-2. **Tokenise.** Tokenise `normalized` against the wav2vec2 vocab to produce `Y = [t_0, t_1, ..., t_{n-1}]` (vocab indices). Track word-boundary positions in `Y` (where one normalised word ends and the next begins).
+0. **Mask non-speech regions.** Build `samples_for_aligner` as a copy of `samples` with sample positions outside the union of *logical* `sub_segments` (joined by `vad_seq` per §5.3) zeroed. wav2vec2 distributes near-all probability to the blank token in long silence regions; CTC Viterbi paths are robust under this only if silence is *uniformly* silent. Zero-masking ensures non-speech regions don't contribute spurious phoneme probabilities and don't smear word boundaries onto silence.
+1. **Normalise text.** Run the language's `TextNormalizer` to produce `NormalizedText { normalized, original_words }`. Normalisation lowercases, strips punctuation, expands contractions per the language's rules, and produces `original_words: Vec<&str>` — original-surface-form word slices in normalised-word-index order. The number of normalised words is `n = original_words.len()`.
+2. **Tokenise.** Tokenise `normalized` against the wav2vec2 vocab to produce `Y = [t_0, t_1, ..., t_{m-1}]` (vocab indices, with `m` typically larger than `n` because tokens are sub-word). Track which normalised-word index each token belongs to in `word_idx_per_token: Vec<usize>` of length `m`.
 3. **Encode.** Run `session` over `samples_for_aligner` (reshaped to wav2vec2's expected input shape). Output is logits `(T, V)`.
 4. **Log-softmax** along V to get log-probabilities.
 5. **CTC lattice.** Build the standard CTC alignment lattice over `(T, 2|Y|+1)` (interspersed with blanks).
 6. **Viterbi.** Run highest-probability monotonic alignment of `Y` to `T`. If no valid path exists, return `AlignmentFailureKind::NoAlignmentPath`.
-7. **Per-word ranges.** Walk the path; for each word boundary in `Y`, extract the start and end frame indices. Map frame index → sample index via `frame * hop_samples`, then to a `TimeRange` at the 1/16000 timebase.
-8. **Score.** For each word, compute `score = exp(mean(log_p_t))` over the frames spanning the word.
-9. **Surface form recovery.** The i-th word's `text` is `original_words[i]` (the original surface form with punctuation and casing), not the normalised form. This way `Transcript.text()` and `joined(Transcript.words().map(|w| w.text()))` differ only in punctuation glue, not in the words themselves.
+7. **Per-word frame ranges into a sparse vector.**
+   - Allocate `per_word: Vec<Option<(u32 /* start_frame */, u32 /* end_frame */, f32 /* logprob_sum */, u32 /* frame_count */)>> = vec![None; n]`.
+   - Walk the Viterbi path frame by frame. For each emitting frame mapped to token index `tok`, the corresponding normalised-word index is `w = word_idx_per_token[tok]`. Update `per_word[w]`: open the entry on first sight, extend `end_frame`, accumulate logprob.
+   - **Words whose audio fell entirely inside the silence-mask region get no emitting frames and remain `None`.** This is the M4 indexing fix: the previous draft assumed alignment produces exactly `n` ordered words, which fails when zero-masking drops some. With the sparse vector, the per-word index `w` always references the right normalised word.
+8. **Compose Word entries.** For each `(i, slot)` in `per_word.iter().enumerate()`:
+   - If `Some((sf, ef, lp_sum, lp_n))`: build `Word { text: original_words[i].into(), range: frames_to_output_range(sf, ef), score: exp(lp_sum / lp_n as f32) }`.
+   - If `None`: skip the word (it had no audio support — most often because it landed in a silence-masked region). The dropped word is *not* added to `words`. The total chunk text on `Transcript.text` still contains the word, just its per-word range entry is absent.
+9. **Surface form preserved.** Each emitted `Word.text` is the original surface form `original_words[i]` (with punctuation and casing as Whisper produced it), not the normalised form. This is the v1 invariant for `Transcript.text` vs `Word.text`.
 
-The `text` recovered for a `Word` therefore preserves the punctuated/cased original; the alignment input was the normalised form. This is the v1 invariant for `Transcript.text` vs `Word.text`.
+`frames_to_output_range(start_frame, end_frame)` is `SampleBuffer::samples_to_output_range(SampleRange::new(chunk_first_sample + start_frame as u64 * hop_samples, chunk_first_sample + end_frame as u64 * hop_samples))`, where `chunk_first_sample` is the chunk's first 16 kHz sample index in stream coordinates. This produces a `TimeRange` in the caller's output timebase.
 
-#### 6.3.3 Concurrency: v1 is sequential; parallelism is conditional on backend
+#### 6.3.3 Concurrency: v1 is sequential; the `Mutex<Aligner>` justification
 
 v1 ships **one alignment worker** in the `AlignmentPool`. Alignment is therefore sequential across chunks, regardless of language. With Whisper running on N workers, alignment will be the throughput bottleneck only when alignment-time-per-chunk × throughput exceeds whisper-time-per-chunk × throughput / N — which is unusual on indexing workloads but possible.
 
-The `Mutex<Aligner>` in `AlignmentSet` is forward-looking, not v1-functional: it allows a future multi-worker pool to operate on different languages in parallel. **It does not by itself enable parallel alignment of the same language**, because `ort::Session::run` is not guaranteed thread-safe across all execution providers (CUDA EP in particular). Two paths exist for v2 if alignment becomes the bottleneck:
+**Why `Mutex<Aligner>` exists in v1 even with one worker.** `ort::Session::run` requires `&mut self` (the session's tensor-allocation arenas mutate during inference). The `AlignmentSet` is owned by `ManagedTranscriber` (which lives on the caller's thread) but its `Aligner`s are accessed from the alignment worker thread; sharing across threads requires `Arc<AlignmentSet>` and a per-language interior-mutability mechanism. `Mutex<Aligner>` is the simplest correct choice: cheap to acquire when uncontended (which it always is in the v1 single-alignment-worker case), and naturally extends to multi-worker without API changes.
+
+**What `Mutex<Aligner>` does NOT enable.** It does not by itself enable parallel alignment of the same language: even with multiple workers, only one can hold a given `Mutex<Aligner>` at a time. Two paths exist for v2 if alignment becomes the bottleneck:
 
 - **Cross-language parallel only.** N alignment workers each grab the relevant `Mutex<Aligner>` per chunk; same-language chunks serialise behind one mutex. Easy.
-- **Within-language parallel.** Replace `Mutex<Aligner>` with `Vec<Aligner>` (one Session per worker per language). Multiplies model memory by parallelism factor.
+- **Within-language parallel.** Replace `Mutex<Aligner>` with `Vec<Aligner>` (one Session per worker per language). Multiplies model memory by parallelism factor. Also requires verifying `ort::Session::run` thread-safety for the chosen execution provider; CUDA EP serialises internally on a single GPU regardless.
 
 Neither is implemented in v1. The §11 throughput math accounts for sequential alignment.
 
-### 6.4 Concurrency model summary
+### 6.4 Concurrency model and saturation behaviour
 
 ```
   caller thread                ASR workers (N)          alignment worker (1)
@@ -1076,7 +1433,7 @@ Neither is implemented in v1. The §11 throughput math accounts for sequential a
   push_samples / push_vad_segment
         |
         v
-  [dispatch loop, inline]
+  [dispatch loop, inline; non-blocking try_send + always-drain pattern]
         |
         +---- RunAsr -------------> work_tx --> WhisperState::full
         |                                            |
@@ -1098,9 +1455,93 @@ Neither is implemented in v1. The §11 throughput math accounts for sequential a
 
 The dispatch loop runs *inline* on the caller's thread inside `process_packet` and `poll_transcript`. There is no background dispatcher thread; the only threads in the runner are the N ASR workers and the 1 alignment worker. This keeps the runner deterministic from the caller's perspective.
 
-The flip side: very long-running `process_packet` calls can stall if all workers are busy and `max_queued_chunks` is reached. By default, `process_packet` blocks; if `WhisperPoolConfig::block_on_full_queue = false`, it returns `RunnerError::Backpressure` instead so the caller can apply its own pacing.
+#### 6.4.1 Avoiding the saturation deadlock
 
-Worker hang protection: each worker tracks its current job's start time and is interrupted (the job is recorded as `WorkerHangTimeout`) if it exceeds the configured per-job timeout. This bounds `drain()` and prevents indefinite stalls on a misbehaving model.
+A naive inline dispatch loop that calls `work_tx.send(item)` (blocking) deadlocks under saturation: when `work_tx` is full, the caller blocks; meanwhile workers continue producing results into `result_rx`, but no thread is draining `result_rx` (the dispatch loop is stuck on the send). If `result_rx` is bounded the workers block too — full deadlock; if unbounded, memory grows without bound.
+
+The dispatch loop therefore uses a **non-blocking try_send + always-drain pattern**:
+
+```rust
+fn drive_one_step(&mut self) -> Result<(), RunnerError> {
+    // Phase 1: ALWAYS drain results first. This must complete before
+    // we attempt to send any new work.
+    while let Ok((chunk_id, asr_result)) = self.whisper_pool.result_rx.try_recv() {
+        match asr_result {
+            Ok(r)  => self.core.inject_asr_result(chunk_id, r)?,
+            Err(e) => self.core.inject_failure(chunk_id, e)?,
+        }
+    }
+    #[cfg(feature = "alignment")]
+    while let Ok((chunk_id, ar)) = self.alignment_pool_or_skip().align_rx.try_recv() {
+        match ar {
+            Ok(r)  => self.core.inject_alignment_result(chunk_id, r)?,
+            Err(e) => self.core.inject_failure(chunk_id, e)?,
+        }
+    }
+
+    // Phase 2: drain core's pending Events to the consumer-facing
+    // emit channel.
+    while let Some(event) = self.core.poll_event() {
+        self.emit_tx.send(event).map_err(|_| RunnerError::WhisperPoolShutdown)?;
+    }
+
+    // Phase 3: drain core's pending Commands. try_send only.
+    while let Some(cmd) = self.core.poll_command() {
+        match cmd {
+            Command::RunAsr { chunk_id, samples, params, .. } => {
+                let item = AsrWorkItem { chunk_id, samples, params, ... };
+                match self.whisper_pool.work_tx.try_send(item) {
+                    Ok(()) => {},
+                    Err(TrySendError::Full(item)) => {
+                        // Park the command back at the front of core's
+                        // pending queue; we'll retry on the next drive_one_step.
+                        self.core.unpoll_command(Command::RunAsr { ... });
+                        return Ok(());  // back-pressure: yield to caller
+                    }
+                    Err(TrySendError::Disconnected(_)) =>
+                        return Err(RunnerError::WhisperPoolShutdown),
+                }
+            }
+            Command::RunAlignment { .. } => { /* same try_send pattern */ }
+        }
+    }
+    Ok(())
+}
+```
+
+`drive_one_step` is called from `process_packet` after `core.push_*` mutations and from `poll_transcript` before reading `emit_rx`. It returns when either everything is dispatched and drained, or when a command would block (work_tx full). In the second case, when `block_on_full_queue=true`, `process_packet` then enters a small loop:
+
+```rust
+while !drive_made_progress {
+    // Block on EITHER any worker result OR a small timeout.
+    crossbeam_channel::select! {
+        recv(self.whisper_pool.result_rx) -> _ => { drive_one_step()? }
+        recv(self.alignment_pool.align_rx) -> _ => { drive_one_step()? }
+        default(Duration::from_millis(10)) => { /* spin once, retry */ }
+    }
+}
+```
+
+This guarantees forward progress: as soon as any worker produces a result (which frees a `cut_pending` slot or completes an in-flight chunk), the dispatch resumes. The only deadlock-equivalent is genuine model hang, which is bounded by per-job worker timeouts.
+
+`unpoll_command` is the core's small affordance for re-parking a command: it accepts a single front-of-queue undo per call site. The dispatch loop is the only caller; the operation is safe because the core's own state (in_flight, cut_pending) is unchanged when a command was emitted but not actually consumed by the runner.
+
+#### 6.4.2 Backpressure contract (the side-effect rule)
+
+When `process_packet` returns `RunnerError::Backpressure { .. }` (only in `block_on_full_queue=false` mode):
+
+- **Inputs are accepted, not rejected.** The `samples` were buffered, the `vad_segments` were fed through the cut state machine; any `MergedChunk` they produced has been queued in `cut_pending`. The state machine has advanced.
+- **The caller must drain via `poll_transcript` / `poll_error`** until `core.buffered_samples()` falls below the buffer cap and `cut_pending` empties. Then continue ingest.
+- **The caller must NOT retry the same `process_packet` call** with the same arguments. Doing so would be a PTS regression (audio already buffered) or a duplicate VAD segment push. Both are state-machine errors.
+- The contract is unchanged for `block_on_full_queue=true` — that mode just blocks until drain, then accepts the input. Callers writing portable code should treat both modes identically and always drain before pushing again, regardless of whether they got a `Backpressure` error or a transient block.
+
+For callers that genuinely need a *non-mutating* check (decide before pushing whether the buffer can accept), `Transcriber::would_accept(&self, samples_len, vad_count) -> bool` is provided as a const-time predicate; `process_packet` does not consult it internally to avoid TOCTOU between the check and the actual mutation.
+
+#### 6.4.3 Worker hang protection
+
+Each worker tracks its current job's start time. The whisper-rs `set_abort_callback_safe(...)` callback is wired to compare elapsed time against the job's `asr_timeout` and signal abort if exceeded. On abort, the worker emits `WorkFailure::WorkerHangTimeout { kind: WorkerKind::Asr, elapsed }` and returns the chunk via `result_rx`. The runner injects the failure, the chunk emits as `Event::Error`, and the worker's `WhisperState` is dropped and re-created from the shared `Arc<WhisperContext>` (cheap; just resets decoder state). This bounds `drain()` and prevents indefinite stalls on a misbehaving model.
+
+Alignment workers use a `std::time::Instant`-tracked equivalent; ort does not have a built-in cooperative abort, so timeout in alignment kills the work item without interrupting in-progress ONNX inference. The session is then dropped and reconstructed from disk if it was a transient model fault.
 
 ---
 
@@ -1110,7 +1551,7 @@ A worked example. Assume `chunk_size = 30 s`, `worker_count = 2`, alignment enab
 
 1. Caller's pipeline emits a 100 ms audio packet (1 600 samples) at PTS 0.
 2. Caller runs silero on the packet, gets zero or more new `SpeechSegment`s.
-3. Caller calls `mt.process_packet(Timestamp::new(0, TIMEBASE), &samples, &vad_segs, None)`.
+3. Caller calls `mt.process_packet(Timestamp::new(0, output_tb), &samples, &vad_segs, None)` — where `output_tb` is the original media's timebase (e.g., 1/48000 for a 48 kHz source).
 4. `ManagedTranscriber::process_packet`:
    - Calls `core.push_samples(...)`. SampleBuffer extends; small forward gaps are zero-filled silently.
    - For each VAD segment: `core.push_vad_segment(seg)`. Cut state machine accumulates; if any single segment exceeds 30 s it is hard-split first; possibly emits a `MergedChunk` if accumulated speech ≥ 30 s.
@@ -1151,7 +1592,9 @@ Defaults and rationale:
 | `AsrParams.condition_on_previous_text`        | false                                | Each `WhisperState::full` call is independent (no cross-chunk state reuse) regardless of this setting. The flag only controls whether Whisper's *intra*-chunk decoder uses prior segment text as a prompt for the next ~30-token segment. WhisperX defaults to `false` because intra-chunk prompt continuation enables degenerate hallucination loops on misrecognised segments; the indexing use case prioritises avoiding these over modest punctuation/casing continuity gains. Callers can flip to `true` if they observe intra-chunk fragmentation. |
 | `AlignmentFallback`                           | `SkipChunk`                          | Unknown languages still emit a `Transcript`, just with empty `words`. |
 | `with_alignment(...)`                         | not called (off)                     | Caller opts in by passing an `AlignmentSet`; otherwise `Transcript.words` is empty. |
-| `Device`                                      | `Device::Cpu`                        | GPU selection is opt-in; defaulting to CPU avoids surprising GPU memory usage on first run. |
+| `WhisperPoolConfig.use_gpu`                   | false                                | GPU selection is opt-in; defaulting to CPU avoids surprising GPU memory usage on first run. Backend (CUDA / Metal / Vulkan / HIPBLAS / CoreML) is selected at crate compile time via Cargo features. |
+| `WhisperPoolConfig.gpu_device`                | 0                                    | Single-GPU index; whisper-rs has no multi-GPU dispatch. |
+| `WhisperPoolConfig.flash_attn`                | false                                | Mutually exclusive with DTW (which is not enabled in v1). |
 | `worker_timeouts.asr`                         | 60 s                                 | Per-job; protects against model stalls. |
 | `worker_timeouts.alignment`                   | 30 s                                 | Per-job. |
 | `drain_timeout`                               | 10 × max(worker_timeouts)            | Cap on `drain()`. Prevents deadlock on a hung worker. |
@@ -1296,16 +1739,24 @@ Whisper-rs on Windows requires CMake and a working C compiler; the CI matrix sho
 
 The following items must be resolved (or explicitly accepted) before implementation begins. Each carries a meaningful chance of forcing a re-architecture, so they get a named slot rather than buried in §12.
 
-### 13.1 `WhisperContext` sharing across worker threads
+### 13.1 `WhisperContext` sharing across worker threads — verification, not spike
 
-`whisper_rs::WhisperState<'a>` borrows `&'a WhisperContext`. The shared-context concurrency model (one `Arc<WhisperContext>` plus N states) requires `WhisperContext: Send + Sync` and a way to move (or self-reference) the borrowed `WhisperState` into a worker thread. Whether this is supported depends on whisper-rs version, build features, and the underlying whisper.cpp build.
+whisper-rs 0.13.x's documentation explicitly states:
 
-**Spike (≤ 1 day) before code starts:** prototype both:
+> "Because the library is thread-safe, contexts can be shared across threads, while states are used to manage individual transcription tasks." (whisper-rs README, §Architecture)
 
-1. `Arc<WhisperContext>` shared, per-worker `WhisperState` (likely via `whisper_rs::OwnedWhisperState` or self-referential `ouroboros`).
-2. Per-worker `WhisperContext` (one model load per worker; memory scales `worker_count × model_size`).
+`WhisperState` in 0.13.x is owned (no `'a` lifetime parameter); `create_state(&self)` takes `&WhisperContext` and returns an owned state. The shared-context concurrency model is therefore officially supported: `Arc<WhisperContext>` + N owned `WhisperState`s, one per worker.
 
-Outcome decides §6.2's worker structure, §11's memory footprint, and the realistic ceiling on `worker_count` for large models. If only (2) is viable, default `worker_count` drops to 1 for any model whose load size exceeds available memory divided by physical cores.
+**Verification (≤ 2 hours) before code lands**, not a spike:
+
+1. Compile-time `assert_send_sync::<WhisperContext>()` to confirm bounds for our build features (CPU, Metal, CUDA, etc.).
+2. Single empirical benchmark: 4 worker threads concurrently calling `state.full()` on a shared context with the tiny model on CPU; assert no panics, output text correctness, ~3–4× throughput vs. single-worker.
+3. Repeat on the active GPU backend at the deployment target; if throughput is flat (single-GPU serialisation) or worse, default `worker_count = 1` for that backend per §6.2.
+4. Confirm threshold setter names in `cargo doc` (`set_no_speech_thold` vs `set_no_speech_threshold` etc.) — the doc and source can diverge across patch versions.
+
+If verification (1) fails, the fallback is per-worker contexts (model loaded N times); the §11 memory math already accounts for both scenarios. If (2) fails (e.g., a panic under contention), file a whisper-rs issue and pin to a known-good version.
+
+The 2-hour verification gates the implementation plan; it is not a separate work item that delays it meaningfully.
 
 ### 13.2 ort `Session` thread-safety per execution provider
 
@@ -1321,7 +1772,7 @@ The forced-alignment story requires a wav2vec2 phoneme/character model per langu
 
 Both questions are resolved and recorded in §1.6 / §1.7:
 
-- **§1.6 (diarization integration):** confirmed against `dia` v0.1.0. `dia::DiarizedSpan.range` uses `mediatime::TimeRange` at the 1/16000 timebase, identical to `Word.range`; the join is plain interval-overlap, no whispery-side API changes required.
+- **§1.6 (diarization integration):** confirmed against `dia` v0.1.0. `dia::DiarizedSpan.range()` returns `mediatime::TimeRange` at the 1/16000 analysis timebase; whispery's `Word.range()` is in the caller-chosen output timebase. The indexer joins by interval overlap across timebases (mediatime supports this directly via 128-bit cross-multiply); no whispery-side API changes required.
 - **§1.7 (deployment):** crate-only for v1. A wrapper service binary, if ever needed, is additive and does not change whispery's public surface.
 
 These resolutions are load-bearing for the implementation plan; if either changes (e.g., `dia` ships a breaking API revision before whispery v1 lands), revisit §1.6 before merging.
