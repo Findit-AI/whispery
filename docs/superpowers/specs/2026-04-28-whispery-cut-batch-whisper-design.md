@@ -247,10 +247,17 @@ Permanent (non-feature-gated) dependencies: `mediatime`, `smol_str`, `thiserror`
 // Always public:
 pub mod types;
 pub mod core;
+
+// Re-exports of mediatime types that appear in whispery's public
+// API (so consumers don't need to add a separate `mediatime`
+// dependency just to name them; they may still do so to call
+// methods like `rescale_to`).
+pub use mediatime::{Timebase, Timestamp, TimeRange};
+
 pub use types::{
     Transcript, Word, Lang, ChunkId, VadSegment,
     TranscriberError, WorkFailure, AsrFailureKind, AlignmentFailureKind,
-    PushKind, WorkerKind,
+    PushKind, WorkerKind, InvalidLang,
 };
 pub use core::{
     Transcriber, TranscriberConfig, LanguagePolicy,
@@ -614,6 +621,11 @@ pub enum AlignmentFailureKind {
 pub enum PushKind { Samples, VadSegment }
 pub enum WorkerKind { Asr, Alignment }
 
+/// Returned by `Lang::from_iso639_1` when the supplied string is
+/// not in Whisper.cpp's supported-language set.
+pub struct InvalidLang(pub smol_str::SmolStr);
+// Display: "unknown language code: {0}"
+
 #[cfg(feature = "runner")]
 pub enum RunnerError {
     WhisperContextLoad { source: /* whisper-rs error */ },
@@ -659,28 +671,66 @@ impl Transcriber {
     pub fn new(config: TranscriberConfig) -> Self;
 
     // ── Push side ───────────────────────────────────────────────
+
+    /// Append audio samples to the buffer.
+    ///
+    /// Empty packets (`samples.is_empty()`) are accepted as no-ops
+    /// when `delta_pts_out == 0`. The first call records the output
+    /// timebase from `starts_at.timebase()`.
+    ///
+    /// Errors:
+    /// - `PtsRegression` — `starts_at.pts()` is earlier than the
+    ///   buffer's expected next-PTS (in output-PTS space).
+    /// - `GapExceedsTolerance` — forward gap larger than the
+    ///   configured `gap_tolerance_samples`.
+    /// - `Backpressure` — buffered samples would exceed the cap.
+    /// - `InconsistentTimebase` — `starts_at.timebase()` differs
+    ///   from the timebase recorded on the first push.
+    /// - `AfterEof` — `signal_eof()` was previously called.
     pub fn push_samples(
         &mut self,
         starts_at: mediatime::Timestamp,
         samples: &[f32],
     ) -> Result<(), TranscriberError>;
 
-    /// Returns `OutputTimebaseUnset` if called before any `push_samples`
-    /// (the output timebase is not yet established, so any chunk the
-    /// cut state machine would emit cannot be converted to a public
-    /// `TimeRange`). Callers must push at least one sample packet before
-    /// pushing VAD segments.
+    /// Push a VAD segment into the cut state machine. VAD segments
+    /// must be strictly monotonically increasing in `start_sample`;
+    /// out-of-order or duplicate segments are rejected as
+    /// `PtsRegression { kind: VadSegment }`.
+    ///
+    /// Errors:
+    /// - `OutputTimebaseUnset` — no `push_samples` has been called yet,
+    ///   so the cut state machine has no output timebase to anchor
+    ///   against. Push at least one sample packet first.
+    /// - `PtsRegression { kind: VadSegment }` — `seg.start_sample` is
+    ///   not strictly greater than the previous VAD segment's
+    ///   `end_sample`.
+    /// - `AfterEof` — `signal_eof()` was previously called.
     pub fn push_vad_segment(
         &mut self,
         seg: VadSegment,
     ) -> Result<(), TranscriberError>;
 
+    /// Mark the input stream as ended. Flushes the cut state
+    /// machine, allowing any partial accumulated chunk to emit.
+    /// Idempotent (calling twice is `Ok(())` on the second call).
+    /// Calling before any `push_samples` is a no-op (`Ok(())`)
+    /// since there is nothing to flush.
+    ///
+    /// Errors: never returns Err in v1; signature carries
+    /// `Result<(), TranscriberError>` for forward compatibility.
     pub fn signal_eof(&mut self) -> Result<(), TranscriberError>;
 
     /// Recovers from a `GapExceedsTolerance`. Flushes the cut state
-    /// machine, clears the live SampleBuffer, re-anchors PTS, and
-    /// preserves chunk_id continuity so already-in-flight chunks
-    /// from before the gap still emit normally. See §5.4.1.
+    /// machine, drains `cut_pending` into `in_flight`, clears the
+    /// live SampleBuffer, re-anchors PTS, and preserves chunk_id
+    /// continuity so already-in-flight chunks from before the gap
+    /// still emit normally. See §5.4.1.
+    ///
+    /// Errors:
+    /// - `AfterEof` — calling restart_at after signal_eof is
+    ///   rejected; once a stream has been ended it cannot be
+    ///   re-anchored. Construct a fresh Transcriber instead.
     pub fn restart_at(
         &mut self,
         starts_at: mediatime::Timestamp,
@@ -696,18 +746,31 @@ impl Transcriber {
     pub fn would_accept(&self, samples_len: usize, vad_count: usize) -> bool;
 
     // ── Inject side ─────────────────────────────────────────────
+
+    /// Errors:
+    /// - `UnknownChunk(chunk_id)` — `chunk_id` is not the id of any
+    ///   record currently in `in_flight` (either never issued, or
+    ///   already resolved to a Transcript / Error).
     pub fn inject_asr_result(
         &mut self,
         chunk_id: ChunkId,
         out: AsrResult,
     ) -> Result<(), TranscriberError>;
 
+    /// Errors:
+    /// - `UnknownChunk(chunk_id)` — same semantics as
+    ///   `inject_asr_result`. Calling `inject_alignment_result` on a
+    ///   chunk whose phase is not `AwaitingAlignment` is also
+    ///   rejected as `UnknownChunk` (the chunk is no longer waiting
+    ///   for alignment).
     pub fn inject_alignment_result(
         &mut self,
         chunk_id: ChunkId,
         out: AlignmentResult,
     ) -> Result<(), TranscriberError>;
 
+    /// Errors:
+    /// - `UnknownChunk(chunk_id)` — `chunk_id` is not in `in_flight`.
     pub fn inject_failure(
         &mut self,
         chunk_id: ChunkId,
@@ -720,14 +783,17 @@ impl Transcriber {
 
     /// Re-park the front of the command queue. Used by the runner's
     /// dispatch loop when a try_send returns Full and the command
-    /// must be retried on the next drive iteration. Crate-private
-    /// in spirit but lives on the public surface because the
-    /// runner is in a separate module and needs the affordance;
-    /// callers driving the state machine themselves typically have
-    /// no reason to use this. Must be called at most once per
-    /// poll_command call (no FIFO; only the most-recently-popped
-    /// command can be unpolled).
-    pub fn unpoll_command(&mut self, cmd: Command);
+    /// must be retried on the next drive iteration. **Visibility:
+    /// `pub(crate)`** — the runner module is the only legitimate
+    /// caller, and exposing this on the public surface would invite
+    /// abuse. Crate-internal because the runner module lives in the
+    /// same crate; out-of-tree consumers driving the state machine
+    /// themselves do not need to re-park (their own command queue
+    /// is theirs to manage).
+    ///
+    /// Must be called at most once per `poll_command` call (no FIFO;
+    /// only the most-recently-popped command can be unpolled).
+    pub(crate) fn unpoll_command(&mut self, cmd: Command);
 
     pub fn is_idle(&self) -> bool;       // no pending work, no buffered samples
     pub fn buffered_samples(&self) -> usize;
@@ -764,9 +830,12 @@ pub struct VadSegment {
 }
 
 impl VadSegment {
-    /// Panics if `end_sample < start_sample`. silero already
-    /// guarantees `start <= end`; the constructor exists to
-    /// surface programmer error.
+    /// Panics if `end_sample <= start_sample`. The strict
+    /// inequality matters: zero-duration VAD segments (`end ==
+    /// start`) would emit zero-length MergedChunks downstream,
+    /// which break alignment and confuse downstream consumers.
+    /// silero never produces zero-duration segments; the
+    /// constructor surfaces programmer error at the boundary.
     pub const fn new(start_sample: u64, end_sample: u64) -> Self;
 
     pub const fn start_sample(&self) -> u64;
@@ -1089,6 +1158,7 @@ Invariants:
 2. **chunk_id allocation is monotonic across success and failure.** Every `MergedChunk` emitted by Cut allocates exactly one `chunk_id`. Failures produce `Event::Error` carrying that same `chunk_id`; the next chunk's id is one larger. Consumers can rely on chunk_id sequences having no gaps (every id is either a Transcript or an Error).
 3. **flush-before-trim contract.** Every `inject_*_result` and `inject_failure` path follows the same shape: build the per-chunk outcome, set `phase = Ready { transcript } | FailedReady { failure }`, call `flush_in_order_events()`, *then* call `trim()`. This ordering matters because `trim()` removes records from `in_flight` and recomputes the low-water mark; flushing first ensures that any newly-emit-eligible chunks are surfaced before their state is dropped. Tests exercise this by injecting results out of order and asserting that `flush_in_order_events` runs before any `in_flight.remove(...)` on every code path.
 4. **Bounded memory under back-pressure.** `cut_pending` entries hold only descriptors; they cost O(1) audio. The single audio back-pressure path is `buffer_cap_samples`, which trips `push_samples` and lets the caller pause ingest.
+   **Exception:** `restart_at` (§5.4.1 step 1) drains the entire `cut_pending` queue into `in_flight` synchronously, which may transiently push `in_flight.len()` above `max_in_flight`. The exceedance is bounded by the size of `cut_pending` at restart time (itself bounded by `max_queued_chunks`) and decays as the worker pool drains the queue normally. Trim's promotion guard (`if in_flight.len() < max_in_flight`) is suspended for the duration of the drain — it does not gate restart-time promotion. This is the only path that breaks the invariant; all steady-state code respects it.
 5. **No deadlock.** As long as workers are alive and inference completes, `flush_in_order_events()` always advances; promotions from `cut_pending` happen as soon as a slot frees. The runner's dispatch loop (§6.4.1) defends against the inline-send saturation deadlock by always draining results before retrying sends.
 
 ### 5.6 Command and Event
@@ -1347,6 +1417,20 @@ impl ManagedTranscriber {
     /// or before that packet's range. Optionally override ASR params
     /// for any chunk produced from this packet — useful for per-call
     /// language hints when the caller has prior knowledge.
+    ///
+    /// **Contract on `vad_segments`:** segments must be in strictly
+    /// monotonically increasing `start_sample` order, and
+    /// `vad_segments[i].end_sample() <= vad_segments[i+1].start_sample()`
+    /// (no overlap, no duplicates). Violations are surfaced as
+    /// `RunnerError::Transcriber(TranscriberError::PtsRegression {
+    /// kind: PushKind::VadSegment, .. })` from the underlying
+    /// state-machine push.
+    ///
+    /// **Empty packet (`samples.is_empty()`):** accepted as a no-op;
+    /// the underlying `push_samples` returns `Ok(())` immediately
+    /// when `delta_pts_out == 0` (i.e., `starts_at` matches
+    /// `next_expected_starts_at`). VAD segments in the same call
+    /// are still pushed.
     pub fn process_packet(
         &mut self,
         starts_at: Timestamp,
@@ -1433,6 +1517,12 @@ pub struct WhisperPoolConfig {
     /// pacing. See §6.4 for the contract on what state has been
     /// consumed when Backpressure is returned.
     pub block_on_full_queue: bool,
+
+    /// Maximum time the saturation wait (§6.4.1) blocks on
+    /// `Select::ready_timeout` before spinning. Acts as a safety
+    /// timer for the case where a worker channel becomes ready
+    /// without a successful readiness wake. Default 10 ms.
+    pub dispatch_idle_poll: Duration,
 }
 
 struct WhisperPool {
@@ -1762,7 +1852,7 @@ loop {
     if let Some(ap) = &self.alignment_pool {
         sel.recv(&ap.align_rx);
     }
-    let _ = sel.ready_timeout(Duration::from_millis(10));
+    let _ = sel.ready_timeout(self.whisper_pool_config.dispatch_idle_poll);
     // Fall through to the next loop iteration; drive_one_step's
     // try_recv pulls the now-ready message. crossbeam's
     // ready_timeout is documented to occasionally return success
@@ -1800,6 +1890,8 @@ Each worker tracks its current job's start time. The whisper-rs `set_abort_callb
 - On `streak >= threshold`, drop and recreate the state. Reset the streak to 0.
 
 For CPU workers (where recycle is cheap), the threshold is 1 (recycle every time). For GPU workers, the threshold is 3 by default; the runner exposes `WhisperPoolConfig::timeout_streak_threshold` for tuning. Documented p99 stall on GPU recycle: `gpu_state_create_latency * num_recycling_workers`, which on a single-worker GPU pool means the entire next-chunk processing pauses for a full state allocation.
+
+**Streak-vs-chunk_id correspondence.** Each timeout corresponds to exactly one `chunk_id` (the chunk in flight when the watchdog fired). When the streak threshold is reached and the state is recycled, the recycled state begins clean for the *next* dequeued `chunk_id`; the recycle does not retroactively retry the timed-out chunks (they emit as `Event::Error { error: WorkFailure::WorkerHangTimeout }` per their original chunk_ids and decay out of `in_flight`). Streak counting is per-worker, not per-chunk_id; a worker that hits 3 timeouts on chunks N, N+2, N+5 (with successful chunks in between resetting the streak) keeps its state.
 
 Alignment workers use a `std::time::Instant`-tracked equivalent; ort does not have a built-in cooperative abort, so timeout in alignment kills the work item without interrupting in-progress ONNX inference. The session is then dropped and reconstructed from disk if it was a transient model fault. The same streak-threshold hysteresis applies (default threshold 3 for GPU, 1 for CPU).
 
@@ -1954,7 +2046,21 @@ If an inference worker exceeds its per-job timeout, the dispatcher records it as
 - `benches/dispatch.rs`: throughput of the dispatch state machine with mocked inference.
 - A separate offline-only `examples/managed_runner.rs` provides a hand-runnable timing reference; not a CI bench.
 
-### 10.4 CI matrix
+### 10.4 v3-v5 regression tests
+
+These exercise specific defects caught during the design-review rounds; landing them as named tests prevents regressions on subsequent refactors.
+
+- **PTS drift on non-integer-ratio output (NB1).** Drive a 1/30001 output timebase through 10 000 trim cycles; assert each emitted `Word.range` is within ±1 PTS of the analytical exact value (rescale_pts of the immutable anchor + absolute_sample_offset). The pre-fix mutable-anchor code drifts by ~982 PTS per 1 000 trims; the test would fail loudly there.
+- **Saturation-wait does not lose results (NB-β).** Mock a worker pool with bounded `result_rx` capacity 1; saturate work_tx; verify every chunk_id sent eventually emits a `Transcript`. The pre-fix `select! { recv -> _ => {} }` silently dropped one result per saturation cycle; this test would fail by missing transcripts.
+- **`restart_at` cut_pending drain (Round-4 latent).** Push enough audio + VAD to fill `cut_pending` to 4 entries; trigger a `GapExceedsTolerance`; call `restart_at(new_anchor)`; push a fresh contiguous segment; assert (a) no panic in the next `trim()`, (b) the 4 pre-restart pending chunks emit normal `Transcript`s in chunk_id order, (c) the first post-restart chunk has chunk_id one larger than the last pre-restart chunk.
+- **`next_expected_starts_at()` correctness (W3).** With output_tb 1/30001 and packet length 1000, push 100 packets using `next_expected_starts_at()` for each subsequent `starts_at`; assert no `PtsRegression`. Then re-run with the caller's own per-packet running sum; assert it eventually trips `PtsRegression` (proving the accessor is necessary).
+- **Layered-ladder suppression (M-κ).** Mock whisper-rs with a recording wrapper around `state.full()`; verify each call's `FullParams` has `temperature_inc == 0.0` and an explicit `set_temperature(t)` value matching the runner's expected ladder step. Two layered ladders would show as multiple internal-loop iterations within a single call.
+- **`unpoll_command` round-trip (M12).** Drive a saturated work_tx; verify `core.poll_command` returns the same command on the second call after `unpoll_command(cmd)` was called (i.e., commands aren't lost or reordered through the park-resume cycle).
+- **Empty packet handling.** `push_samples(next_expected_starts_at(), &[])` returns `Ok(())` and does not advance state; `push_vad_segment` after still works.
+- **Zero-duration `VadSegment::new`.** Constructor panics; this is enforced via `#[should_panic]` test.
+- **PtsRegression in output-PTS space, not 16k space (M-δ).** Output_tb 30000/1001 (NTSC), strictly contiguous packet pushes for 100 packets via `next_expected_starts_at()` — assert no spurious `PtsRegression`.
+
+### 10.5 CI matrix
 
 CI builds the crate on Linux, macOS, and Windows (mirroring the existing template). Feature combinations covered:
 
@@ -2020,7 +2126,7 @@ whisper-rs 0.13.x's documentation explicitly states:
 1. Compile-time `assert_send_sync::<WhisperContext>()` to confirm bounds for our build features (CPU, Metal, CUDA, etc.).
 2. Single empirical benchmark: 4 worker threads concurrently calling `state.full()` on a shared context with the tiny model on CPU; assert no panics, output text correctness, ~3–4× throughput vs. single-worker.
 3. Repeat on the active GPU backend at the deployment target; if throughput is flat (single-GPU serialisation) or worse, default `worker_count = 1` for that backend per §6.2.
-4. Confirm threshold setter names in `cargo doc` (`set_no_speech_thold` vs `set_no_speech_threshold` etc.) — the doc and source can diverge across patch versions.
+4. Confirm `set_temperature(...)`, `set_temperature_inc(...)`, and (best-effort) `set_max_decoding_failures(...)` are present on `whisper_rs::FullParams` for the active version. The v4/v5 audits found the first two are present in 0.13.x; the third is the best-effort secondary safeguard documented in §5.6. If a future version renames or removes either of the first two, the alternative code path described in §5.6 (advisory temperature fields, no runner ladder) must be wired in via cfg.
 
 If verification (1) fails, the fallback is per-worker contexts (model loaded N times); the §11 memory math already accounts for both scenarios. If (2) fails (e.g., a panic under contention), file a whisper-rs issue and pin to a known-good version.
 
