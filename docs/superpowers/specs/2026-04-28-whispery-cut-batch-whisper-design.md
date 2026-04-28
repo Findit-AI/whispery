@@ -71,27 +71,53 @@ The design is **backend-agnostic in the core**: swapping whisper-rs for candle-w
 
 ### 1.6 Integration with diarization (speaker-agnostic by design)
 
-whispery is speaker-agnostic. It produces `Transcript`s with sample-accurate word ranges; speaker assignment is the responsibility of an external diarization stage and the indexer that joins the two.
+whispery is speaker-agnostic. Diarization runs as a sibling of whispery on the same source audio, not upstream or downstream of it; the indexer joins the two outputs by time-range overlap.
 
-The contract for downstream joiners:
+**Join contract (verified against `dia` v0.1.0).** The findit-studio diarization crate `dia` (in `/Users/user/Develop/findit-studio/dia`) emits `DiarizedSpan` values with a `range: mediatime::TimeRange` at the **same 1/16000 timebase** as whispery's `Word.range`. The minimal join is therefore an interval-overlap test on the shared timebase — no rescaling, no anchor types, no whispery-side speaker awareness:
 
-- Each `Word.range` is a half-open `mediatime::TimeRange` in source-audio sample space (1/16000 timebase). A diarization output of the form `(start, end, speaker_id)` joins to a word by interval overlap on the same audio timeline.
-- `Transcript.vad_segments` is the canonical anchor when overlap is ambiguous: a word that spans a VAD-segment boundary is more reliable than a word whose `range` straddles a silence gap inside the merged chunk.
-- The join is performed by the indexer (or a thin wrapper service), never by whispery itself. whispery never sees speaker IDs.
+```rust
+// indexer-side pseudo-code
+for word in transcript.words() {
+    for span in dia_spans_overlapping(word.range()) {
+        index.insert(WordRow {
+            chunk_id: transcript.chunk_id(),
+            word_text: word.text(),
+            range: word.range(),
+            speaker_id: Some(span.speaker_id()),
+            speaker_first_seen: span.is_new_speaker(),
+        });
+    }
+}
+```
 
-> **Open item — please confirm.** This section assumes a future diarization stage produces `(start, end, speaker_id)` segments at the same 1/16000 timebase. If your diarization plan (M0–M3, referenced by an external reviewer) constrains the join in a way that requires whispery to expose anything beyond `Word.range` and `Transcript.vad_segments` — for instance, per-VAD-segment confidence or pre-tokenisation phonetic timestamps — flag it before implementation begins.
+Concretely from `dia`:
 
-### 1.7 Crate vs service — open question
+```rust
+pub struct DiarizedSpan {
+    range: mediatime::TimeRange,         // 1/16000 timebase
+    speaker_id: u64,                      // session-local
+    is_new_speaker: bool,
+    average_activation: f32,
+    activity_count: u32,
+    clean_mask_fraction: f32,
+}
+```
 
-silero, soundevents, and textclap are Rust *library* crates with sync APIs. The reviewer's note that "new services must follow findit-silero-vad / findit-soundevents ThreadService pattern" suggests there may exist (or be planned) a *service* layer that wraps these libraries with an IPC boundary, separate from the library crates themselves.
+`Transcript.vad_segments()` is the secondary anchor when overlap is ambiguous (e.g., a word that straddles silence inside the merged chunk): the indexer should weight overlap with VAD segments more heavily than overlap with the chunk's outer `range`.
 
-This spec describes whispery as a **library crate** consistent with its siblings: callers link it directly into the indexer and drive it in-process. If your team convention requires every heavy-inference component to live behind an IPC boundary (a `findit-whispery` service binary), the implication is:
+**What whispery does not need to do.**
 
-- whispery the crate ships the public types and the Sans-I/O core.
-- A separate `findit-whispery-service` binary wraps `ManagedTranscriber` with a queue/IPC surface (likely matching the silero/soundevents service layout, which is not in this codebase).
-- §6's concurrency model is unchanged inside the service; only the call-site changes from in-process method calls to RPC.
+- whispery does not consume `DiarizedSpan`s. It does not depend on the `dia` crate.
+- whispery does not assign or track speaker IDs. `dia`'s speaker IDs are session-local `u64`s; cross-file speaker stability is the indexer's concern (a global cluster table keyed by embeddings, owned outside both whispery and dia).
+- whispery does not need to expose phonetic-level timestamps or per-VAD-segment confidence. The 1/16000 sample-accurate `Word.range` is sufficient for `dia`'s overlap-based join.
 
-> **Decision needed before implementation.** Crate-only (this spec as written), or crate + thin service wrapper (additional binary)? The crate is correct either way; the service binary is purely additive.
+This section pins the join contract; if a future `dia` revision introduces a different output shape, this spec must be revisited.
+
+### 1.7 Crate-only deployment (decided)
+
+whispery is a **library crate** consistent with its siblings (silero, soundevents, textclap, dia — all library crates with sync APIs). Callers link it directly into the indexer and drive it in-process. There is no `findit-whispery-service` binary in v1.
+
+If a wrapper service is later required for IPC isolation, it is a separately-shipped binary that calls `ManagedTranscriber` and exposes the runner's API over a queue or RPC surface; whispery the crate stays unchanged. This spec does not preclude that addition; it only declines to do it in v1.
 
 ---
 
@@ -1291,14 +1317,14 @@ Not a v1 blocker, but document the known constraints alongside the §6.3 design 
 
 The forced-alignment story requires a wav2vec2 phoneme/character model per language. Hugging Face has good coverage of major languages; long-tail languages may have only multilingual (XLSR / MMS) models. The spec defers model curation to a v2 `whispery-models` crate, but if the indexer's first deployment targets a language without a quality language-specific model, falling back to multilingual changes the alignment quality story. Confirm target-language coverage before committing to the forced-alignment path; if a target language has no usable aligner, that chunk emits with empty `words` per `AlignmentFallback::SkipChunk`.
 
-### 13.4 P4 alignment open questions (§1.6, §1.7)
+### 13.4 P4 architectural questions — resolved
 
-Both rely on memory the design author does not have access to. Concretely:
+Both questions are resolved and recorded in §1.6 / §1.7:
 
-- §1.6 assumes the M0–M3 diarization plan's join model is interval-overlap on `Word.range`. If the plan instead requires whispery to expose phonetic-level timestamps or per-VAD-segment confidence, that's an API addition.
-- §1.7's crate-vs-service decision changes deployment but not the public type surface; either path is implementable from this spec.
+- **§1.6 (diarization integration):** confirmed against `dia` v0.1.0. `dia::DiarizedSpan.range` uses `mediatime::TimeRange` at the 1/16000 timebase, identical to `Word.range`; the join is plain interval-overlap, no whispery-side API changes required.
+- **§1.7 (deployment):** crate-only for v1. A wrapper service binary, if ever needed, is additive and does not change whispery's public surface.
 
-Get explicit confirmation before implementation starts.
+These resolutions are load-bearing for the implementation plan; if either changes (e.g., `dia` ships a breaking API revision before whispery v1 lands), revisit §1.6 before merging.
 
 ---
 
