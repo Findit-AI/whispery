@@ -257,7 +257,7 @@ pub use mediatime::{Timebase, Timestamp, TimeRange};
 pub use types::{
     Transcript, Word, Lang, ChunkId, VadSegment,
     TranscriberError, WorkFailure, AsrFailureKind, AlignmentFailureKind,
-    PushKind, WorkerKind, InvalidLang,
+    PushKind, WorkerKind,
 };
 pub use core::{
     Transcriber, TranscriberConfig, LanguagePolicy,
@@ -504,28 +504,45 @@ impl Word {
 
 ### 4.4 Language
 
-A newtype around `SmolStr`. Whisper.cpp returns ISO 639-1 strings; we accept and emit the same. There is **no sentinel value**; `Lang` only ever holds a real ISO code. The "match any registered language" concept lives in the type system as `AlignerKey::Any` (§6.3), not as a magic `Lang` value.
+A typed enum over Whisper.cpp's supported language set. Marked `#[non_exhaustive]` so new variants can be added when whisper.cpp adds languages, without forcing a semver-major; carries an `Other(SmolStr)` variant so unknown ISO codes flowing in from whisper's auto-detect don't fail an indexing run — they propagate through to the indexer's logs.
 
 ```rust
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct Lang(smol_str::SmolStr);
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Lang {
+    En, Zh, De, Es, Ru, Ko, Fr, Ja, Pt, Tr,
+    Pl, Ca, Nl, Ar, Sv, It, Id, Hi, Fi, Vi,
+    // …99 known whisper.cpp variants total; full list in Appendix C.
+    /// ISO 639-1 (or whisper-supplied) code that did not match any
+    /// known variant. `from_iso639_1` and `as_str` round-trip through
+    /// this for unknown codes; the indexer can log the SmolStr value
+    /// and continue.
+    Other(smol_str::SmolStr),
+}
 
 impl Lang {
-    pub const EN: Self = Self(SmolStr::new_inline("en"));
-    pub const ZH: Self = Self(SmolStr::new_inline("zh"));
-    pub const JA: Self = Self(SmolStr::new_inline("ja"));
-    // …a curated list of constants for common languages
+    /// Total-function constructor: every `&str` produces a `Lang`.
+    /// Known whisper.cpp codes canonicalise to their named variant;
+    /// unknown codes go to `Lang::Other`. Never produces
+    /// `Lang::Other("en")` for an enum-known code — see the
+    /// canonicalisation invariant below.
+    pub fn from_iso639_1(s: &str) -> Self;
 
+    /// Stable round-trip with `from_iso639_1`. Named variants emit
+    /// their canonical ISO 639-1 string; `Other(s)` emits `s`.
     pub fn as_str(&self) -> &str;
-    pub fn from_iso639_1(s: &str) -> Result<Self, InvalidLang>;
 }
 
 impl Display for Lang { /* writes the ISO code */ }
 ```
 
-`Hash + Eq` are required because `Lang` (wrapped in `AlignerKey::Lang`) is a `HashMap` key in `AlignmentSet`. `Clone` because the runner clones it into `AsrParams.language_hint`.
+**Canonicalisation invariant.** For every named variant `V`, `Lang::from_iso639_1(V.as_str())` returns the named variant, **never** `Lang::Other(V.as_str().into())`. This is what makes structural `PartialEq`/`Hash` correct: `Lang::En != Lang::Other("en")` is fine because no path in the public API can produce `Lang::Other("en")`. The runner's worker does `Lang::from_iso639_1(detected.as_str())` to wrap whisper's output, so the canonicalisation runs on every detection.
 
-The `from_iso639_1` constructor validates against Whisper.cpp's supported language set (lookup table); unknown codes return `InvalidLang`. Callers that want to accept arbitrary tags use a private constructor.
+**Why `Other(SmolStr)` rather than `Result<Lang, InvalidLang>`.** An indexing engine processing thousands of hours of audio shouldn't fail a chunk when whisper detects a language we haven't enumerated yet. `Other` lets the chunk's transcript flow through with whatever string whisper produced; the indexer logs the unusual code and decides whether to retry, drop, or accept. The alternative — erroring at the boundary — forces every caller to write recovery logic for an event that should be a soft warning.
+
+**Variant addition is not a breaking change.** Because the enum is `#[non_exhaustive]`, adding `Lang::Yue` later forces external callers' matches to already have a `_` arm; their compiled code keeps working. The newly-named variant just stops appearing under `Lang::Other("yue")` and starts appearing under `Lang::Yue` — observable, but not a panic surface.
+
+**`AlignerKey::Lang(Lang)` hashing.** With the enum, `AlignerKey::Lang(Lang::En)` hashes by discriminant (one byte) instead of the SmolStr's content. `AlignerKey::Lang(Lang::Other(s))` falls back to hashing `s`'s contents. Both paths are correct; the typed-variant path is just faster.
 
 ### 4.5 Errors
 
@@ -621,10 +638,10 @@ pub enum AlignmentFailureKind {
 pub enum PushKind { Samples, VadSegment }
 pub enum WorkerKind { Asr, Alignment }
 
-/// Returned by `Lang::from_iso639_1` when the supplied string is
-/// not in Whisper.cpp's supported-language set.
-pub struct InvalidLang(pub smol_str::SmolStr);
-// Display: "unknown language code: {0}"
+// Note: there is no `InvalidLang` type. `Lang::from_iso639_1` is a
+// total function — every input string produces a `Lang`, with
+// unknown codes going to `Lang::Other(s)`. See §4.4 for the
+// canonicalisation invariant that keeps Eq/Hash consistent.
 
 #[cfg(feature = "runner")]
 pub enum RunnerError {
@@ -2186,7 +2203,37 @@ def merge_chunks(segments, chunk_size, onset, offset):
 
 ## Appendix B — Decisions deferred
 
-1. Whether `Lang` should be a typed enum over the Whisper-supported languages or a `SmolStr` newtype. v1 uses the newtype; revisit when we have a curated downstream consumer set.
+1. ~~Whether `Lang` should be a typed enum over the Whisper-supported languages or a `SmolStr` newtype.~~ **Resolved.** v1 uses a `#[non_exhaustive]` enum with an `Other(SmolStr)` escape hatch — see §4.4 and Appendix C.
 2. Whether `Transcript` should derive `Clone`. v1 does not; the dispatcher moves it through a single channel. Revisit if the indexer needs to fan out the same chunk to multiple writers.
 3. Whether the runner's dispatch loop should run on a dedicated background thread instead of inline on the caller's thread inside `process_packet`. v1 inline; revisit if profiling shows `process_packet` stalls dominating.
 4. ~~Whether to maintain a per-Transcriber language cache.~~ **Resolved.** v1 implements `LanguagePolicy::AutoLockAfter(1)` as the default — language is detected on the first non-trivial chunk and locked for the rest of the session.
+
+## Appendix C — `Lang` variant table
+
+The full set of named variants on `Lang`, mirroring whisper.cpp's `g_lang` table. Variant names use Rust PascalCase; the wire form (`as_str` / `from_iso639_1`) uses the lowercase ISO 639-1 code (or the multi-letter form for `Haw` / `Yue`).
+
+```rust
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Lang {
+    En, Zh, De, Es, Ru, Ko, Fr, Ja, Pt, Tr,
+    Pl, Ca, Nl, Ar, Sv, It, Id, Hi, Fi, Vi,
+    He, Uk, El, Ms, Cs, Ro, Da, Hu, Ta, No,
+    Th, Ur, Hr, Bg, Lt, La, Mi, Ml, Cy, Sk,
+    Te, Fa, Lv, Bn, Sr, Az, Sl, Kn, Et, Mk,
+    Br, Eu, Is, Hy, Ne, Mn, Bs, Kk, Sq, Sw,
+    Gl, Mr, Pa, Si, Km, Sn, Yo, So, Af, Oc,
+    Ka, Be, Tg, Sd, Gu, Am, Yi, Lo, Uz, Fo,
+    Ht, Ps, Tk, Nn, Mt, Sa, Lb, My, Bo, Tl,
+    Mg, As, Tt, Haw, Ln, Ha, Ba, Jw, Su, Yue,
+    Other(smol_str::SmolStr),
+}
+```
+
+99 named variants plus `Other`. The list is generated from whisper.cpp's source; a `#[test]` round-trips every named variant through `from_iso639_1(v.as_str())` and asserts the result equals `v` (canonicalisation invariant). When whisper.cpp ships a new language, the v1.x patch is to insert the variant alphabetically here and add the `as_str` / `from_iso639_1` match arms — no other code paths need touching.
+
+Naming notes:
+
+- `Haw` is Hawaiian (3-letter code "haw"; ISO 639-2 since 639-1 doesn't list it).
+- `Yue` is Cantonese (3-letter code "yue").
+- `Jw` is Javanese (whisper.cpp uses the older "jw" code; modern ISO 639-1 is "jv"; we accept "jv" via `Other` for now and may rename in v2 if whisper.cpp aligns).
