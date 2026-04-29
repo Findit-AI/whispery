@@ -1,4 +1,4 @@
 //! Public types.
 
-pub use self::placeholder::*;
-mod placeholder { /* fills in subsequent tasks */ }
+mod chunk_id;
+pub use chunk_id::ChunkId;
