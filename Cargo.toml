@@ -27,6 +27,11 @@ tempfile  = "3"
 [features]
 default  = ["std"]
 std      = ["mediatime/std", "smol_str/std", "serde?/std"]
+# Stubs for Plan B / Plan C. Declared here so cfg(feature = "...")
+# branches in Plan A code don't emit `unexpected_cfg` warnings; the
+# features pull no deps and gate no behaviour until Plan B/C land.
+runner    = []
+alignment = ["runner"]
 
 [lib]
 name = "whispery"

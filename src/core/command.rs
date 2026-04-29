@@ -204,6 +204,7 @@ pub struct AsrParamsOverride {
 
 /// Used by the dispatch state machine to refer to a chunk's audio
 /// + sub-segments without copying.
+#[allow(dead_code)] // consumed by the dispatch state machine in Task 16
 pub(crate) type ChunkAudio = Arc<[f32]>;
 
 #[cfg(test)]
