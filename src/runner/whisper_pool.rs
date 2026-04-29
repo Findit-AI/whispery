@@ -884,4 +884,14 @@ mod tests {
         ) -> Result<crate::core::AsrResult, crate::types::WorkFailure> =
             run_with_temperature_ladder;
     }
+
+    #[test]
+    fn whisper_pool_handles_are_send() {
+        fn assert_send<T: Send>() {}
+        // The Sender / Receiver halves crossbeam exposes are Send + Sync;
+        // this assertion fails to compile if a future refactor introduces
+        // a non-Send field.
+        assert_send::<crossbeam_channel::Sender<AsrWorkItem>>();
+        assert_send::<crossbeam_channel::Receiver<AsrResultMsg>>();
+    }
 }
