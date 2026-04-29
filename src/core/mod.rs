@@ -1,5 +1,6 @@
 //! Sans-I/O core state machine.
 
+mod buffer;
 mod command;
 mod cut;
 mod event;
