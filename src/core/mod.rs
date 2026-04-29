@@ -3,6 +3,7 @@
 mod buffer;
 mod command;
 mod cut;
+mod dispatch;
 mod event;
 
 pub use command::{
