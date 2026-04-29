@@ -117,6 +117,17 @@ impl Cut {
         self.chunk_size_samples
     }
 
+    /// Highest sample index ever pushed (inclusive of last segment's
+    /// end_sample). `None` before any push. Used by `Transcriber`
+    /// to enforce strict-monotonic VAD segment ordering.
+    pub(crate) fn last_pushed_end(&self) -> Option<u64> {
+        if self.next_vad_seq == 0 {
+            None
+        } else {
+            Some(self.current_end)
+        }
+    }
+
     /// Push a VAD segment through the cut state machine. Returns
     /// `Some(MergedChunk)` if this push closed an accumulating
     /// chunk; `None` otherwise.

@@ -15,7 +15,7 @@ use crate::core::command::{AsrParams, Command};
 use crate::core::cut::Cut;
 use crate::core::dispatch::Dispatch;
 use crate::core::event::Event;
-use crate::types::Lang;
+use crate::types::{ChunkId, Lang, TranscriberError, VadSegment};
 
 /// Language-detection / locking strategy.
 #[derive(Clone, Debug)]
@@ -166,5 +166,141 @@ impl Transcriber {
     /// configured caps?
     pub fn would_accept(&self, samples_len: usize, _vad_count: usize) -> bool {
         self.buffered_samples() + samples_len <= self.config.buffer_cap_samples
+    }
+
+    /// Push samples into the buffer. See spec §4.1 / §5.4.
+    ///
+    /// Errors:
+    /// - `PtsRegression`, `GapExceedsTolerance`, `Backpressure`,
+    ///   `InconsistentTimebase`, `AfterEof` per `SampleBuffer::append`.
+    pub fn push_samples(
+        &mut self,
+        starts_at: Timestamp,
+        samples: &[f32],
+    ) -> Result<(), TranscriberError> {
+        if self.eof_signaled {
+            return Err(TranscriberError::AfterEof);
+        }
+        self.buffer.append(starts_at, samples)
+    }
+
+    /// Push a VAD segment into the cut state machine. See spec
+    /// §5.3.
+    ///
+    /// Errors:
+    /// - `OutputTimebaseUnset` if no `push_samples` has been called.
+    /// - `PtsRegression { kind: VadSegment }` if `seg.start_sample`
+    ///   is not strictly greater than the previous VAD segment's
+    ///   `end_sample`.
+    /// - `AfterEof` if `signal_eof()` was called.
+    pub fn push_vad_segment(&mut self, seg: VadSegment) -> Result<(), TranscriberError> {
+        if self.eof_signaled {
+            return Err(TranscriberError::AfterEof);
+        }
+        if self.buffer.output_timebase().is_none() {
+            return Err(TranscriberError::OutputTimebaseUnset);
+        }
+        // Strict-monotonic check against the cut state machine's
+        // last accumulated end. Cut tracks current_end internally;
+        // we replicate the check here to surface PtsRegression for
+        // the explicit test contract.
+        if let Some(last_end) = self.cut.last_pushed_end() {
+            if seg.start_sample() < last_end {
+                return Err(TranscriberError::PtsRegression {
+                    kind: crate::types::PushKind::VadSegment,
+                    advance: seg.start_sample() as i64 - last_end as i64,
+                });
+            }
+        }
+
+        let merged_chunks = self.cut.push_segment(seg);
+        for chunk in merged_chunks {
+            let chunk_id = ChunkId::from_raw(self.next_chunk_id);
+            self.next_chunk_id += 1;
+            self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
+        }
+        Ok(())
+    }
+
+    /// Mark the input stream as ended. Idempotent. Calling before
+    /// any push is a no-op (Ok(())). Errors: never returns Err in
+    /// v1; signature carries `Result<(), TranscriberError>` for
+    /// forward compatibility.
+    pub fn signal_eof(&mut self) -> Result<(), TranscriberError> {
+        if self.eof_signaled {
+            return Ok(());
+        }
+        self.eof_signaled = true;
+        if self.buffer.output_timebase().is_some() {
+            if let Some(chunk) = self.cut.flush() {
+                let chunk_id = ChunkId::from_raw(self.next_chunk_id);
+                self.next_chunk_id += 1;
+                self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::VadSegment;
+    use core::num::NonZeroU32;
+
+    fn tb_48k() -> Timebase {
+        Timebase::new(1, NonZeroU32::new(48_000).unwrap())
+    }
+
+    fn ts(pts: i64) -> Timestamp {
+        Timestamp::new(pts, tb_48k())
+    }
+
+    fn fresh() -> Transcriber {
+        Transcriber::new(TranscriberConfig::default())
+    }
+
+    #[test]
+    fn push_vad_before_push_samples_returns_output_timebase_unset() {
+        let mut t = fresh();
+        let r = t.push_vad_segment(VadSegment::new(0, 100));
+        assert!(matches!(r, Err(TranscriberError::OutputTimebaseUnset)));
+    }
+
+    #[test]
+    fn push_samples_then_vad_works() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 1000]).unwrap();
+        t.push_vad_segment(VadSegment::new(0, 200)).unwrap();
+    }
+
+    #[test]
+    fn vad_segment_regression_returns_pts_regression() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 10_000]).unwrap();
+        t.push_vad_segment(VadSegment::new(100, 200)).unwrap();
+        let r = t.push_vad_segment(VadSegment::new(150, 250)); // overlaps
+        assert!(matches!(
+            r,
+            Err(TranscriberError::PtsRegression { kind: crate::types::PushKind::VadSegment, .. })
+        ));
+    }
+
+    #[test]
+    fn signal_eof_then_push_rejects() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 100]).unwrap();
+        t.signal_eof().unwrap();
+        let r = t.push_samples(ts(100), &[0.0; 100]);
+        assert!(matches!(r, Err(TranscriberError::AfterEof)));
+        let r = t.push_vad_segment(VadSegment::new(0, 100));
+        assert!(matches!(r, Err(TranscriberError::AfterEof)));
+    }
+
+    #[test]
+    fn signal_eof_idempotent_and_noop_before_push() {
+        let mut t = fresh();
+        t.signal_eof().unwrap();
+        t.signal_eof().unwrap();
     }
 }
