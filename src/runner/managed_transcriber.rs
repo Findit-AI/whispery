@@ -148,4 +148,49 @@ impl ManagedTranscriber {
 
         Ok(progress)
     }
+
+    /// Block (with `dispatch_idle_poll` safety) until at least one
+    /// worker channel has data, OR the safety-timeout fires. Does NOT
+    /// consume any message — the next `drive_one_step` does that via
+    /// `try_recv`. See spec §6.4.1 for why `Select::ready_timeout`
+    /// is the correct primitive (consuming variants would silently
+    /// drop results: NB-β).
+    fn wait_for_progress(&self) -> Result<(), RunnerError> {
+        let mut sel = crossbeam_channel::Select::new();
+        sel.recv(&self.whisper_pool.result_rx);
+        // ready_timeout returns Ok(idx) with idx of the first ready
+        // op (including disconnects), or Err(SelectTimeoutError) on
+        // timeout. We don't care which arm fired — the next
+        // drive_one_step's try_recv handles message vs. disconnect.
+        let _ = sel.ready_timeout(self.dispatch_idle_poll);
+        Ok(())
+    }
+
+    /// Drive the inline dispatch loop in a saturation wait.
+    ///
+    /// Loops:
+    ///   1. drive_one_step — if Ok(true), made progress; loop again.
+    ///   2. else if no command is parked, exit (genuine idle).
+    ///   3. else wait_for_progress, then loop.
+    ///
+    /// Used by both `process_packet` (after pushing inputs) and
+    /// `drain` (until idle).
+    fn pump_until_idle_or_progress(&mut self) -> Result<(), RunnerError> {
+        loop {
+            if self.drive_one_step()? {
+                continue;
+            }
+            // No progress. Is there a parked command waiting?
+            // We can't peek without popping; the only way to detect
+            // a parked command is to call poll_command, then re-park
+            // if Some.
+            match self.core.poll_command() {
+                None => return Ok(()),
+                Some(cmd) => {
+                    self.core.unpoll_command(cmd);
+                    self.wait_for_progress()?;
+                }
+            }
+        }
+    }
 }
