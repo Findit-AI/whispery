@@ -101,7 +101,9 @@ impl Cut {
     /// converted to 16 kHz samples once.
     pub(crate) fn new(chunk_size: Duration) -> Self {
         let secs = chunk_size.as_secs_f64();
-        let samples = (secs * crate::time::SAMPLE_RATE_HZ as f64).round() as u64;
+        // `.round()` is not available in `no_std`; add 0.5 then truncate,
+        // which is equivalent for non-negative values.
+        let samples = (secs * crate::time::SAMPLE_RATE_HZ as f64 + 0.5) as u64;
         Self {
             chunk_size_samples: samples,
             next_vad_seq: 0,

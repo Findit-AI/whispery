@@ -2,11 +2,7 @@
 //! speech-to-text indexing pipelines.
 //!
 //! See `docs/superpowers/specs/2026-04-28-whispery-cut-batch-whisper-design.md`
-//! for the full design. The crate is organised as a small public
-//! type surface (this file's re-exports), a `core` module with the
-//! Sans-I/O state machine (no ML deps), and — gated behind the
-//! `runner` and `alignment` features in later milestones — a runner
-//! module wrapping whisper-rs and an `ort`-based forced aligner.
+//! for the full design.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -19,3 +15,24 @@ extern crate alloc;
 pub mod time;
 pub mod types;
 pub mod core;
+
+// Re-exports of mediatime types that appear in whispery's public API
+// (so consumers don't need to add a separate `mediatime` dependency
+// just to name them; they may still do so to call methods like
+// `rescale_to`).
+//
+// SemVer note: re-exporting mediatime types ties whispery's public
+// API to mediatime's. A breaking change in mediatime (major-version
+// bump) is automatically a breaking change for whispery, so the
+// `mediatime` dependency is pinned to a single major in Cargo.toml.
+pub use mediatime::{Timebase, TimeRange, Timestamp};
+
+pub use types::{
+    AlignmentFailureKind, AsrFailureKind, ChunkId, Lang, PushKind, Transcript,
+    TranscriberError, VadSegment, Word, WorkFailure, WorkerKind,
+};
+
+pub use core::{
+    AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, Event,
+    LanguagePolicy, SamplingStrategy, Transcriber, TranscriberConfig,
+};
