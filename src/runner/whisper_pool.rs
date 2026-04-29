@@ -1,7 +1,12 @@
 //! Whisper worker pool. See spec §6.2.
 
+use alloc::sync::Arc;
 use core::time::Duration;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+
+use crate::core::AsrParams;
+use crate::types::ChunkId;
 
 /// Configuration for the runner's whisper worker pool.
 ///
@@ -241,6 +246,27 @@ const fn is_gpu_backend_active_const() -> bool {
     ))
 }
 
+/// One unit of ASR work shipped to a worker thread. Crate-private.
+pub(super) struct AsrWorkItem {
+    /// Identity of the chunk this inference fulfils.
+    pub chunk_id: ChunkId,
+    /// Chunk audio (16 kHz f32 mono); shared via `Arc` with the core.
+    pub samples: Arc<[f32]>,
+    /// ASR knobs (per-call overrides already merged in by the runner).
+    pub params: AsrParams,
+    /// Per-job timeout. Stamped at dispatch time so each in-flight
+    /// chunk carries its own budget; the worker's watchdog feeds
+    /// this into the abort_flag check.
+    pub asr_timeout: core::time::Duration,
+    /// Watchdog flag. The worker installs this into `FullParams` via
+    /// `set_abort_callback_safe`; a separate watchdog thread flips
+    /// it true if the per-job timeout elapses.
+    pub abort_flag: Arc<AtomicBool>,
+}
+
+/// Worker-emitted result for one chunk. Crate-private.
+pub(super) type AsrResultMsg = (ChunkId, Result<crate::core::AsrResult, crate::types::WorkFailure>);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +313,12 @@ mod tests {
         cfg.set_model_path("/var/cache/model.gguf");
         assert_eq!(cfg.worker_count(), 3);
         assert_eq!(cfg.model_path(), Path::new("/var/cache/model.gguf"));
+    }
+
+    #[test]
+    fn asr_work_item_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<AsrWorkItem>();
+        assert_send::<AsrResultMsg>();
     }
 }
