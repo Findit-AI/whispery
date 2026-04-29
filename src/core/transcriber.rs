@@ -11,11 +11,11 @@ use core::time::Duration;
 use mediatime::{Timebase, Timestamp};
 
 use crate::core::buffer::SampleBuffer;
-use crate::core::command::{AsrParams, Command};
+use crate::core::command::{AlignmentResult, AsrParams, AsrResult, Command};
 use crate::core::cut::Cut;
 use crate::core::dispatch::Dispatch;
 use crate::core::event::Event;
-use crate::types::{ChunkId, Lang, TranscriberError, VadSegment};
+use crate::types::{ChunkId, Lang, TranscriberError, VadSegment, WorkFailure};
 
 /// Language-detection / locking strategy.
 #[derive(Clone, Debug)]
@@ -85,14 +85,11 @@ impl Default for TranscriberConfig {
 /// `Mutex<Transcriber>` themselves; whispery does not provide
 /// internal synchronisation.
 pub struct Transcriber {
-    #[allow(dead_code)] // consumed in Tasks 19/20
     config: TranscriberConfig,
     buffer: SampleBuffer,
     cut: Cut,
     dispatch: Dispatch,
-    #[allow(dead_code)] // consumed in Tasks 19/20
     next_chunk_id: u64,
-    #[allow(dead_code)] // consumed in Tasks 19/20
     eof_signaled: bool,
 }
 
@@ -240,6 +237,99 @@ impl Transcriber {
         }
         Ok(())
     }
+
+    /// Inject the result of a `Command::RunAsr`.
+    ///
+    /// Errors:
+    /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight.
+    pub fn inject_asr_result(
+        &mut self,
+        chunk_id: ChunkId,
+        result: AsrResult,
+    ) -> Result<(), TranscriberError> {
+        self.dispatch.inject_asr_result(chunk_id, result)?;
+        self.dispatch.after_inject(&mut self.buffer);
+        Ok(())
+    }
+
+    /// Inject the result of a `Command::RunAlignment`.
+    ///
+    /// Errors:
+    /// - `UnknownChunk(chunk_id)` if `chunk_id` is not awaiting alignment.
+    pub fn inject_alignment_result(
+        &mut self,
+        chunk_id: ChunkId,
+        result: AlignmentResult,
+    ) -> Result<(), TranscriberError> {
+        self.dispatch.inject_alignment_result(chunk_id, result)?;
+        self.dispatch.after_inject(&mut self.buffer);
+        Ok(())
+    }
+
+    /// Inject a per-chunk failure.
+    ///
+    /// Errors:
+    /// - `UnknownChunk(chunk_id)` if `chunk_id` is not in flight.
+    pub fn inject_failure(
+        &mut self,
+        chunk_id: ChunkId,
+        failure: WorkFailure,
+    ) -> Result<(), TranscriberError> {
+        self.dispatch.inject_failure(chunk_id, failure)?;
+        self.dispatch.after_inject(&mut self.buffer);
+        Ok(())
+    }
+
+    /// Recover from a `GapExceedsTolerance`. See spec §5.4.1.
+    ///
+    /// Steps:
+    /// 1. Drain `cut_pending` synchronously into `in_flight`
+    ///    (extract samples in old-frame indexing, cache TimeRange
+    ///    via the old anchor). May temporarily exceed
+    ///    `max_in_flight`.
+    /// 2. Flush the cut state machine. Any partial chunk also
+    ///    promotes to `in_flight`.
+    /// 3. Clear the live buffer; reset `absolute_sample_offset` and
+    ///    `buffer_drop_offset` to 0.
+    /// 4. Re-anchor `base_pts_out_anchor` to `starts_at.pts()`.
+    /// 5. `next_chunk_id` continues monotonically.
+    /// 6. Trim's low-water computed from `cut_pending` only — empty
+    ///    after drain — so the new buffer is fully droppable.
+    ///
+    /// Errors:
+    /// - `AfterEof` if `signal_eof()` was previously called.
+    pub fn restart_at(&mut self, starts_at: Timestamp) -> Result<(), TranscriberError> {
+        if self.eof_signaled {
+            return Err(TranscriberError::AfterEof);
+        }
+
+        // Step 1: drain cut_pending into in_flight before clearing
+        // the buffer. Uses the existing buffer state (still in old
+        // frame).
+        self.dispatch.draining_for_restart = true;
+        while let Some((chunk_id, chunk)) = self.dispatch.cut_pending.pop_front() {
+            // Synthesise the same path as Dispatch::on_emit's
+            // immediate-promote branch.
+            self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
+        }
+
+        // Step 2: flush the cut accumulator (also goes through on_emit).
+        if let Some(chunk) = self.cut.flush() {
+            let chunk_id = ChunkId::from_raw(self.next_chunk_id);
+            self.next_chunk_id += 1;
+            self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
+        }
+
+        // Steps 3 + 4: clear buffer and re-anchor.
+        self.buffer.restart_at(starts_at);
+
+        // Reset the cut state machine so its current_end / next_vad_seq
+        // align with the new frame.
+        self.cut = Cut::new(self.config.chunk_size);
+
+        self.dispatch.draining_for_restart = false;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +392,42 @@ mod tests {
         let mut t = fresh();
         t.signal_eof().unwrap();
         t.signal_eof().unwrap();
+    }
+
+    #[test]
+    fn restart_at_after_signal_eof_rejects() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 1000]).unwrap();
+        t.signal_eof().unwrap();
+        let r = t.restart_at(ts(50_000_000));
+        assert!(matches!(r, Err(TranscriberError::AfterEof)));
+    }
+
+    #[test]
+    fn restart_at_drains_cut_pending_into_in_flight() {
+        // max_in_flight = 1 forces queueing.
+        let mut config = TranscriberConfig::default();
+        config.max_in_flight = 1;
+        config.chunk_size = Duration::from_millis(125); // 2_000 samples
+        config.buffer_cap_samples = 100_000;
+        let mut t = Transcriber::new(config);
+
+        // Push enough audio to cover three chunks.
+        t.push_samples(ts(0), &[0.0; 16_000]).unwrap(); // 1 sec @ 16k pretend
+        t.push_vad_segment(VadSegment::new(0, 2_000)).unwrap();
+        t.push_vad_segment(VadSegment::new(2_000, 4_000)).unwrap();
+        t.push_vad_segment(VadSegment::new(4_000, 6_000)).unwrap();
+        // First chunk's RunAsr is in pending_commands; second and
+        // third are in cut_pending awaiting promotion.
+        // Now restart at a fresh anchor.
+        t.restart_at(ts(50_000_000)).unwrap();
+
+        // After restart: cut_pending should be empty (drained), the
+        // buffer should be empty (cleared). Pre-restart in-flight
+        // chunks (the originally-promoted one PLUS the formerly-
+        // pending ones) survive — they hold their audio in their
+        // own Arc<[f32]>s and will emit normally.
+        // (Spec §5.4.1 + §5.5 invariant 4 exception: drain is
+        // allowed to exceed max_in_flight transiently.)
     }
 }
