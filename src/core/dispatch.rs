@@ -243,7 +243,7 @@ impl Dispatch {
         buffer: &SampleBuffer,
     ) {
         let extracted = ExtractedChunk::extract_from(chunk_id, chunk, buffer);
-        if self.in_flight.len() < self.effective_max_in_flight() {
+        if self.can_promote(chunk_id) {
             self.promote_extracted(extracted);
         } else {
             self.cut_pending.push_back(extracted);
@@ -262,30 +262,44 @@ impl Dispatch {
         self.cut_pending.iter().map(|c| c.samples.len()).sum()
     }
 
-    /// Effective parallel-dispatch cap. Normally `max_in_flight`,
-    /// but capped to `n` while `LanguagePolicy::AutoLockAfter(n)` is
-    /// still unlocked.
+    /// Decide whether a chunk with id `chunk_id` may be promoted to
+    /// `in_flight` right now, given the current `max_in_flight`
+    /// budget and (for unlocked AutoLockAfter) the observation
+    /// window threshold.
     ///
-    /// Codex round-6 fix: pre-fix code dispatched all chunks up to
-    /// `max_in_flight` immediately, so chunks 1..N were issued with
-    /// `language_hint = None` before chunk 0's ASR result came back.
-    /// Each could independently auto-detect a different language,
-    /// breaking the auto-lock contract that says "lock detection
-    /// after the first non-empty chunks". Holding back chunks past
-    /// the observation window ensures the lock applies to every
-    /// chunk past the window.
+    /// Round-6 introduced an "in-flight count cap of `n`" gate to
+    /// hold back unhinted chunks. Round-10 (this method) replaces
+    /// it with a per-ChunkId threshold:
+    /// `threshold = auto_lock_cursor + (n - observations.len())`.
     ///
-    /// Round-7: this gate is now preserved across `restart_at` —
-    /// the old `draining_for_restart` bypass was removed (cut_pending
-    /// entries hold pre-extracted audio, so they no longer need the
-    /// drain to preserve their data).
-    fn effective_max_in_flight(&self) -> usize {
+    /// Chunks with id < threshold are observation candidates —
+    /// they may run unhinted and contribute to the lock. Chunks
+    /// with id >= threshold wait for the lock regardless of
+    /// available in-flight slots.
+    ///
+    /// The pre-round-10 count-cap had a sliding-window bug: when
+    /// chunk 0 of an `AutoLockAfter(3)` stream completed and its
+    /// in-flight slot freed, chunk 3 was promoted with no hint
+    /// even though chunks 1 and 2 might still complete and lock
+    /// the language. Tracking the threshold by ChunkId fixes that:
+    /// chunk 3 is past the observation window and waits regardless
+    /// of slot count.
+    ///
+    /// Round-7 invariant preserved: cut_pending entries hold
+    /// pre-extracted audio, so the gate is enforced even across
+    /// `restart_at`.
+    fn can_promote(&self, chunk_id: ChunkId) -> bool {
+        if self.in_flight.len() >= self.max_in_flight {
+            return false;
+        }
         if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
             if self.locked_language.is_none() {
-                return (*n).min(self.max_in_flight);
+                let slack = n.saturating_sub(self.auto_lock_observations.len());
+                let threshold = self.auto_lock_cursor.as_u64() + slack as u64;
+                return chunk_id.as_u64() < threshold;
             }
         }
-        self.max_in_flight
+        true
     }
 
     /// Move a pre-extracted chunk to `in_flight` and queue its
@@ -396,12 +410,17 @@ impl Dispatch {
         self.flush_in_order_events();
         let low = self.low_water_samples(cut_accumulator_start, safe_trim_high_water);
         buffer.trim_to(low);
-        // Promote pending chunks if slots are open under the effective
-        // cap (round-6 fix: cap is `n` while AutoLockAfter is unlocked).
-        while self.in_flight.len() < self.effective_max_in_flight()
-            && !self.cut_pending.is_empty()
-        {
-            let extracted = self.cut_pending.pop_front().expect("just checked non-empty");
+        // Promote pending chunks while the gate allows them. Round-10
+        // gate is per-ChunkId (auto_lock_cursor + n - observations.len());
+        // older slots free up when observations land or the lock fires.
+        // Peek the front entry to ask `can_promote(its chunk_id)`; if
+        // it's gated, stop (cut_pending is in chunk_id order, so later
+        // entries are gated too).
+        while let Some(front_id) = self.cut_pending.front().map(|e| e.chunk_id) {
+            if !self.can_promote(front_id) {
+                break;
+            }
+            let extracted = self.cut_pending.pop_front().expect("just peeked");
             self.promote_extracted(extracted);
         }
     }
@@ -1182,6 +1201,123 @@ mod tests {
                 _ => panic!("expected RunAsr"),
             }
         }
+    }
+
+    /// Codex round-10 finding [high]: AutoLockAfter(n>1) must hold
+    /// back chunks past the observation window even after earlier
+    /// observation chunks complete. Pre-fix gate was a fixed
+    /// in-flight count cap of `n`, which slid: when chunk 0 of an
+    /// AutoLockAfter(3) stream completed and freed a slot, chunk 3
+    /// was promoted with `language_hint = None` even though the
+    /// lock hadn't fired (chunks 1 and 2 still pending). Chunk 3
+    /// would run ASR without the locked language, defeating the
+    /// AutoLockAfter contract for n>1.
+    ///
+    /// Post-fix: gate by ChunkId threshold = auto_lock_cursor +
+    /// (n - observations.len()). Chunks past that threshold wait
+    /// for the lock regardless of in_flight occupancy.
+    #[test]
+    fn auto_lock_after_n_holds_back_post_window_chunks_until_lock() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            8,
+            LanguagePolicy::AutoLockAfter(3),
+        );
+        let mut b = make_buffer_with_samples(20_000);
+
+        d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
+        d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
+        d.on_emit(fake_chunk(2_000, 3_000), ChunkId::from_raw(2), &b);
+        d.on_emit(fake_chunk(3_000, 4_000), ChunkId::from_raw(3), &b);
+
+        // First three chunks form the observation window — promoted.
+        // Chunk 3 is past the window, must wait.
+        assert_eq!(d.in_flight.len(), 3);
+        assert_eq!(d.cut_pending.len(), 1, "chunk 3 must wait past the observation window");
+
+        // Chunk 0 returns En. Only 1/3 observations; lock not set.
+        d.inject_asr_result(
+            ChunkId::from_raw(0),
+            AsrResult::new(SmolStr::new("a"), Lang::En, -0.5, 0.05, 0.0),
+        ).unwrap();
+        d.after_inject(&mut b, Some(0), u64::MAX);
+        assert_eq!(d.locked_language, None);
+        // Pre-fix: chunk 3 promoted here (slot freed). Post-fix: still pending.
+        assert_eq!(d.cut_pending.len(), 1,
+            "chunk 3 must NOT be promoted just because chunk 0 freed a slot");
+
+        // Chunk 1 returns En. 2/3 observations; lock not set.
+        d.inject_asr_result(
+            ChunkId::from_raw(1),
+            AsrResult::new(SmolStr::new("b"), Lang::En, -0.5, 0.05, 0.0),
+        ).unwrap();
+        d.after_inject(&mut b, Some(0), u64::MAX);
+        assert_eq!(d.locked_language, None);
+        assert_eq!(d.cut_pending.len(), 1, "chunk 3 still must not be promoted");
+
+        // Chunk 2 returns En. 3/3 observations; lock fires.
+        d.inject_asr_result(
+            ChunkId::from_raw(2),
+            AsrResult::new(SmolStr::new("c"), Lang::En, -0.5, 0.05, 0.0),
+        ).unwrap();
+        d.after_inject(&mut b, Some(0), u64::MAX);
+        assert_eq!(d.locked_language, Some(Lang::En));
+
+        // Chunk 3 must now be promoted, with the locked hint applied.
+        assert_eq!(d.cut_pending.len(), 0, "chunk 3 promoted after lock");
+        let mut found_chunk_3 = false;
+        for cmd in d.pending_commands.iter() {
+            if let Command::RunAsr { chunk_id, params, .. } = cmd {
+                if chunk_id.as_u64() == 3 {
+                    assert_eq!(params.language_hint(), Some(&Lang::En),
+                        "chunk 3 (post-lock) must carry the locked hint");
+                    found_chunk_3 = true;
+                }
+            }
+        }
+        assert!(found_chunk_3, "chunk 3's RunAsr command must be queued post-lock");
+    }
+
+    /// Round-10 corollary: if an early observation chunk resolves
+    /// empty/failed, the threshold slides forward by one and the
+    /// next chunk becomes a candidate (still without the lock).
+    /// Reproduction: AutoLockAfter(2). Chunk 0 returns empty. The
+    /// threshold was 0+2=2 (chunks 0, 1 in window); after chunk 0's
+    /// empty result advances cursor to 1, threshold = 1+2 = 3,
+    /// so chunk 2 is now a candidate.
+    #[test]
+    fn auto_lock_after_threshold_slides_on_empty() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            8,
+            LanguagePolicy::AutoLockAfter(2),
+        );
+        let mut b = make_buffer_with_samples(20_000);
+
+        d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
+        d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
+        d.on_emit(fake_chunk(2_000, 3_000), ChunkId::from_raw(2), &b);
+
+        // Initial threshold = 0 + 2 = 2. Chunks 0, 1 in flight; 2 waits.
+        assert_eq!(d.in_flight.len(), 2);
+        assert_eq!(d.cut_pending.len(), 1);
+
+        // Chunk 0 returns empty — cursor advances, observations stays 0.
+        d.inject_asr_result(
+            ChunkId::from_raw(0),
+            AsrResult::new(SmolStr::new(""), Lang::En, -1.0, 0.95, 0.0),
+        ).unwrap();
+        d.after_inject(&mut b, Some(0), u64::MAX);
+
+        // Threshold = 1 + 2 = 3. Chunk 2 (id=2) is now a candidate
+        // and gets promoted (id < 3).
+        assert_eq!(d.locked_language, None);
+        assert_eq!(d.cut_pending.len(), 0,
+            "chunk 2 promoted after empty chunk 0 advanced threshold");
+        assert_eq!(d.in_flight.len(), 2,
+            "chunk 1 still in flight + chunk 2 just promoted");
     }
 
     /// Tiebreaking: with n=2 and [En, Zh] (each observed once), the
