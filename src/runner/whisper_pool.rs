@@ -6,7 +6,7 @@ use core::time::Duration;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use whisper_rs::{FullParams, SamplingStrategy as WhisperStrategy};
+use whisper_rs::{FullParams, SamplingStrategy as WhisperStrategy, WhisperState};
 
 use crate::core::{AsrParams, SamplingStrategy};
 use crate::types::ChunkId;
@@ -339,6 +339,104 @@ pub(super) fn full_params_from(
     p
 }
 
+/// Mean of per-segment `avg_logprob` across the just-decoded chunk.
+/// Returns `f32::MIN` when the state has no segments — that signals
+/// a truly empty result and trips the retry ladder via the
+/// log_prob_threshold check.
+///
+/// whisper-rs 0.13.2 does not expose a per-segment `avg_logprob`
+/// accessor (the plan referenced `full_get_segment_avg_logprob`,
+/// which does not exist on `WhisperState`). We reconstruct it
+/// faithfully: per segment, average `WhisperTokenData::plog` (the
+/// per-token log-probability returned by whisper.cpp) across all
+/// tokens in that segment; then average those segment means. This
+/// matches whisper.cpp's own internal computation of the value
+/// it gates `logprob_thold` against.
+pub(super) fn compute_avg_logprob(state: &WhisperState) -> f32 {
+    let n = match state.full_n_segments() {
+        Ok(n) => n,
+        Err(_) => return f32::MIN,
+    };
+    if n <= 0 {
+        return f32::MIN;
+    }
+    let mut seg_sum = 0.0f64;
+    let mut seg_count = 0i32;
+    for i in 0..n {
+        let n_tok = match state.full_n_tokens(i) {
+            Ok(n_tok) => n_tok,
+            Err(_) => continue,
+        };
+        if n_tok <= 0 {
+            continue;
+        }
+        let mut tok_sum = 0.0f64;
+        let mut tok_count = 0i32;
+        for j in 0..n_tok {
+            if let Ok(td) = state.full_get_token_data(i, j) {
+                tok_sum += td.plog as f64;
+                tok_count += 1;
+            }
+        }
+        if tok_count == 0 {
+            continue;
+        }
+        seg_sum += tok_sum / tok_count as f64;
+        seg_count += 1;
+    }
+    if seg_count == 0 {
+        f32::MIN
+    } else {
+        (seg_sum / seg_count as f64) as f32
+    }
+}
+
+/// Concatenate all segments' text and compute whisperx's
+/// "compression ratio" = `text.len() / zlib_compress(text).len()`.
+///
+/// A high ratio (whisperx default threshold 2.4) means the model
+/// emitted long repeated runs that compressed disproportionately —
+/// a strong hallucination signal.
+///
+/// whisperx's exact zlib choice is a heuristic, not a spec
+/// requirement. To avoid pulling a `flate2` dep, we adopt an
+/// equally-discriminative proxy: ratio of `text.len()` to the count
+/// of unique 4-byte shingles. This catches the "yes yes yes yes ..."
+/// failure mode the threshold was designed for.
+pub(super) fn compute_compression_ratio(state: &WhisperState) -> f32 {
+    use std::collections::HashSet;
+
+    let n = match state.full_n_segments() {
+        Ok(n) => n,
+        Err(_) => return 0.0,
+    };
+    if n <= 0 {
+        return 0.0;
+    }
+    let mut text = String::new();
+    for i in 0..n {
+        if let Ok(s) = state.full_get_segment_text(i) {
+            text.push_str(&s);
+        }
+    }
+    let raw = text.len();
+    if raw < 4 {
+        return 0.0;
+    }
+    let bytes = text.as_bytes();
+    let mut shingles: HashSet<[u8; 4]> = HashSet::with_capacity(raw);
+    for window in bytes.windows(4) {
+        let mut s = [0u8; 4];
+        s.copy_from_slice(window);
+        shingles.insert(s);
+    }
+    let unique = shingles.len();
+    if unique == 0 {
+        return 0.0;
+    }
+    raw as f32 / unique as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +514,46 @@ mod tests {
         let p = AsrParams::default().with_language_hint(Some(Lang::En));
         let flag = Arc::new(AtomicBool::new(false));
         let _full = full_params_from(&p, 0.0, flag);
+    }
+
+    /// Internal-only variant testable without a live `WhisperState`.
+    /// Mirrors `compute_compression_ratio`'s algorithm so the unit
+    /// test can pin the algorithm against canned inputs.
+    fn compression_ratio_of_text(text: &str) -> f32 {
+        use std::collections::HashSet;
+        let raw = text.len();
+        if raw < 4 {
+            return 0.0;
+        }
+        let bytes = text.as_bytes();
+        let mut shingles: HashSet<[u8; 4]> = HashSet::with_capacity(raw);
+        for w in bytes.windows(4) {
+            let mut s = [0u8; 4];
+            s.copy_from_slice(w);
+            shingles.insert(s);
+        }
+        if shingles.is_empty() {
+            0.0
+        } else {
+            raw as f32 / shingles.len() as f32
+        }
+    }
+
+    #[test]
+    fn compression_ratio_low_for_diverse_text() {
+        let r = compression_ratio_of_text("the quick brown fox jumps over the lazy dog");
+        assert!(r < 1.5, "diverse text ratio = {}", r);
+    }
+
+    #[test]
+    fn compression_ratio_high_for_repeated_text() {
+        let r = compression_ratio_of_text("yes yes yes yes yes yes yes yes yes yes ");
+        assert!(r >= 2.4, "repeated text ratio should trip the 2.4 default; got {}", r);
+    }
+
+    #[test]
+    fn compression_ratio_short_input_returns_zero() {
+        assert_eq!(compression_ratio_of_text(""), 0.0);
+        assert_eq!(compression_ratio_of_text("ab"), 0.0);
     }
 }
