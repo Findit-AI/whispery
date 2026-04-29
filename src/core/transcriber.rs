@@ -95,7 +95,42 @@ pub struct Transcriber {
 
 impl Transcriber {
     /// Construct from config.
+    ///
+    /// # Panics
+    ///
+    /// Codex round-4 finding [high]: invalid config values are
+    /// rejected up-front rather than turning into deadlocks (zero
+    /// `max_in_flight`), divide-by-zero panics in cut
+    /// (`chunk_size` that rounds to 0 samples), or empty-list panics
+    /// in the auto-lock mode helper (`AutoLockAfter(0)`).
+    ///
+    /// - `max_in_flight == 0` — the dispatch loop would route every
+    ///   emitted chunk to `cut_pending` and never issue a `RunAsr`.
+    /// - `LanguagePolicy::AutoLockAfter(0)` — a 0-observation lock
+    ///   has no defined mode and would call the tiebreak helper on
+    ///   an empty list.
+    /// - `chunk_size` that rounds to 0 16 kHz samples (e.g.
+    ///   `Duration::ZERO`) — Cut's hard-split path divides by it.
     pub fn new(config: TranscriberConfig) -> Self {
+        assert!(
+            config.max_in_flight > 0,
+            "TranscriberConfig::max_in_flight must be > 0 (got 0; would deadlock the dispatch loop)"
+        );
+        if let LanguagePolicy::AutoLockAfter(n) = config.language_policy {
+            assert!(
+                n > 0,
+                "LanguagePolicy::AutoLockAfter(n) requires n > 0 (got 0)"
+            );
+        }
+        let chunk_size_samples = (config.chunk_size.as_secs_f64()
+            * crate::time::SAMPLE_RATE_HZ as f64
+            + 0.5) as u64;
+        assert!(
+            chunk_size_samples > 0,
+            "TranscriberConfig::chunk_size must round to at least 1 sample at 16 kHz; got {:?}",
+            config.chunk_size
+        );
+
         let buffer = SampleBuffer::new(config.buffer_cap_samples, config.gap_tolerance_samples);
         let cut = Cut::new(config.chunk_size);
         let dispatch = Dispatch::new(
@@ -328,9 +363,24 @@ impl Transcriber {
     ///
     /// Errors:
     /// - `AfterEof` if `signal_eof()` was previously called.
+    /// - `InconsistentTimebase` if the buffer already has an established
+    ///   output timebase from a prior `push_samples` and `starts_at`'s
+    ///   timebase doesn't match. Codex round-4 fix: pre-fix code
+    ///   silently overwrote the timebase, so a 48 kHz stream restarted
+    ///   at a millisecond timebase would produce post-restart chunks
+    ///   in a different unit from pre-restart ones — corrupting
+    ///   ordering and PTS arithmetic with no surfaced error.
     pub fn restart_at(&mut self, starts_at: Timestamp) -> Result<(), TranscriberError> {
         if self.eof_signaled {
             return Err(TranscriberError::AfterEof);
+        }
+        if let Some(expected_tb) = self.buffer.output_timebase() {
+            if starts_at.timebase() != expected_tb {
+                return Err(TranscriberError::InconsistentTimebase {
+                    expected: expected_tb,
+                    got: starts_at.timebase(),
+                });
+            }
         }
 
         // Step 1: drain cut_pending into in_flight before clearing
@@ -531,6 +581,75 @@ mod tests {
         assert!(!t.is_idle(), "buffer has 1000 samples; not idle yet");
         t.signal_eof().unwrap();
         assert!(t.is_idle(), "after silent EOF, transcriber should be idle");
+    }
+
+    /// Codex round-4 finding [high]: `max_in_flight = 0` deadlocks
+    /// the dispatch loop — every emitted chunk goes to cut_pending,
+    /// no `RunAsr` command ever fires. Reject at construction.
+    #[test]
+    #[should_panic(expected = "max_in_flight")]
+    fn config_with_zero_max_in_flight_panics() {
+        let mut config = TranscriberConfig::default();
+        config.max_in_flight = 0;
+        let _ = Transcriber::new(config);
+    }
+
+    /// Round-4 corollary: `AutoLockAfter(0)` calls
+    /// `mode_with_first_occurrence_tiebreak` on a possibly-empty
+    /// observation list (when the first chunk lands empty/failed),
+    /// which panics. Reject at construction.
+    #[test]
+    #[should_panic(expected = "AutoLockAfter")]
+    fn config_with_zero_auto_lock_after_panics() {
+        let mut config = TranscriberConfig::default();
+        config.language_policy = LanguagePolicy::AutoLockAfter(0);
+        let _ = Transcriber::new(config);
+    }
+
+    /// Round-4 corollary: a `chunk_size` that rounds to 0 samples
+    /// (e.g. `Duration::ZERO`) makes `Cut::push_segment`'s
+    /// `len.div_ceil(self.chunk_size_samples)` divide by zero on
+    /// any non-trivial VAD segment. Reject at construction.
+    #[test]
+    #[should_panic(expected = "chunk_size")]
+    fn config_with_zero_chunk_size_panics() {
+        let mut config = TranscriberConfig::default();
+        config.chunk_size = Duration::ZERO;
+        let _ = Transcriber::new(config);
+    }
+
+    /// Codex round-4 finding [high]: restart_at must not silently
+    /// switch the output timebase. Without the guard, a stream
+    /// anchored at 1/48000 could be restarted at 1/1000 and produce
+    /// post-restart `TimeRange`s in a different unit from pre-restart
+    /// chunks — corrupts ordering and downstream PTS arithmetic with
+    /// no error surfaced.
+    #[test]
+    fn restart_at_with_different_timebase_returns_inconsistent_timebase() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 1000]).unwrap();
+        // Stream is now anchored at 1/48000. Try to restart at 1/1000.
+        let other_tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
+        let r = t.restart_at(Timestamp::new(0, other_tb));
+        assert!(
+            matches!(r, Err(TranscriberError::InconsistentTimebase {
+                expected,
+                got,
+            }) if expected == tb_48k() && got == other_tb),
+            "expected InconsistentTimebase, got {:?}",
+            r
+        );
+        // Original timebase must still be in effect.
+        assert_eq!(t.output_timebase(), Some(tb_48k()));
+    }
+
+    /// Round-4 corollary: a restart at the same timebase succeeds.
+    #[test]
+    fn restart_at_same_timebase_succeeds() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 1000]).unwrap();
+        t.restart_at(ts(50_000_000)).unwrap();
+        assert_eq!(t.output_timebase(), Some(tb_48k()));
     }
 
     /// Codex round-2 finding [high]: VAD must not reference audio

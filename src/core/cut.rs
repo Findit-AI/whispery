@@ -50,14 +50,23 @@ pub(crate) enum SubOrigin {
     /// `chunk_size`. The full original VAD segment can be
     /// reconstructed by joining all `SubRange`s sharing this
     /// `vad_seq`.
+    ///
+    /// Codex round-4 fix: `part` and `total_parts` were `u8` and
+    /// the algorithm asserted `n_full <= 255`. With smaller
+    /// `chunk_size` settings, realistic long-form audio (lectures,
+    /// podcasts) can need more than 255 hard-split parts — the
+    /// assertion turned valid input into a process panic. Widening
+    /// to `u32` removes the artificial ceiling; with default
+    /// `chunk_size = 30 s` the new bound is >2 hours per VAD
+    /// segment, well past anything seen in practice.
     HardSplit {
         /// Original VAD segment's sequence number.
         vad_seq: u32,
         /// Zero-based index of this fragment.
-        part: u8,
+        part: u32,
         /// Total number of fragments the original segment was split
         /// into.
-        total_parts: u8,
+        total_parts: u32,
     },
 }
 
@@ -152,18 +161,19 @@ impl Cut {
             // Pre-split overlong segment into n equal-ish parts.
             // n = ceil(len / chunk_size_samples).
             let n_full = len.div_ceil(self.chunk_size_samples);
-            // SubOrigin::HardSplit.total_parts is u8 (255 max), so a
-            // single VAD segment longer than 255 × chunk_size is
-            // outside the design envelope. For default chunk_size=30s
-            // that's 127 minutes of continuous speech in one segment;
-            // pathological. Hard-fail rather than silently drop data.
+            // Codex round-4: the previous u8 ceiling (255 parts) made
+            // realistic long-form audio panic at small chunk_size
+            // settings. SubOrigin::HardSplit's `part` / `total_parts`
+            // are now u32 — only truly absurd input (>4 G parts)
+            // would overflow, and that's well past any realistic
+            // upper bound on `len / chunk_size_samples`.
             assert!(
-                n_full <= u8::MAX as u64,
-                "VadSegment of {} samples exceeds 255×chunk_size ({}); refuse to drop data",
+                n_full <= u32::MAX as u64,
+                "VadSegment of {} samples exceeds u32::MAX × chunk_size_samples ({}); pathological input",
                 len,
-                255 * self.chunk_size_samples,
+                self.chunk_size_samples,
             );
-            let n = n_full as u8;
+            let n = n_full as u32;
             for i in 0..n {
                 let part_start = seg.start_sample() + (i as u64 * len) / n as u64;
                 let part_end = if i == n - 1 {
@@ -322,6 +332,43 @@ mod tests {
         match final_chunk.subs[0].origin {
             SubOrigin::HardSplit { vad_seq: 0, part: 2, total_parts: 3 } => {}
             o => panic!("unexpected origin {:?}", o),
+        }
+    }
+
+    /// Codex round-4 finding [medium]: a single VAD segment longer
+    /// than 255 × chunk_size used to panic in the old u8-bounded
+    /// code. With chunk_size=625ms (10_000 samples), a ~3-minute
+    /// segment (300 parts) is realistic for lectures / podcasts and
+    /// must split successfully rather than aborting the process.
+    #[test]
+    fn hard_split_supports_more_than_255_parts() {
+        let mut c = Cut::new(Duration::from_millis(625)); // 10_000 samples
+        let parts_wanted: u64 = 300;
+        let len = parts_wanted * 10_000;
+        let emitted = c.push_segment(VadSegment::new(0, len));
+        // n_full = len.div_ceil(10_000) = 300 → 299 chunks emit, the
+        // last accumulates and only emerges from flush().
+        assert_eq!(emitted.len(), (parts_wanted - 1) as usize);
+
+        // Verify total_parts on every emitted chunk.
+        for sub_chunk in &emitted {
+            for sub in &sub_chunk.subs {
+                match sub.origin {
+                    SubOrigin::HardSplit { total_parts, .. } => {
+                        assert_eq!(total_parts as u64, parts_wanted);
+                    }
+                    other => panic!("expected HardSplit, got {:?}", other),
+                }
+            }
+        }
+
+        let last = c.flush().unwrap();
+        match last.subs[0].origin {
+            SubOrigin::HardSplit { part, total_parts, .. } => {
+                assert_eq!(part as u64, parts_wanted - 1);
+                assert_eq!(total_parts as u64, parts_wanted);
+            }
+            other => panic!("expected HardSplit, got {:?}", other),
         }
     }
 
