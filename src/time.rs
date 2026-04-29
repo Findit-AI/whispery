@@ -1,0 +1,1 @@
+//! Time constants for whispery.
