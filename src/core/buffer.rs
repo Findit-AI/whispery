@@ -157,6 +157,65 @@ impl SampleBuffer {
             );
         Some(Timestamp::new(pts, tb))
     }
+
+    /// Extract a chunk's samples as a fresh `Arc<[f32]>` without
+    /// mutating the buffer. The range is in stream-relative 16 kHz
+    /// indices (i.e., absolute, not relative to the live buffer).
+    pub(crate) fn extract(&self, range: crate::core::cut::SampleRange) -> alloc::sync::Arc<[f32]> {
+        let lo = (range.start - self.buffer_drop_offset) as usize;
+        let hi = (range.end - self.buffer_drop_offset) as usize;
+        let slice = &self.samples[lo..hi];
+        slice.into()
+    }
+
+    /// Convert a 16 kHz `SampleRange` (stream-relative) to a
+    /// `mediatime::TimeRange` in the output timebase. Always
+    /// rescales from the immutable anchor; the round-trip error is
+    /// at most ±1 PTS regardless of trim history.
+    pub(crate) fn samples_to_output_range(&self, range: crate::core::cut::SampleRange) -> mediatime::TimeRange {
+        let tb = self.output_tb.expect("samples_to_output_range called before any push");
+        let start_out = self.base_pts_out_anchor
+            + Timebase::rescale_pts(range.start as i64, ANALYSIS_TIMEBASE, tb);
+        let end_out = self.base_pts_out_anchor
+            + Timebase::rescale_pts(range.end as i64, ANALYSIS_TIMEBASE, tb);
+        mediatime::TimeRange::new(start_out, end_out, tb)
+    }
+
+    /// Drop samples up to (but not including) `low_water_samples`.
+    /// `base_pts_out_anchor` is *not* touched; `buffer_drop_offset`
+    /// advances. Used by the dispatch state machine after chunks
+    /// past `low_water_samples` are no longer reachable from
+    /// `cut_pending`.
+    pub(crate) fn trim_to(&mut self, low_water_samples: u64) {
+        if low_water_samples <= self.buffer_drop_offset {
+            return;
+        }
+        let drop_count = (low_water_samples - self.buffer_drop_offset) as usize;
+        let drop_count = drop_count.min(self.samples.len());
+        self.samples.drain(..drop_count);
+        self.buffer_drop_offset += drop_count as u64;
+    }
+
+    /// Reset the buffer's anchor for `restart_at`. Clears the live
+    /// `Vec<f32>`, sets `base_pts_out_anchor` to `starts_at.pts()`,
+    /// and zeroes both offsets so the next push starts a fresh
+    /// contiguous segment with `delta_pts_out == 0` exactly.
+    /// Pre-restart in-flight chunks are unaffected — they hold their
+    /// audio in their own `Arc<[f32]>`s.
+    pub(crate) fn restart_at(&mut self, starts_at: Timestamp) {
+        self.output_tb = Some(starts_at.timebase());
+        self.base_pts_out_anchor = starts_at.pts();
+        self.absolute_sample_offset = 0;
+        self.buffer_drop_offset = 0;
+        self.samples.clear();
+    }
+
+    /// Buffer drop offset (in 16 kHz samples). Used by the dispatch
+    /// state machine when computing trim's low-water against
+    /// `cut_pending` ranges.
+    pub(crate) fn buffer_drop_offset(&self) -> u64 {
+        self.buffer_drop_offset
+    }
 }
 
 /// Construct a default `SampleBuffer` with the spec's defaults
@@ -243,5 +302,55 @@ mod tests {
         let other_tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
         let r = b.append(Timestamp::new(0, other_tb), &[0.0; 100]);
         assert!(matches!(r, Err(TranscriberError::InconsistentTimebase { .. })));
+    }
+
+    #[test]
+    fn extract_returns_correct_slice() {
+        use crate::core::cut::SampleRange;
+        let mut b = SampleBuffer::new(1_000_000, 3200);
+        let mut samples = Vec::with_capacity(1000);
+        for i in 0..1000 {
+            samples.push(i as f32);
+        }
+        b.append(ts_at_48k(0), &samples).unwrap();
+        let arc = b.extract(SampleRange::new(100, 200));
+        assert_eq!(arc.len(), 100);
+        assert_eq!(arc[0], 100.0);
+        assert_eq!(arc[99], 199.0);
+    }
+
+    #[test]
+    fn samples_to_output_range_drift_free_across_trims() {
+        use crate::core::cut::SampleRange;
+        let mut b = SampleBuffer::new(1_000_000, 3200);
+        b.append(ts_at_48k(0), &[0.0; 16_000]).unwrap();
+        let range_before = b.samples_to_output_range(SampleRange::new(8_000, 12_000));
+        b.trim_to(4_000);
+        let range_after = b.samples_to_output_range(SampleRange::new(8_000, 12_000));
+        assert_eq!(range_before, range_after,
+            "samples_to_output_range must not drift across trims");
+    }
+
+    #[test]
+    fn trim_to_below_drop_offset_is_noop() {
+        let mut b = SampleBuffer::new(1_000_000, 3200);
+        b.append(ts_at_48k(0), &[0.0; 1000]).unwrap();
+        b.trim_to(500);
+        assert_eq!(b.buffer_drop_offset(), 500);
+        b.trim_to(300); // below current drop_offset
+        assert_eq!(b.buffer_drop_offset(), 500);
+    }
+
+    #[test]
+    fn restart_at_resets_offsets_and_anchor() {
+        let mut b = SampleBuffer::new(1_000_000, 3200);
+        b.append(ts_at_48k(0), &[1.0; 1000]).unwrap();
+        b.restart_at(ts_at_48k(50_000_000));
+        assert_eq!(b.absolute_sample_offset(), 0);
+        assert_eq!(b.buffer_drop_offset(), 0);
+        assert_eq!(b.buffered_samples(), 0);
+        // Next push at 50_000_000 must succeed without PtsRegression
+        // — this is the round-4 NB-α regression test.
+        b.append(ts_at_48k(50_000_000), &[2.0; 1000]).unwrap();
     }
 }
