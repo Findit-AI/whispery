@@ -3,7 +3,7 @@
 mod chunk_id;
 mod errors;
 mod lang;
-mod transcript;
+pub(crate) mod transcript;
 mod vad_segment;
 
 pub use chunk_id::ChunkId;
