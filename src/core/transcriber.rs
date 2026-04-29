@@ -187,8 +187,12 @@ impl Transcriber {
     /// Errors:
     /// - `OutputTimebaseUnset` if no `push_samples` has been called.
     /// - `PtsRegression { kind: VadSegment }` if `seg.start_sample`
-    ///   is not strictly greater than the previous VAD segment's
-    ///   `end_sample`.
+    ///   overlaps the previous VAD segment — i.e., is strictly
+    ///   *less than* its `end_sample`. Touching segments (where
+    ///   `new.start == prev.end`) are accepted: silero occasionally
+    ///   emits them on silence-edge transitions and rejecting them
+    ///   would force callers to add gap-injection logic for the
+    ///   same data silero already produced cleanly.
     /// - `AfterEof` if `signal_eof()` was called.
     pub fn push_vad_segment(&mut self, seg: VadSegment) -> Result<(), TranscriberError> {
         if self.eof_signaled {
