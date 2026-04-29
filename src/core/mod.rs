@@ -1,4 +1,7 @@
 //! Sans-I/O core state machine.
 
-pub use self::placeholder::*;
-mod placeholder { /* fills in subsequent tasks */ }
+mod command;
+
+pub use command::{
+    AlignmentResult, AsrParams, AsrParamsOverride, AsrResult, Command, SamplingStrategy,
+};
