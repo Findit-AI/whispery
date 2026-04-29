@@ -1,5 +1,6 @@
 //! ManagedTranscriber — the runner's public surface. See spec §6.1.
 
+use alloc::collections::VecDeque;
 use core::time::Duration;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -36,6 +37,8 @@ pub struct ManagedTranscriber {
     block_on_full_queue: bool,
     dispatch_idle_poll: Duration,
     buffer_cap_samples: usize,
+    pending_transcripts: VecDeque<Transcript>,
+    pending_errors: VecDeque<(ChunkId, WorkFailure)>,
 }
 
 impl ManagedTranscriber {
@@ -318,6 +321,8 @@ impl ManagedTranscriberBuilder {
             block_on_full_queue: self.pool_config.block_on_full_queue(),
             dispatch_idle_poll: self.pool_config.dispatch_idle_poll(),
             buffer_cap_samples: self.buffer_cap_samples,
+            pending_transcripts: VecDeque::new(),
+            pending_errors: VecDeque::new(),
         })
     }
 }
@@ -474,6 +479,83 @@ impl ManagedTranscriber {
 
     fn restore_asr_default(&mut self, prior: AsrParams) {
         self.asr_params_default = prior;
+    }
+}
+
+impl ManagedTranscriber {
+    /// Mark the input stream as ended. Flushes the cut accumulator,
+    /// then drives the dispatch loop one more time. Idempotent.
+    pub fn signal_eof(&mut self) -> Result<(), RunnerError> {
+        self.core.signal_eof()?;
+        self.pump_until_idle_or_progress()?;
+        Ok(())
+    }
+
+    /// Pop the next available `Transcript`, draining the dispatch
+    /// loop along the way. Returns `None` only when no transcript is
+    /// currently available; the caller must keep calling until the
+    /// returned `Option` is `None` and `core.is_idle()` is true to
+    /// know the stream has fully drained.
+    pub fn poll_transcript(&mut self) -> Option<Transcript> {
+        // Drive once so any pending results land in the core's event
+        // queue. Errors here would be silent loss; surface via
+        // poll_error in the caller's next call (the queue still has
+        // any `Event::Error` events).
+        let _ = self.drive_one_step();
+
+        if let Some(tr) = self.pending_transcripts.pop_front() {
+            return Some(tr);
+        }
+        loop {
+            match self.core.poll_event()? {
+                Event::Transcript(tr) => return Some(tr),
+                Event::Error { chunk_id, error } => {
+                    self.pending_errors.push_back((chunk_id, error));
+                    // Continue: maybe a Transcript is right behind it.
+                }
+            }
+        }
+    }
+
+    /// Pop the next available `(ChunkId, WorkFailure)` error, draining
+    /// the dispatch loop along the way.
+    pub fn poll_error(&mut self) -> Option<(ChunkId, WorkFailure)> {
+        let _ = self.drive_one_step();
+
+        if let Some(pair) = self.pending_errors.pop_front() {
+            return Some(pair);
+        }
+        // Drain a few events looking for an error. We don't loop
+        // forever: if the next event is a Transcript, push it onto a
+        // queue and surface only errors here.
+        loop {
+            match self.core.poll_event()? {
+                Event::Error { chunk_id, error } => return Some((chunk_id, error)),
+                Event::Transcript(tr) => {
+                    self.pending_transcripts.push_back(tr);
+                }
+            }
+        }
+    }
+
+    /// Block until `core.is_idle()` or `drain_timeout` elapses.
+    pub fn drain(&mut self) -> Result<(), RunnerError> {
+        let started = std::time::Instant::now();
+        let timeout = self.drain_timeout;
+        loop {
+            self.pump_until_idle_or_progress()?;
+            if self.core.is_idle() {
+                return Ok(());
+            }
+            if started.elapsed() > timeout {
+                return Err(RunnerError::DrainTimeout {
+                    timeout,
+                    in_flight: self.core.buffered_samples(), // proxy; exact count is in dispatch
+                });
+            }
+            // No progress and not idle: wait for a worker.
+            self.wait_for_progress()?;
+        }
     }
 }
 
