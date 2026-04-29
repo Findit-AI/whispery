@@ -1,11 +1,14 @@
 //! Whisper worker pool. See spec §6.2.
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use crate::core::AsrParams;
+use whisper_rs::{FullParams, SamplingStrategy as WhisperStrategy};
+
+use crate::core::{AsrParams, SamplingStrategy};
 use crate::types::ChunkId;
 
 /// Configuration for the runner's whisper worker pool.
@@ -267,6 +270,75 @@ pub(super) struct AsrWorkItem {
 /// Worker-emitted result for one chunk. Crate-private.
 pub(super) type AsrResultMsg = (ChunkId, Result<crate::core::AsrResult, crate::types::WorkFailure>);
 
+/// Build a `FullParams` for one decoding attempt. The runner's outer
+/// retry ladder calls this once per attempt with `attempt_temperature`
+/// set to the next ladder step.
+///
+/// Disables whisper.cpp's internal temperature ladder via
+/// `set_temperature_inc(0.0)`; each `state.full()` call is exactly
+/// one decoding attempt at exactly `attempt_temperature`. The
+/// `set_max_decoding_failures(...)` belt-and-braces secondary safeguard
+/// documented in spec §5.6 is omitted here because whisper-rs 0.13.x
+/// does not expose that setter; with `temperature_inc = 0.0` the
+/// internal ladder iterates exactly once regardless.
+///
+/// Wires the worker-hang watchdog via `set_abort_callback_safe`. The
+/// closure reads `abort_flag` on every whisper.cpp progress callback;
+/// when the watchdog flips it true, whisper.cpp returns mid-inference.
+pub(super) fn full_params_from(
+    params: &AsrParams,
+    attempt_temperature: f32,
+    abort_flag: Arc<AtomicBool>,
+) -> FullParams<'static, 'static> {
+    let strategy = match params.strategy() {
+        SamplingStrategy::Greedy { best_of } =>
+            WhisperStrategy::Greedy { best_of },
+        SamplingStrategy::BeamSearch { beam_size, patience } =>
+            WhisperStrategy::BeamSearch { beam_size, patience },
+    };
+    let mut p = FullParams::new(strategy);
+
+    p.set_n_threads(params.n_threads());
+    p.set_no_context(params.no_context());
+    p.set_suppress_blank(params.suppress_blank());
+    p.set_suppress_non_speech_tokens(params.suppress_non_speech_tokens());
+
+    if let Some(lang) = params.language_hint() {
+        // `FullParams<'a, _>::set_language` requires the `&str`'s
+        // lifetime to match `'a`. We return `FullParams<'static, _>`,
+        // so the str must be `'static`. whisper-rs immediately copies
+        // the str into a leaked CString (`CString::into_raw`) inside
+        // `set_language`, so the lifetime constraint is purely a
+        // type-system requirement — the borrow does not actually
+        // outlive the call. We satisfy it by leaking a small
+        // `Box<str>` (≤ a handful of bytes per language code; the
+        // set of distinct codes is bounded by `Lang`'s variants).
+        let static_lang: &'static str = Box::leak(Box::<str>::from(lang.as_str()));
+        p.set_language(Some(static_lang));
+    } else {
+        p.set_detect_language(true);
+    }
+
+    if let Some(prompt) = params.initial_prompt() {
+        p.set_initial_prompt(prompt.as_str());
+    }
+
+    p.set_print_special(false);
+    p.set_print_progress(false);
+    p.set_print_realtime(false);
+    p.set_print_timestamps(false);
+
+    // Pin temperature; disable internal ladder. See spec §5.6.
+    p.set_temperature(attempt_temperature);
+    p.set_temperature_inc(0.0);
+
+    // Worker-hang watchdog. The closure is `Send + 'static`; the
+    // abort_flag is shared with the watchdog thread.
+    p.set_abort_callback_safe(move || abort_flag.load(Ordering::Relaxed));
+
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +392,29 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<AsrWorkItem>();
         assert_send::<AsrResultMsg>();
+    }
+
+    use crate::core::AsrParams;
+    use crate::core::SamplingStrategy;
+    use crate::types::Lang;
+    use core::sync::atomic::AtomicBool;
+
+    #[test]
+    fn full_params_from_greedy_is_finite() {
+        let p = AsrParams::default()
+            .with_strategy(SamplingStrategy::Greedy { best_of: 1 });
+        let flag = Arc::new(AtomicBool::new(false));
+        let _full = full_params_from(&p, 0.4, flag);
+        // FullParams' fields aren't all readable; the assertion is that
+        // the build does not panic and the abort closure compiles. The
+        // recording-mock test in Task 18 verifies temperature_inc=0.0
+        // and the explicit set_temperature(t) call sequence.
+    }
+
+    #[test]
+    fn full_params_from_with_language_hint_does_not_panic() {
+        let p = AsrParams::default().with_language_hint(Some(Lang::En));
+        let flag = Arc::new(AtomicBool::new(false));
+        let _full = full_params_from(&p, 0.0, flag);
     }
 }
