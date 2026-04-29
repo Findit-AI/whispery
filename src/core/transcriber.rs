@@ -83,6 +83,25 @@ impl TranscriberConfig {
 
     /// Max samples kept in the internal buffer before push returns
     /// `Backpressure`. Default 60 s × 16 kHz = 960 000.
+    ///
+    /// **Caller contract:** `buffer_cap_samples` must be at least
+    /// as large as the longest single VAD segment the caller
+    /// expects to push. `push_vad_segment` requires all of the
+    /// segment's audio to be buffered (the round-2 `VadAheadOfAudio`
+    /// guard) before it accepts the segment, so a single VAD
+    /// segment longer than `buffer_cap_samples` cannot be
+    /// processed: `push_samples` would return `Backpressure`
+    /// before enough audio is buffered, and the only recovery is
+    /// `restart_at` (which drops the partial segment). Hard-split
+    /// in `Cut::push_segment` only runs after the segment is
+    /// accepted, so it cannot rescue this case (Codex round-9 [high]
+    /// finding 2).
+    ///
+    /// Practical guidance: with default 60 s cap, a single VAD
+    /// segment must fit in 60 s of speech. Configure your upstream
+    /// VAD to emit at silence boundaries below that, OR raise
+    /// `buffer_cap_samples` to cover your worst-case segment
+    /// length.
     pub const fn buffer_cap_samples(&self) -> usize {
         self.buffer_cap_samples
     }
@@ -389,6 +408,15 @@ impl Transcriber {
     /// Push a VAD segment into the cut state machine. See spec
     /// §5.3.
     ///
+    /// **Caller contract:** the entire segment's audio must be
+    /// buffered first (`seg.end_sample() <= absolute_sample_offset()`).
+    /// In particular, a segment longer than `buffer_cap_samples`
+    /// cannot be pushed at all — `push_samples` would return
+    /// `Backpressure` before enough audio accumulates. Either
+    /// configure upstream VAD to emit shorter segments at silence
+    /// boundaries, or raise `buffer_cap_samples`. See
+    /// [`TranscriberConfig::buffer_cap_samples`] for details.
+    ///
     /// Errors:
     /// - `OutputTimebaseUnset` if no `push_samples` has been called.
     /// - `PtsRegression { kind: VadSegment }` if `seg.start_sample`
@@ -519,8 +547,10 @@ impl Transcriber {
         }
 
         // Run the standard post-mutation drain so trim drops audio
-        // unreferenced by any live chunk.
-        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
+        // unreferenced by any live chunk. Trim's upper bound is the
+        // VAD watermark we just advanced — never past audio that
+        // hasn't been declared analyzed (round-9 fix).
+        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start(), self.vad_watermark);
         Ok(())
     }
 
@@ -540,11 +570,14 @@ impl Transcriber {
                 self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
             }
             // Run after_inject so trim drops any audio not referenced
-            // by either cut_pending or the cut accumulator. Without
-            // this, a silent stream (samples pushed but no VAD) would
-            // leave the buffer non-empty forever and `is_idle()`
+            // by either cut_pending or the cut accumulator. signal_eof
+            // is the one path where trimming past the VAD watermark is
+            // safe — the stream is ended; no further VAD will arrive.
+            // Without this, a silent stream (samples pushed but no VAD)
+            // would leave the buffer non-empty forever and `is_idle()`
             // would never become true.
-            self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
+            let high_water = self.buffer.absolute_sample_offset();
+            self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start(), high_water);
         }
         Ok(())
     }
@@ -560,7 +593,10 @@ impl Transcriber {
         result: AsrResult,
     ) -> Result<(), TranscriberError> {
         self.dispatch.inject_asr_result(chunk_id, result)?;
-        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
+        // Trim cap: VAD watermark, not high-water — round-9 fix.
+        // inject_* doesn't change what's been analyzed, so audio
+        // past the watermark must survive trim until VAD catches up.
+        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start(), self.vad_watermark);
         Ok(())
     }
 
@@ -574,7 +610,7 @@ impl Transcriber {
         result: AlignmentResult,
     ) -> Result<(), TranscriberError> {
         self.dispatch.inject_alignment_result(chunk_id, result)?;
-        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
+        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start(), self.vad_watermark);
         Ok(())
     }
 
@@ -589,7 +625,7 @@ impl Transcriber {
         failure: WorkFailure,
     ) -> Result<(), TranscriberError> {
         self.dispatch.inject_failure(chunk_id, failure)?;
-        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
+        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start(), self.vad_watermark);
         Ok(())
     }
 
@@ -902,6 +938,49 @@ mod tests {
         t.push_samples(ts(0), &[0.0; 1000]).unwrap();
         t.restart_at(ts(50_000_000)).unwrap();
         assert_eq!(t.output_timebase(), Some(tb_48k()));
+    }
+
+    /// Codex round-9 finding [high]: signal_no_speech_through must
+    /// not let trim drop audio past the declared `sample_index`.
+    /// Pre-fix code passed `cut.pending_start()` to `after_inject`;
+    /// when no cut accumulator existed, after_inject's fallback was
+    /// `buffer.absolute_sample_offset()` (drop everything). With
+    /// audio buffered ahead of the no-speech declaration, that
+    /// dropped the still-unanalyzed tail. A subsequent VAD push
+    /// inside the dropped range would call buffer.extract on
+    /// already-trimmed indices and panic.
+    #[test]
+    fn signal_no_speech_through_does_not_trim_past_declared_index() {
+        use crate::core::command::Command;
+
+        let config = TranscriberConfig::default()
+            .with_buffer_cap_samples(20_000)
+            .with_language_policy(LanguagePolicy::Auto);
+        let mut t = Transcriber::new(config);
+
+        // Push 1 000 samples of audio.
+        t.push_samples(ts(0), &[0.0; 1_000]).unwrap();
+
+        // Declare silence only through sample 500. Audio at [500,
+        // 1 000) is still unanalyzed and must NOT be trimmed.
+        t.signal_no_speech_through(500).unwrap();
+        assert_eq!(t.buffered_samples(), 500,
+            "trim must drop [0..500) but keep [500..1 000) — VAD hasn't analyzed past 500 yet");
+
+        // Push a VAD segment in the unanalyzed tail. Must succeed,
+        // and the audio must still be available for extraction.
+        t.push_vad_segment(VadSegment::new(600, 800)).unwrap();
+        t.signal_eof().unwrap();
+
+        let mut got_chunk = false;
+        while let Some(cmd) = t.poll_command() {
+            if let Command::RunAsr { samples, .. } = cmd {
+                assert_eq!(samples.len(), 200,
+                    "extracted audio should be 200 samples for VAD [600, 800)");
+                got_chunk = true;
+            }
+        }
+        assert!(got_chunk, "chunk for VAD [600, 800) should have emitted");
     }
 
     /// Codex round-8 finding [high]: cut_pending audio (round-7's

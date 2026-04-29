@@ -353,20 +353,24 @@ impl Dispatch {
     /// Compute trim's low-water. After the round-7 refactor, both
     /// `in_flight` chunks and `cut_pending` chunks hold their own
     /// `Arc<[f32]>` audio (extracted at emit time), so neither
-    /// pins the live buffer. The only constraint is the cut
-    /// accumulator: samples back to its start are still referenced
-    /// by an unextracted partial chunk and must survive trim.
+    /// pins the live buffer. The only constraint from the live
+    /// audio side is the cut accumulator: samples back to its
+    /// start are still referenced by an unextracted partial chunk.
     ///
     /// `cut_accumulator_start` is `Cut::pending_start()`. If it's
-    /// `None` (no chunk accumulating), the buffer can be trimmed
-    /// all the way to `fallback_high_water` — the caller passes
-    /// `absolute_sample_offset` for that.
+    /// `None` (no chunk accumulating), the trim falls back to
+    /// `safe_trim_high_water` — usually the caller's VAD analysis
+    /// watermark. This is the round-9 fix: the previous fallback
+    /// was the buffer's absolute high-water mark, which dropped
+    /// audio past any unanalyzed VAD tail. With the watermark as
+    /// the upper bound, trim respects "VAD hasn't analyzed past
+    /// here yet, don't drop the audio".
     pub(crate) fn low_water_samples(
         &self,
         cut_accumulator_start: Option<u64>,
-        fallback_high_water: u64,
+        safe_trim_high_water: u64,
     ) -> u64 {
-        cut_accumulator_start.unwrap_or(fallback_high_water)
+        cut_accumulator_start.unwrap_or(safe_trim_high_water)
     }
 
     /// After an inject_* path, try to land any newly-eligible
@@ -377,15 +381,20 @@ impl Dispatch {
     ///
     /// `cut_accumulator_start` is `Cut::pending_start()` — see
     /// `low_water_samples`.
+    ///
+    /// `safe_trim_high_water` is the upper bound on trim: usually
+    /// the caller's VAD analysis watermark (`vad_watermark`).
+    /// Passing `buffer.absolute_sample_offset()` is only safe in
+    /// `signal_eof` paths where the stream is ending and audio
+    /// past the watermark won't be analyzed (round-9 fix).
     pub(crate) fn after_inject(
         &mut self,
         buffer: &mut SampleBuffer,
         cut_accumulator_start: Option<u64>,
+        safe_trim_high_water: u64,
     ) {
         self.flush_in_order_events();
-        // Trim the buffer to the lowest live-chunk start (the lowest
-        // start across cut_pending + the cut accumulator, if any).
-        let low = self.low_water_samples(cut_accumulator_start, buffer.absolute_sample_offset());
+        let low = self.low_water_samples(cut_accumulator_start, safe_trim_high_water);
         buffer.trim_to(low);
         // Promote pending chunks if slots are open under the effective
         // cap (round-6 fix: cap is `n` while AutoLockAfter is unlocked).
@@ -656,17 +665,17 @@ mod tests {
 
         // Resolve out of order: 2, 0, 1.
         d.inject_asr_result(ChunkId::from_raw(2), fake_asr_result("c2")).unwrap();
-        d.after_inject(&mut b, None);
+        d.after_inject(&mut b, None, u64::MAX);
         // Chunk 2 is Ready but cannot emit yet (next_emit is 0).
         assert!(d.pending_events.is_empty());
 
         d.inject_asr_result(ChunkId::from_raw(0), fake_asr_result("c0")).unwrap();
-        d.after_inject(&mut b, None);
+        d.after_inject(&mut b, None, u64::MAX);
         // Chunk 0 emitted; chunk 1 still in_flight.
         assert_eq!(d.pending_events.len(), 1);
 
         d.inject_asr_result(ChunkId::from_raw(1), fake_asr_result("c1")).unwrap();
-        d.after_inject(&mut b, None);
+        d.after_inject(&mut b, None, u64::MAX);
         // Chunks 1 and 2 now emit (cascade).
         assert_eq!(d.pending_events.len(), 3);
 
@@ -697,7 +706,7 @@ mod tests {
                 message: "x".into(),
             },
         ).unwrap();
-        d.after_inject(&mut b, None);
+        d.after_inject(&mut b, None, u64::MAX);
         assert_eq!(d.pending_events.len(), 1);
         match d.pending_events.front().unwrap() {
             Event::Error { chunk_id, .. } => assert_eq!(chunk_id.as_u64(), 0),
@@ -759,7 +768,7 @@ mod tests {
         // AND promote chunk 2 from cut_pending into in_flight,
         // emitting a third RunAsr command.
         d.inject_asr_result(ChunkId::from_raw(0), fake_asr_result("c0")).unwrap();
-        d.after_inject(&mut b, None);
+        d.after_inject(&mut b, None, u64::MAX);
 
         assert_eq!(d.cut_pending.len(), 0, "cut_pending should be drained");
         assert_eq!(d.in_flight.len(), 2,
@@ -828,7 +837,7 @@ mod tests {
         // (the start of the second chunk we're about to emit). This
         // keeps samples 1_000.. alive in the buffer past the
         // post-inject trim, so the next on_emit's extract succeeds.
-        d.after_inject(&mut b, Some(1_000));
+        d.after_inject(&mut b, Some(1_000), u64::MAX);
 
         // Second chunk: hint should now be locked to Zh.
         d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
@@ -939,7 +948,7 @@ mod tests {
             // start, keeping all chunks' samples alive for the
             // duration of the test. This test exercises language
             // policy, not trim behavior.
-            d.after_inject(&mut b, Some(0));
+            d.after_inject(&mut b, Some(0), u64::MAX);
         }
 
         // After 3 observations, locked_language should be En —
@@ -991,7 +1000,7 @@ mod tests {
             ChunkId::from_raw(1),
             AsrResult::new(SmolStr::new("zh"), Lang::Zh, -0.5, 0.05, 0.0),
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
         assert_eq!(d.locked_language, None,
             "auto-lock must not advance until chunk 0 resolves, regardless of completion order");
 
@@ -1003,7 +1012,7 @@ mod tests {
             ChunkId::from_raw(0),
             AsrResult::new(SmolStr::new("en"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
 
         assert_eq!(d.locked_language, Some(Lang::En),
             "auto-lock must observe in chunk_id order: chunk 0 = En first, then chunk 1 = Zh");
@@ -1036,7 +1045,7 @@ mod tests {
                 message: "fail".into(),
             },
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
         assert_eq!(d.locked_language, None, "single failed chunk produced no observation yet");
 
         // Chunks 1 and 2 succeed in English. After both land, cursor
@@ -1046,12 +1055,12 @@ mod tests {
             ChunkId::from_raw(1),
             AsrResult::new(SmolStr::new("hello"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
         d.inject_asr_result(
             ChunkId::from_raw(2),
             AsrResult::new(SmolStr::new("world"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
 
         assert_eq!(d.locked_language, Some(Lang::En),
             "auto-lock must skip failed chunk 0 and lock to En from chunks 1 + 2");
@@ -1081,7 +1090,7 @@ mod tests {
             ChunkId::from_raw(1),
             AsrResult::new(SmolStr::new("hello"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
         assert_eq!(d.locked_language, None);
 
         // Chunk 0 (empty) — the cursor advances to 1, picks up En.
@@ -1089,7 +1098,7 @@ mod tests {
             ChunkId::from_raw(0),
             AsrResult::new(SmolStr::new(""), Lang::En, -1.0, 0.95, 0.0),
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
         assert_eq!(d.locked_language, None,
             "only chunk 1 contributed; need a second non-empty observation");
 
@@ -1098,7 +1107,7 @@ mod tests {
             ChunkId::from_raw(2),
             AsrResult::new(SmolStr::new("world"), Lang::En, -0.5, 0.05, 0.0),
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
         assert_eq!(d.locked_language, Some(Lang::En));
     }
 
@@ -1156,7 +1165,7 @@ mod tests {
             ChunkId::from_raw(0),
             AsrResult::new(SmolStr::new("zh"), Lang::Zh, -0.5, 0.05, 0.0),
         ).unwrap();
-        d.after_inject(&mut b, Some(0));
+        d.after_inject(&mut b, Some(0), u64::MAX);
 
         assert_eq!(d.locked_language, Some(Lang::Zh));
         // Chunks 1 and 2 must now be in flight (cap reverted to 4).
@@ -1195,7 +1204,7 @@ mod tests {
                 AsrResult::new(SmolStr::new("text"), lang.clone(), -0.5, 0.05, 0.0),
             ).unwrap();
             // Pass Some(0) to pin trim at the buffer start.
-            d.after_inject(&mut b, Some(0));
+            d.after_inject(&mut b, Some(0), u64::MAX);
         }
 
         assert_eq!(
