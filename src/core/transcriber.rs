@@ -91,6 +91,16 @@ pub struct Transcriber {
     dispatch: Dispatch,
     next_chunk_id: u64,
     eof_signaled: bool,
+    /// Highest sample index that VAD has analyzed — either as the
+    /// `end_sample` of a pushed `VadSegment`, or as the explicit
+    /// watermark in `signal_no_speech_through`. Future VAD pushes
+    /// and no-speech signals must advance this; regressions
+    /// surface as `TranscriberError::PtsRegression { kind: VadSegment }`.
+    /// Independent from `Cut::last_pushed_end()` because the cut
+    /// state machine only tracks pushed segments, while the
+    /// watermark also incorporates explicit silence declarations
+    /// (Codex round-5 fix).
+    vad_watermark: u64,
 }
 
 impl Transcriber {
@@ -146,6 +156,7 @@ impl Transcriber {
             dispatch,
             next_chunk_id: 0,
             eof_signaled: false,
+            vad_watermark: 0,
         }
     }
 
@@ -254,25 +265,92 @@ impl Transcriber {
                 buffered: high_water,
             });
         }
-        // Strict-monotonic check against the cut state machine's
-        // last accumulated end. Cut tracks current_end internally;
-        // we replicate the check here to surface PtsRegression for
-        // the explicit test contract.
-        if let Some(last_end) = self.cut.last_pushed_end() {
-            if seg.start_sample() < last_end {
-                return Err(TranscriberError::PtsRegression {
-                    kind: crate::types::PushKind::VadSegment,
-                    advance: seg.start_sample() as i64 - last_end as i64,
-                });
-            }
+        // Strict-monotonic check against the VAD watermark. The
+        // watermark advances with every push_vad_segment AND every
+        // signal_no_speech_through, so a VAD push that would
+        // contradict an explicit silence declaration (Codex round-5)
+        // is also caught here.
+        if seg.start_sample() < self.vad_watermark {
+            return Err(TranscriberError::PtsRegression {
+                kind: crate::types::PushKind::VadSegment,
+                advance: seg.start_sample() as i64 - self.vad_watermark as i64,
+            });
         }
 
         let merged_chunks = self.cut.push_segment(seg);
+        self.vad_watermark = seg.end_sample();
         for chunk in merged_chunks {
             let chunk_id = ChunkId::from_raw(self.next_chunk_id);
             self.next_chunk_id += 1;
             self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
         }
+        Ok(())
+    }
+
+    /// Declare that VAD has finished analyzing audio through
+    /// `sample_index` and produced no segments past the most
+    /// recent `push_vad_segment` call. The core uses this signal
+    /// to:
+    ///
+    /// 1. Trim audio that is no longer referenced by any live
+    ///    chunk — without this, a stream with long silences would
+    ///    accumulate audio in the buffer until the configured cap
+    ///    is hit and `push_samples` returns
+    ///    `TranscriberError::Backpressure` with no recovery path
+    ///    (chunks emit only on VAD or EOF).
+    /// 2. Pre-flush the cut accumulator if a hypothetical future
+    ///    segment starting at `sample_index` would force a flush
+    ///    (`sample_index - current_start > chunk_size_samples`).
+    ///    This handles the speech-followed-by-long-silence case
+    ///    where a trailing partial chunk would otherwise sit in
+    ///    the cut state until EOF.
+    ///
+    /// `sample_index` advances the VAD watermark; subsequent
+    /// `push_vad_segment` calls with `start_sample < sample_index`
+    /// or `signal_no_speech_through` calls with a smaller
+    /// `sample_index` return `PtsRegression { kind: VadSegment }`.
+    ///
+    /// Errors:
+    /// - `OutputTimebaseUnset` if no `push_samples` has been called.
+    /// - `AfterEof` if `signal_eof()` was called.
+    /// - `PtsRegression { kind: VadSegment }` if `sample_index` is
+    ///   less than the current VAD watermark.
+    pub fn signal_no_speech_through(
+        &mut self,
+        sample_index: u64,
+    ) -> Result<(), TranscriberError> {
+        if self.eof_signaled {
+            return Err(TranscriberError::AfterEof);
+        }
+        if self.buffer.output_timebase().is_none() {
+            return Err(TranscriberError::OutputTimebaseUnset);
+        }
+        if sample_index < self.vad_watermark {
+            return Err(TranscriberError::PtsRegression {
+                kind: crate::types::PushKind::VadSegment,
+                advance: sample_index as i64 - self.vad_watermark as i64,
+            });
+        }
+        self.vad_watermark = sample_index;
+
+        // Pre-flush the cut accumulator if a hypothetical segment
+        // arriving at `sample_index` would have forced a flush
+        // (extension would exceed chunk_size_samples). Otherwise
+        // the partial chunk sits forever waiting for a segment
+        // that the caller has now declared isn't coming.
+        if let Some(start) = self.cut.pending_start() {
+            if sample_index.saturating_sub(start) > self.cut.chunk_size_samples() {
+                if let Some(chunk) = self.cut.flush() {
+                    let chunk_id = ChunkId::from_raw(self.next_chunk_id);
+                    self.next_chunk_id += 1;
+                    self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
+                }
+            }
+        }
+
+        // Run the standard post-mutation drain so trim drops audio
+        // unreferenced by any live chunk.
+        self.dispatch.after_inject(&mut self.buffer, self.cut.pending_start());
         Ok(())
     }
 
@@ -406,6 +484,13 @@ impl Transcriber {
         // Reset the cut state machine so its current_end / next_vad_seq
         // align with the new frame.
         self.cut = Cut::new(self.config.chunk_size);
+
+        // The VAD watermark lives in absolute-sample space, which
+        // restart_at just reset to 0. Reset the watermark too,
+        // otherwise post-restart VAD pushes at small sample indices
+        // fail the regression check against the pre-restart end
+        // (Codex round-5 corollary).
+        self.vad_watermark = 0;
 
         self.dispatch.draining_for_restart = false;
         Ok(())
@@ -650,6 +735,145 @@ mod tests {
         t.push_samples(ts(0), &[0.0; 1000]).unwrap();
         t.restart_at(ts(50_000_000)).unwrap();
         assert_eq!(t.output_timebase(), Some(tb_48k()));
+    }
+
+    /// Round-5 corollary: `restart_at` resets the buffer's
+    /// `absolute_sample_offset` to 0, so the VAD watermark — which
+    /// is in absolute-sample space — must reset too. Without the
+    /// reset, a post-restart VAD push starting near sample 0
+    /// fails the watermark regression check against the
+    /// pre-restart VAD's end.
+    #[test]
+    fn restart_at_resets_vad_watermark() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 50_000]).unwrap();
+        t.push_vad_segment(VadSegment::new(0, 30_000)).unwrap();
+        // Pre-restart watermark is now 30_000.
+        t.restart_at(ts(50_000_000)).unwrap();
+        // Post-restart, push at sample 0 of the new frame must succeed.
+        t.push_samples(ts(50_000_000), &[0.0; 10_000]).unwrap();
+        t.push_vad_segment(VadSegment::new(0, 5_000)).unwrap();
+    }
+
+    /// Codex round-5 finding [high]: a stream with no VAD activity
+    /// for longer than `buffer_cap_samples` would fill the buffer
+    /// and trip Backpressure with no recovery path — chunks emit
+    /// only on VAD or EOF, so trim never runs. The watermark API
+    /// lets the caller explicitly declare "VAD analyzed through
+    /// here, no segments" so the core can safely drop the buffered
+    /// audio.
+    #[test]
+    fn signal_no_speech_through_drains_pure_silence_buffer() {
+        let mut config = TranscriberConfig::default();
+        // Tighten cap so test doesn't have to push 60 s of audio.
+        config.buffer_cap_samples = 20_000;
+        let mut t = Transcriber::new(config);
+        // Push 16 000 samples (close to cap, but under).
+        t.push_samples(ts(0), &[0.0; 16_000]).unwrap();
+        assert_eq!(t.buffered_samples(), 16_000);
+        // Tell whispery VAD has analyzed through sample 16_000 with
+        // no segments. Buffer should drop everything; the next push
+        // can land cleanly even though a contiguous push without
+        // the signal would have hit Backpressure (16 000 + 16 000
+        // > 20 000).
+        t.signal_no_speech_through(16_000).unwrap();
+        assert_eq!(t.buffered_samples(), 0,
+            "post-watermark trim must drop unreferenced audio");
+        assert!(t.is_idle());
+        // Subsequent push at the same anchor (no time gap, since the
+        // buffer's anchor was preserved) succeeds.
+        let next = t.next_expected_starts_at().unwrap();
+        t.push_samples(next, &[0.0; 16_000]).unwrap();
+    }
+
+    /// Round-5 corollary: speech followed by long silence must be
+    /// flushable. After a partial chunk has been accumulating in the
+    /// cut state machine, signal_no_speech_through(sample_index)
+    /// past `current_start + chunk_size_samples` pre-flushes the
+    /// chunk — any future segment starting >= sample_index would
+    /// force the cut to flush anyway.
+    #[test]
+    fn signal_no_speech_through_flushes_orphaned_partial_chunk() {
+        let mut config = TranscriberConfig::default();
+        config.chunk_size = Duration::from_secs(2); // 32 000 samples
+        let mut t = Transcriber::new(config);
+        // Push enough audio to cover speech + lots of silence.
+        t.push_samples(ts(0), &[0.0; 200_000]).unwrap();
+        // Speech segment: [0, 16 000) — half a chunk_size.
+        t.push_vad_segment(VadSegment::new(0, 16_000)).unwrap();
+        // No emit yet: the cut accumulator is half-full, still under
+        // chunk_size.
+        assert!(t.poll_event().is_none());
+
+        // Now signal silence past chunk_size_samples. The hypothetical
+        // next segment at sample 100_000 would trigger flush
+        // (100_000 - 0 > 32_000); pre-flush instead.
+        t.signal_no_speech_through(100_000).unwrap();
+
+        // The cut accumulator should have been flushed — chunk 0 is
+        // now in_flight awaiting an ASR result.
+        match t.poll_command() {
+            Some(crate::core::command::Command::RunAsr { chunk_id, .. })
+                if chunk_id.as_u64() == 0 => {}
+            other => panic!("expected RunAsr for chunk 0, got {:?}", other),
+        }
+    }
+
+    /// Round-5 corollary: a no-speech signal advances the VAD
+    /// watermark, so subsequent VAD pushes that start before the
+    /// watermark must be rejected with PtsRegression — otherwise
+    /// the caller could contradict their own no-speech declaration.
+    #[test]
+    fn vad_segment_before_no_speech_watermark_returns_pts_regression() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 50_000]).unwrap();
+        t.signal_no_speech_through(10_000).unwrap();
+        let r = t.push_vad_segment(VadSegment::new(5_000, 8_000));
+        assert!(matches!(
+            r,
+            Err(TranscriberError::PtsRegression {
+                kind: crate::types::PushKind::VadSegment,
+                ..
+            })
+        ));
+    }
+
+    /// Round-5 corollary: a regression on the no-speech watermark
+    /// itself (calling it twice with a smaller index second) returns
+    /// PtsRegression.
+    #[test]
+    fn signal_no_speech_through_regression_returns_error() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 50_000]).unwrap();
+        t.signal_no_speech_through(20_000).unwrap();
+        let r = t.signal_no_speech_through(10_000);
+        assert!(matches!(
+            r,
+            Err(TranscriberError::PtsRegression {
+                kind: crate::types::PushKind::VadSegment,
+                ..
+            })
+        ));
+    }
+
+    /// Round-5 corollary: signal_no_speech_through before any push
+    /// returns OutputTimebaseUnset (consistent with push_vad_segment).
+    #[test]
+    fn signal_no_speech_through_before_push_samples_returns_unset() {
+        let mut t = fresh();
+        let r = t.signal_no_speech_through(1000);
+        assert!(matches!(r, Err(TranscriberError::OutputTimebaseUnset)));
+    }
+
+    /// Round-5 corollary: signal_no_speech_through after signal_eof
+    /// returns AfterEof (consistent with push_*).
+    #[test]
+    fn signal_no_speech_through_after_eof_returns_after_eof() {
+        let mut t = fresh();
+        t.push_samples(ts(0), &[0.0; 1000]).unwrap();
+        t.signal_eof().unwrap();
+        let r = t.signal_no_speech_through(2000);
+        assert!(matches!(r, Err(TranscriberError::AfterEof)));
     }
 
     /// Codex round-2 finding [high]: VAD must not reference audio
