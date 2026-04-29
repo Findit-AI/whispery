@@ -559,6 +559,37 @@ impl ManagedTranscriber {
     }
 }
 
+impl ManagedTranscriber {
+    /// True iff every queue is empty (core idle AND no pending
+    /// transcripts/errors locally buffered).
+    pub fn is_idle(&self) -> bool {
+        self.core.is_idle()
+            && self.pending_transcripts.is_empty()
+            && self.pending_errors.is_empty()
+    }
+
+    /// Live buffer length in samples (proxy from the core).
+    pub fn buffered_samples(&self) -> usize {
+        self.core.buffered_samples()
+    }
+
+    /// Output timebase, recorded on the first push_samples call.
+    pub fn output_timebase(&self) -> Option<mediatime::Timebase> {
+        self.core.output_timebase()
+    }
+
+    /// PTS that the core expects on the next contiguous push_samples.
+    pub fn next_expected_starts_at(&self) -> Option<Timestamp> {
+        self.core.next_expected_starts_at()
+    }
+
+    /// Non-mutating predicate: would the next push of `samples_len`
+    /// audio samples fit?
+    pub fn would_accept(&self, samples_len: usize) -> bool {
+        self.core.would_accept(samples_len, 0)
+    }
+}
+
 /// Merge a sparse `AsrParamsOverride` onto `base`, producing the
 /// final `AsrParams` that will ship in any RunAsr emitted from the
 /// current packet's chunks.
