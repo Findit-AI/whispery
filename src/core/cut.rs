@@ -129,7 +129,19 @@ impl Cut {
         if len > self.chunk_size_samples {
             // Pre-split overlong segment into n equal-ish parts.
             // n = ceil(len / chunk_size_samples).
-            let n = ((len + self.chunk_size_samples - 1) / self.chunk_size_samples) as u8;
+            let n_full = len.div_ceil(self.chunk_size_samples);
+            // SubOrigin::HardSplit.total_parts is u8 (255 max), so a
+            // single VAD segment longer than 255 × chunk_size is
+            // outside the design envelope. For default chunk_size=30s
+            // that's 127 minutes of continuous speech in one segment;
+            // pathological. Hard-fail rather than silently drop data.
+            assert!(
+                n_full <= u8::MAX as u64,
+                "VadSegment of {} samples exceeds 255×chunk_size ({}); refuse to drop data",
+                len,
+                255 * self.chunk_size_samples,
+            );
+            let n = n_full as u8;
             for i in 0..n {
                 let part_start = seg.start_sample() + (i as u64 * len) / n as u64;
                 let part_end = if i == n - 1 {
