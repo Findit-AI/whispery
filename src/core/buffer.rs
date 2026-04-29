@@ -70,18 +70,26 @@ impl SampleBuffer {
         starts_at: Timestamp,
         packet: &[f32],
     ) -> Result<(), TranscriberError> {
-        if let Some(expected_tb) = self.output_tb {
-            if starts_at.timebase() != expected_tb {
-                return Err(TranscriberError::InconsistentTimebase {
-                    expected: expected_tb,
-                    got: starts_at.timebase(),
-                });
+        // Round-3 fix: do NOT commit `output_tb` / `base_pts_out_anchor`
+        // until every error path has been cleared. Pre-fix code wrote
+        // the anchor on first push *before* the capacity check, so a
+        // first-push Backpressure left a "ghost" timebase that later
+        // retries (with a corrected timebase or smaller packet) would
+        // race against, tripping InconsistentTimebase / PtsRegression.
+        // Compute against the *effective* anchor (the one we'd commit
+        // if every check passes) without writing to `self` until then.
+        let (effective_tb, effective_anchor, would_be_first_push) = match self.output_tb {
+            Some(expected_tb) => {
+                if starts_at.timebase() != expected_tb {
+                    return Err(TranscriberError::InconsistentTimebase {
+                        expected: expected_tb,
+                        got: starts_at.timebase(),
+                    });
+                }
+                (expected_tb, self.base_pts_out_anchor, false)
             }
-        } else {
-            self.output_tb = Some(starts_at.timebase());
-            self.base_pts_out_anchor = starts_at.pts();
-        }
-        let output_tb = self.output_tb.expect("just set");
+            None => (starts_at.timebase(), starts_at.pts(), true),
+        };
 
         // Compute expected next-PTS in output-tb space, then the
         // delta against caller's starts_at. This is the round-4
@@ -89,11 +97,11 @@ impl SampleBuffer {
         // so contiguous pushes on non-integer-ratio output
         // timebases don't trip spurious regressions through round-trip
         // truncation.
-        let expected_pts_out = self.base_pts_out_anchor
+        let expected_pts_out = effective_anchor
             + Timebase::rescale_pts(
                 self.absolute_sample_offset as i64,
                 ANALYSIS_TIMEBASE,
-                output_tb,
+                effective_tb,
             );
         let delta_pts_out = starts_at.pts() - expected_pts_out;
 
@@ -107,7 +115,7 @@ impl SampleBuffer {
         } else {
             // Convert the gap back to 16 kHz samples for the
             // zero-fill width / tolerance check.
-            let g = Timebase::rescale_pts(delta_pts_out, output_tb, ANALYSIS_TIMEBASE);
+            let g = Timebase::rescale_pts(delta_pts_out, effective_tb, ANALYSIS_TIMEBASE);
             if (g as u64) > self.gap_tolerance_samples {
                 return Err(TranscriberError::GapExceedsTolerance {
                     gap_samples: g as u64,
@@ -133,7 +141,12 @@ impl SampleBuffer {
             });
         }
 
-        // Zero-fill any tolerated gap, then append the packet.
+        // All checks passed. Commit the anchor on first push, then
+        // zero-fill any tolerated gap and append the packet.
+        if would_be_first_push {
+            self.output_tb = Some(effective_tb);
+            self.base_pts_out_anchor = effective_anchor;
+        }
         if delta_samples > 0 {
             self.samples.extend(core::iter::repeat_n(0.0_f32, delta_samples as usize));
             self.absolute_sample_offset += delta_samples;
@@ -327,6 +340,42 @@ mod tests {
         // Same anchor PTS still works on a smaller packet.
         b.append(ts_at_48k(0), &[1.0; 100]).unwrap();
         assert_eq!(b.buffered_samples(), 100);
+        assert_eq!(b.absolute_sample_offset(), 100);
+    }
+
+    /// Codex round-3 finding [medium]: a Backpressure on the FIRST
+    /// push must be fully atomic — the rejected packet must not
+    /// commit the stream's timebase or anchor. Without the fix, a
+    /// retry (after the cap is raised, or with a smaller packet, or
+    /// with a corrected timebase) would race against an already-fixed
+    /// anchor and trip InconsistentTimebase / PtsRegression /
+    /// GapExceedsTolerance even though the rejected input was
+    /// supposed to be uncommitted.
+    #[test]
+    fn first_push_backpressure_does_not_commit_timebase() {
+        let mut b = SampleBuffer::new(150, 3200);
+        // First push fails with Backpressure (200 > 150).
+        let r = b.append(ts_at_48k(48_000), &[0.0; 200]);
+        assert!(matches!(r, Err(TranscriberError::Backpressure { .. })));
+        // Timebase and anchor must remain uncommitted.
+        assert_eq!(b.output_timebase(), None,
+            "Backpressure on first push must not commit output timebase");
+        assert!(b.next_expected_starts_at().is_none(),
+            "Backpressure on first push must not commit anchor PTS");
+    }
+
+    /// Round-3 corollary: after a first-push Backpressure, the buffer
+    /// must accept a *different* timebase as its actual first push.
+    /// (Pre-fix behavior committed the rejected timebase, so this
+    /// would have tripped InconsistentTimebase.)
+    #[test]
+    fn first_push_backpressure_allows_different_timebase_on_retry() {
+        let mut b = SampleBuffer::new(150, 3200);
+        let _ = b.append(ts_at_48k(0), &[0.0; 200]); // rejected
+        let other_tb = Timebase::new(1, NonZeroU32::new(96_000).unwrap());
+        // Different timebase + smaller packet must succeed.
+        b.append(Timestamp::new(0, other_tb), &[0.0; 100]).unwrap();
+        assert_eq!(b.output_timebase(), Some(other_tb));
         assert_eq!(b.absolute_sample_offset(), 100);
     }
 

@@ -83,11 +83,11 @@ pub(crate) struct Dispatch {
     /// (b) `LanguagePolicy::AutoLockAfter(n)` reaches its threshold.
     pub locked_language: Option<Lang>,
     /// First `n` non-empty observations under
-    /// `LanguagePolicy::AutoLockAfter(n)`. When this reaches `n`
-    /// entries, `locked_language` is set to the most-frequent
-    /// language in the list (with first-occurrence tiebreaking
-    /// among ties — the language that appeared first in the
-    /// observation order wins).
+    /// `LanguagePolicy::AutoLockAfter(n)`, in ChunkId order. When
+    /// this reaches `n` entries, `locked_language` is set to the
+    /// most-frequent language in the list (with first-occurrence
+    /// tiebreaking among ties — the language that appeared first
+    /// in chunk_id order wins).
     ///
     /// Codex round-2 fix: previously this was a `usize` counter
     /// that just stored the last-observed language at threshold.
@@ -95,6 +95,28 @@ pub(crate) struct Dispatch {
     /// contract — a noisy `En, En, Zh` sequence would have
     /// locked to Zh.
     pub auto_lock_observations: alloc::vec::Vec<Lang>,
+    /// Per-ChunkId resolution status for AutoLockAfter ordering. An
+    /// entry's value is `Some(lang)` for a non-empty ASR result and
+    /// `None` for either an empty-text result or an ASR-stage
+    /// failure. Entries ahead of `auto_lock_cursor` are buffered
+    /// here until earlier chunks resolve; the cursor drains them in
+    /// chunk_id order via `advance_auto_lock_cursor`.
+    ///
+    /// Codex round-3 fix: previously observations were appended in
+    /// ASR completion order, so out-of-order completion (chunk 1
+    /// finishing before chunk 0) race-determined the locked
+    /// language. The spec calls for locking on the first non-empty
+    /// chunks *in the stream*, not the first to complete on the
+    /// runner.
+    pub auto_lock_pending: BTreeMap<ChunkId, Option<Lang>>,
+    /// Next ChunkId the auto-lock cursor will consider. Advances
+    /// monotonically, only moving past a ChunkId once that chunk has
+    /// an entry in `auto_lock_pending` (i.e., its ASR stage has
+    /// resolved one way or another). Independent from
+    /// `next_emit_chunk_id` because the cursor advances on ASR
+    /// resolution, not on full chunk readiness — a chunk awaiting
+    /// alignment has already produced its language signal.
+    pub auto_lock_cursor: ChunkId,
     /// Set true while `restart_at` is draining `cut_pending`. While
     /// true, the promotion guard `in_flight.len() < max_in_flight`
     /// is suspended (per §5.5 invariant 4 exception). Reset to
@@ -134,8 +156,33 @@ impl Dispatch {
             language_policy,
             locked_language,
             auto_lock_observations: alloc::vec::Vec::new(),
+            auto_lock_pending: BTreeMap::new(),
+            auto_lock_cursor: ChunkId::from_raw(0),
             draining_for_restart: false,
             parked_command: None,
+        }
+    }
+
+    /// Drain `auto_lock_pending` from `auto_lock_cursor` forward,
+    /// appending non-empty observations to `auto_lock_observations`
+    /// in ChunkId order. Stops at the first cursor position with no
+    /// resolution recorded yet, or as soon as `n` observations have
+    /// been collected (then sets `locked_language`).
+    fn advance_auto_lock_cursor(&mut self, n: usize) {
+        while let Some(entry) = self.auto_lock_pending.remove(&self.auto_lock_cursor) {
+            if let Some(lang) = entry {
+                self.auto_lock_observations.push(lang);
+            }
+            self.auto_lock_cursor = ChunkId::from_raw(self.auto_lock_cursor.as_u64() + 1);
+            if self.auto_lock_observations.len() >= n {
+                self.locked_language = Some(mode_with_first_occurrence_tiebreak(
+                    &self.auto_lock_observations,
+                ));
+                // Drop the buffered tail; nothing past this point
+                // contributes to the lock decision.
+                self.auto_lock_pending.clear();
+                return;
+            }
         }
     }
 
@@ -299,30 +346,42 @@ impl Dispatch {
         chunk_id: ChunkId,
         result: AsrResult,
     ) -> Result<(), TranscriberError> {
-        let record = self.in_flight.get_mut(&chunk_id).ok_or(TranscriberError::UnknownChunk(chunk_id))?;
-        if !matches!(record.phase, ChunkPhase::AwaitingAsr) {
-            return Err(TranscriberError::UnknownChunk(chunk_id));
+        // Phase check via shared borrow first; the borrow drops at
+        // the end of this statement so the auto-lock block below
+        // can take `&mut self`. Holding a mutable record borrow
+        // across `advance_auto_lock_cursor` (a `&mut self` method)
+        // is what tripped E0499.
+        match self.in_flight.get(&chunk_id) {
+            None => return Err(TranscriberError::UnknownChunk(chunk_id)),
+            Some(r) if !matches!(r.phase, ChunkPhase::AwaitingAsr) => {
+                return Err(TranscriberError::UnknownChunk(chunk_id));
+            }
+            Some(_) => {}
         }
 
-        // Update LanguagePolicy::AutoLockAfter observations.
-        // Empty-text results don't count (they're typically silent
-        // chunks with no language signal). Once `n` non-empty
-        // observations land, lock to the most-frequent language
-        // among them, with first-occurrence tiebreaking — the
-        // language that appeared first in the observation order
-        // wins ties. (Codex round-2 fix: previous code locked to
-        // the last observation, which broke `En, En, Zh → Zh`.)
+        // Update LanguagePolicy::AutoLockAfter observations. The
+        // cursor advances strictly in ChunkId order so out-of-order
+        // ASR completion can't race-determine the locked language —
+        // pre-fix code recorded observations on completion, so
+        // chunk 5 finishing before chunk 0 could lock against an
+        // unrepresentative early sample of the stream. Empty-text
+        // results and ASR failures don't add an observation, but
+        // they DO advance the cursor so a single empty/failed chunk
+        // doesn't block auto-lock forever.
         if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
-            if self.locked_language.is_none() && !result.text.is_empty() {
-                self.auto_lock_observations.push(result.language.clone());
-                if self.auto_lock_observations.len() >= *n {
-                    self.locked_language = Some(mode_with_first_occurrence_tiebreak(
-                        &self.auto_lock_observations,
-                    ));
-                }
+            if self.locked_language.is_none() {
+                let entry = if result.text.is_empty() {
+                    None
+                } else {
+                    Some(result.language.clone())
+                };
+                self.auto_lock_pending.insert(chunk_id, entry);
+                let n = *n;
+                self.advance_auto_lock_cursor(n);
             }
         }
 
+        let record = self.in_flight.get_mut(&chunk_id).expect("phase-checked above");
         if self.word_alignment && !result.text.is_empty() {
             // Cache only when alignment will consume it. Alignment-off
             // builds the Transcript directly below; caching there
@@ -401,11 +460,36 @@ impl Dispatch {
         chunk_id: ChunkId,
         failure: WorkFailure,
     ) -> Result<(), TranscriberError> {
-        let record = self.in_flight.get_mut(&chunk_id).ok_or(TranscriberError::UnknownChunk(chunk_id))?;
-        if !matches!(record.phase, ChunkPhase::AwaitingAsr | ChunkPhase::AwaitingAlignment) {
-            return Err(TranscriberError::UnknownChunk(chunk_id));
+        // Snapshot the pre-transition phase via a shared borrow so
+        // the auto-lock branch below can take `&mut self`.
+        let was_awaiting_asr = match self.in_flight.get(&chunk_id) {
+            None => return Err(TranscriberError::UnknownChunk(chunk_id)),
+            Some(r) => match r.phase {
+                ChunkPhase::AwaitingAsr => true,
+                ChunkPhase::AwaitingAlignment => false,
+                _ => return Err(TranscriberError::UnknownChunk(chunk_id)),
+            },
+        };
+
+        // An ASR-stage failure produces no language signal but still
+        // resolves the chunk, so the auto-lock cursor must advance
+        // past it. An alignment-stage failure has already had its
+        // language observed at ASR-result time, so we don't touch
+        // auto_lock_pending for those.
+        if was_awaiting_asr {
+            if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
+                if self.locked_language.is_none() {
+                    self.auto_lock_pending.insert(chunk_id, None);
+                    let n = *n;
+                    self.advance_auto_lock_cursor(n);
+                }
+            }
         }
-        record.phase = ChunkPhase::FailedReady { failure };
+
+        self.in_flight
+            .get_mut(&chunk_id)
+            .expect("phase-checked above")
+            .phase = ChunkPhase::FailedReady { failure };
         Ok(())
     }
 
@@ -817,6 +901,187 @@ mod tests {
             }
             _ => panic!("expected RunAsr"),
         }
+    }
+
+    /// Codex round-3 finding [high]: AutoLockAfter must order
+    /// observations by ChunkId, not by ASR completion order. With
+    /// max_in_flight > 1, chunk 1 can finish before chunk 0; the
+    /// pre-fix code recorded observations in completion order,
+    /// race-determining the lock based on which worker happened to
+    /// finish first. Reproduction: chunk 0 = En, chunk 1 = Zh, ASR
+    /// for chunk 1 arrives first. With first-occurrence tiebreaking,
+    /// chunk_id order [En, Zh] picks En; completion order [Zh, En]
+    /// picks Zh — pre-fix would have locked Zh.
+    #[test]
+    fn auto_lock_after_orders_by_chunk_id_not_completion() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            4,
+            LanguagePolicy::AutoLockAfter(2),
+        );
+        let mut b = make_buffer_with_samples(10_000);
+
+        d.on_emit(fake_chunk(0, 500), ChunkId::from_raw(0), &b);
+        d.on_emit(fake_chunk(500, 1_000), ChunkId::from_raw(1), &b);
+
+        // Chunk 1's ASR result arrives FIRST (out of order). Lock
+        // must NOT advance — chunk 0 is still in flight.
+        d.inject_asr_result(
+            ChunkId::from_raw(1),
+            AsrResult {
+                text: SmolStr::new("zh"),
+                language: Lang::Zh,
+                avg_logprob: -0.5,
+                no_speech_prob: 0.05,
+                temperature: 0.0,
+            },
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+        assert_eq!(d.locked_language, None,
+            "auto-lock must not advance until chunk 0 resolves, regardless of completion order");
+
+        // Chunk 0's ASR result arrives — En. Now both have resolved
+        // and the cursor can advance through both in chunk_id order:
+        // observations = [En, Zh] → mode picks En (first occurrence
+        // wins on ties).
+        d.inject_asr_result(
+            ChunkId::from_raw(0),
+            AsrResult {
+                text: SmolStr::new("en"),
+                language: Lang::En,
+                avg_logprob: -0.5,
+                no_speech_prob: 0.05,
+                temperature: 0.0,
+            },
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+
+        assert_eq!(d.locked_language, Some(Lang::En),
+            "auto-lock must observe in chunk_id order: chunk 0 = En first, then chunk 1 = Zh");
+    }
+
+    /// Round-3 corollary: an ASR failure on AwaitingAsr must advance
+    /// the auto-lock cursor without contributing an observation.
+    /// Otherwise a single failed chunk would block auto-lock forever.
+    /// Reproduction: chunk 0 fails ASR; chunks 1 and 2 succeed in
+    /// English. AutoLockAfter(2) must still lock to En.
+    #[test]
+    fn auto_lock_after_skips_failed_chunks() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            4,
+            LanguagePolicy::AutoLockAfter(2),
+        );
+        let mut b = make_buffer_with_samples(10_000);
+
+        d.on_emit(fake_chunk(0, 500), ChunkId::from_raw(0), &b);
+        d.on_emit(fake_chunk(500, 1_000), ChunkId::from_raw(1), &b);
+        d.on_emit(fake_chunk(1_000, 1_500), ChunkId::from_raw(2), &b);
+
+        // Chunk 0 fails ASR.
+        d.inject_failure(
+            ChunkId::from_raw(0),
+            WorkFailure::AsrFailed {
+                kind: crate::types::AsrFailureKind::AllTemperaturesFailed,
+                message: "fail".into(),
+            },
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+        assert_eq!(d.locked_language, None, "single failed chunk produced no observation yet");
+
+        // Chunks 1 and 2 succeed in English. After both land, cursor
+        // advances through 0 (failed, skipped) → 1 (En) → 2 (En) and
+        // locks once observations.len() reaches 2.
+        d.inject_asr_result(
+            ChunkId::from_raw(1),
+            AsrResult {
+                text: SmolStr::new("hello"),
+                language: Lang::En,
+                avg_logprob: -0.5,
+                no_speech_prob: 0.05,
+                temperature: 0.0,
+            },
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+        d.inject_asr_result(
+            ChunkId::from_raw(2),
+            AsrResult {
+                text: SmolStr::new("world"),
+                language: Lang::En,
+                avg_logprob: -0.5,
+                no_speech_prob: 0.05,
+                temperature: 0.0,
+            },
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+
+        assert_eq!(d.locked_language, Some(Lang::En),
+            "auto-lock must skip failed chunk 0 and lock to En from chunks 1 + 2");
+    }
+
+    /// Round-3 corollary: an empty-text ASR result must advance the
+    /// cursor without contributing an observation, even when arriving
+    /// out of order. Reproduction: chunks 0–2 promoted; chunk 1 = En,
+    /// chunk 0 = empty silent chunk, chunk 2 = En. AutoLockAfter(2)
+    /// must lock on En after chunk 2 resolves.
+    #[test]
+    fn auto_lock_after_skips_empty_chunks_in_chunk_id_order() {
+        let mut d = Dispatch::new(
+            AsrParams::default(),
+            false,
+            4,
+            LanguagePolicy::AutoLockAfter(2),
+        );
+        let mut b = make_buffer_with_samples(10_000);
+
+        d.on_emit(fake_chunk(0, 500), ChunkId::from_raw(0), &b);
+        d.on_emit(fake_chunk(500, 1_000), ChunkId::from_raw(1), &b);
+        d.on_emit(fake_chunk(1_000, 1_500), ChunkId::from_raw(2), &b);
+
+        // Chunk 1 (En) lands first (out of order).
+        d.inject_asr_result(
+            ChunkId::from_raw(1),
+            AsrResult {
+                text: SmolStr::new("hello"),
+                language: Lang::En,
+                avg_logprob: -0.5,
+                no_speech_prob: 0.05,
+                temperature: 0.0,
+            },
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+        assert_eq!(d.locked_language, None);
+
+        // Chunk 0 (empty) — the cursor advances to 1, picks up En.
+        d.inject_asr_result(
+            ChunkId::from_raw(0),
+            AsrResult {
+                text: SmolStr::new(""),
+                language: Lang::En,
+                avg_logprob: -1.0,
+                no_speech_prob: 0.95,
+                temperature: 0.0,
+            },
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+        assert_eq!(d.locked_language, None,
+            "only chunk 1 contributed; need a second non-empty observation");
+
+        // Chunk 2 (En) — second observation lands; lock to En.
+        d.inject_asr_result(
+            ChunkId::from_raw(2),
+            AsrResult {
+                text: SmolStr::new("world"),
+                language: Lang::En,
+                avg_logprob: -0.5,
+                no_speech_prob: 0.05,
+                temperature: 0.0,
+            },
+        ).unwrap();
+        d.after_inject(&mut b, Some(0));
+        assert_eq!(d.locked_language, Some(Lang::En));
     }
 
     /// Tiebreaking: with n=2 and [En, Zh] (each observed once), the
