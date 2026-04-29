@@ -2288,7 +2288,7 @@ pub enum Lang {
 }
 ```
 
-99 named variants plus `Other`. The list is generated from whisper.cpp's source; a `#[test]` round-trips every named variant through `from_iso639_1(v.as_str())` and asserts the result equals `v` (canonicalisation invariant). When whisper.cpp ships a new language, the v1.x patch is to insert the variant alphabetically here and add the `as_str` / `from_iso639_1` match arms — no other code paths need touching.
+100 named variants plus `Other`. The list is generated from whisper.cpp's `g_lang` table (v1.7.6); a `#[test]` round-trips every named variant through `from_iso639_1(v.as_str())` and asserts the result equals `v` (canonicalisation invariant). When whisper.cpp ships a new language, the v1.x patch is to insert the variant alphabetically here and add the `as_str` / `from_iso639_1` match arms — no other code paths need touching.
 
 Naming notes:
 
