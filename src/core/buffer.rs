@@ -119,7 +119,7 @@ impl SampleBuffer {
 
         // Zero-fill any tolerated gap, then append the packet.
         if delta_samples > 0 {
-            self.samples.extend(core::iter::repeat(0.0_f32).take(delta_samples as usize));
+            self.samples.extend(core::iter::repeat_n(0.0_f32, delta_samples as usize));
             self.absolute_sample_offset += delta_samples;
         }
         self.samples.extend_from_slice(packet);
