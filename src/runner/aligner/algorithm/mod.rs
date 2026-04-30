@@ -6,3 +6,4 @@
 pub(crate) mod encode;
 pub(crate) mod silence_mask;
 pub(crate) mod tokenize;
+pub(crate) mod viterbi;
