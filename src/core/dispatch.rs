@@ -109,6 +109,18 @@ impl ExtractedChunk {
       sub_origins,
     }
   }
+
+  /// Stream-coordinate first 16 kHz sample index of this chunk's
+  /// audio. Used by the alignment worker (Plan C) to map wav2vec2
+  /// frame indices back to stream sample positions.
+  ///
+  /// Plan A's `SampleRange` is half-open and stream-relative, so
+  /// `sample_range.start` is exactly the chunk's first sample
+  /// index since stream zero.
+  #[cfg(feature = "alignment")]
+  pub(crate) fn chunk_first_sample_in_stream(&self) -> u64 {
+    self.sample_range.start
+  }
 }
 
 pub(crate) struct Dispatch {
