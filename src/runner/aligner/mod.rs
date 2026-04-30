@@ -6,4 +6,4 @@ mod normalizers;
 
 pub use key::{AlignerKey, AlignmentFallback};
 pub use normalizer::{DynTextNormalizer, NormalizationError, NormalizedText, TextNormalizer};
-pub use normalizers::{ChineseNormalizer, EnglishNormalizer};
+pub use normalizers::{ChineseNormalizer, EnglishNormalizer, JapaneseNormalizer};

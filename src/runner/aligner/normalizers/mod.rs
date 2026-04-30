@@ -6,6 +6,8 @@
 
 mod chinese;
 mod english;
+mod japanese;
 
 pub use chinese::ChineseNormalizer;
 pub use english::EnglishNormalizer;
+pub use japanese::JapaneseNormalizer;
