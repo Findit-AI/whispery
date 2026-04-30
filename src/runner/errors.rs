@@ -10,7 +10,8 @@ use crate::types::TranscriberError;
 /// inference failure surfaced asynchronously via `Event::Error`.
 /// `RunnerError` is returned synchronously from
 /// [`crate::runner::ManagedTranscriber::process_packet`],
-/// `signal_eof`, `drain`, and the builder's `build`.
+/// `signal_eof`, `drain`, the builder's `build`, and (with the
+/// `alignment` feature) `Aligner::from_paths`.
 ///
 /// See spec §4.5 / §9.
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +21,25 @@ pub enum RunnerError {
     #[error("failed to load whisper context: {message}")]
     WhisperContextLoad {
         /// Verbatim error from whisper-rs.
+        message: alloc::string::String,
+    },
+
+    /// `Aligner::from_paths` failed at builder time. The wav2vec2
+    /// ONNX model or tokenizer.json could not be loaded; no
+    /// alignment workers were spawned. The aligner-bearing builder
+    /// (`ManagedTranscriberBuilder::with_alignment`) returns this
+    /// from `build()`.
+    ///
+    /// Two common causes: (1) `model_path` does not exist or is
+    /// not a valid ONNX graph; (2) `tokenizer_path` does not exist
+    /// or is not a valid HuggingFace `tokenizer.json`. The verbatim
+    /// upstream error string is in `message`.
+    ///
+    /// Gated on `feature = "alignment"`.
+    #[cfg(feature = "alignment")]
+    #[error("failed to load aligner: {message}")]
+    AlignerLoad {
+        /// Verbatim error from `ort` or `tokenizers`.
         message: alloc::string::String,
     },
 
