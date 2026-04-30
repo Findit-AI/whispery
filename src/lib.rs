@@ -54,3 +54,18 @@ pub use runner::{
 // single major in Cargo.toml.
 #[cfg(feature = "runner")]
 pub use whisper_rs::{WhisperContext, WhisperContextParameters};
+
+#[cfg(feature = "alignment")]
+pub use runner::{
+    Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
+    ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer,
+    NormalizationError, NormalizedText, TextNormalizer,
+};
+
+// Re-export ort types that appear on the alignment public API.
+//
+// SemVer note: re-exporting pins whispery's public API to ort's
+// semver. Cargo.toml pins ort to =2.0.0-rc.12; bumping it requires
+// a matching whispery-major bump.
+#[cfg(feature = "alignment")]
+pub use ort;
