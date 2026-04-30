@@ -174,10 +174,13 @@ impl Aligner {
         text: &str,
         chunk_first_sample_in_stream: u64,
         samples_to_output_range: F,
+        abort_flag: &core::sync::atomic::AtomicBool,
     ) -> Result<AlignmentResult, WorkFailure>
     where
         F: Fn(u64, u64) -> TimeRange,
     {
+        use core::sync::atomic::Ordering;
+
         use crate::runner::aligner::algorithm::{
             compose::compose_words,
             encode::encode_log_softmax,
@@ -186,6 +189,26 @@ impl Aligner {
             viterbi::ctc_viterbi,
         };
         use crate::types::AlignmentFailureKind;
+
+        // Helper: produce a WorkerHangTimeout when the watchdog has
+        // already flipped abort_flag. `elapsed` is left as ZERO here;
+        // `run_one_alignment` (the worker) holds the canonical
+        // Instant::now() reference and overwrites unconditionally
+        // when abort_flag is set, so the value here is purely
+        // diagnostic. We keep the in-`align` checks anyway so a long
+        // encode (1+ seconds for 30 s of audio) bails out at the
+        // next stage boundary instead of compounding the hang by
+        // running CTC + Viterbi + compose on probably-bogus data.
+        let timed_out = || -> WorkFailure {
+            WorkFailure::WorkerHangTimeout {
+                kind: crate::types::WorkerKind::Alignment,
+                elapsed: core::time::Duration::ZERO,
+            }
+        };
+
+        if abort_flag.load(Ordering::Relaxed) {
+            return Err(timed_out());
+        }
 
         // Step 0: silence-mask non-speech regions.
         // The output_range_to_chunk_local closure converts an
@@ -226,6 +249,10 @@ impl Aligner {
             (seg.start_pts() as u64, seg.end_pts() as u64)
         });
 
+        if abort_flag.load(Ordering::Relaxed) {
+            return Err(timed_out());
+        }
+
         // Step 1: normalise.
         let normalized = self
             .normalizer
@@ -249,6 +276,10 @@ impl Aligner {
 
         let n_words = normalized.original_words().len();
 
+        if abort_flag.load(Ordering::Relaxed) {
+            return Err(timed_out());
+        }
+
         // Step 2: tokenise with word index map.
         let tokenized = tokenize_with_word_map(
             &self.tokenizer,
@@ -257,8 +288,19 @@ impl Aligner {
             &self.language,
         )?;
 
-        // Steps 3-4: encode + log-softmax.
+        if abort_flag.load(Ordering::Relaxed) {
+            return Err(timed_out());
+        }
+
+        // Steps 3-4: encode + log-softmax. ort::Session::run is
+        // uninterruptible in v1 — this can run for ~1 s on 30 s of
+        // audio. The watchdog may flip abort_flag mid-run; we surface
+        // the timeout at the *next* boundary check immediately below.
         let log_probs = encode_log_softmax(&mut self.session, &masked, &self.language)?;
+
+        if abort_flag.load(Ordering::Relaxed) {
+            return Err(timed_out());
+        }
 
         // Steps 5-6: CTC lattice + Viterbi.
         let path = ctc_viterbi(
@@ -267,6 +309,10 @@ impl Aligner {
             self.blank_token_id,
             &self.language,
         )?;
+
+        if abort_flag.load(Ordering::Relaxed) {
+            return Err(timed_out());
+        }
 
         // Steps 7-9: per-word state + surface-form recovery.
         Ok(compose_words(

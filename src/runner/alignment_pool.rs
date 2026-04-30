@@ -244,6 +244,7 @@ fn run_under_lock(
         job.text.as_str(),
         job.chunk_first_sample_in_stream,
         move |a, b| (bound)(a, b),
+        &job.abort_flag,
     )
 }
 
