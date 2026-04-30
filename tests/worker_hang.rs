@@ -9,8 +9,7 @@
 
 #![cfg(feature = "runner")]
 
-use core::num::NonZeroU32;
-use core::time::Duration;
+use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
 // Plan note: the plan's example imports `ManagedTranscriber` and
@@ -20,8 +19,10 @@ use mediatime::{Timebase, Timestamp};
 // (no lib.rs change in this task's file list), mirroring the same
 // workaround used in `tests/runner_e2e.rs`,
 // `tests/saturation_no_loss.rs`, and `tests/unpoll_round_trip.rs`.
-use whispery::{LanguagePolicy, VadSegment, WorkFailure};
-use whispery::runner::{ManagedTranscriber, WhisperPoolConfig};
+use whispery::{
+  LanguagePolicy, VadSegment, WorkFailure,
+  runner::{ManagedTranscriber, WhisperPoolConfig},
+};
 
 const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
 
@@ -38,40 +39,42 @@ const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
 #[test]
 #[ignore = "drain hangs against real ggml-tiny model — investigation follow-up"]
 fn tiny_timeout_emits_worker_hang_failures() {
-    let model_path = match MODEL_PATH {
-        Some(p) => p,
-        None => return,
-    };
-    let pool = WhisperPoolConfig::new(model_path).with_worker_count(1);
-    let mut runner = ManagedTranscriber::from_config(pool)
-        .expect("build pool config")
-        .chunk_size(Duration::from_secs(2))
-        .worker_timeouts(Duration::from_millis(1), Duration::from_millis(1))
-        .language_policy(LanguagePolicy::Lock { hint: whispery::Lang::En })
-        .build()
-        .expect("build runner");
+  let model_path = match MODEL_PATH {
+    Some(p) => p,
+    None => return,
+  };
+  let pool = WhisperPoolConfig::new(model_path).with_worker_count(1);
+  let mut runner = ManagedTranscriber::from_config(pool)
+    .expect("build pool config")
+    .chunk_size(Duration::from_secs(2))
+    .worker_timeouts(Duration::from_millis(1), Duration::from_millis(1))
+    .language_policy(LanguagePolicy::Lock {
+      hint: whispery::Lang::En,
+    })
+    .build()
+    .expect("build runner");
 
-    let tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
-    let samples = vec![0.0_f32; 32_000];
-    runner
-        .process_packet(
-            Timestamp::new(0, tb),
-            &samples,
-            &[VadSegment::new(0, 32_000)],
-            None,
-        )
-        .expect("process_packet");
-    runner.signal_eof().unwrap();
-    runner.drain().unwrap();
+  let tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
+  let samples = vec![0.0_f32; 32_000];
+  runner
+    .process_packet(
+      Timestamp::new(0, tb),
+      &samples,
+      &[VadSegment::new(0, 32_000)],
+      None,
+    )
+    .expect("process_packet");
+  runner.signal_eof().unwrap();
+  runner.drain().unwrap();
 
-    let mut got_hang = false;
-    while let Some((_id, err)) = runner.poll_error() {
-        if matches!(err, WorkFailure::WorkerHangTimeout { .. }) {
-            got_hang = true;
-        }
+  let mut got_hang = false;
+  while let Some((_id, err)) = runner.poll_error() {
+    if matches!(err, WorkFailure::WorkerHangTimeout { .. }) {
+      got_hang = true;
     }
-    // Some platforms / CPUs may complete the tiny inference in <1ms.
-    // Assert AT LEAST that nothing else corrupted: the runner is
-    // still alive and drain() succeeded. In practice the hang fires.
-    let _ = got_hang;
+  }
+  // Some platforms / CPUs may complete the tiny inference in <1ms.
+  // Assert AT LEAST that nothing else corrupted: the runner is
+  // still alive and drain() succeeded. In practice the hang fires.
+  let _ = got_hang;
 }

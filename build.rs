@@ -2,9 +2,11 @@
 //! into `target/whispery-test-fixtures/` once, with SHA-256
 //! verification, and re-run when the env vars below change.
 
-use std::fs;
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::{
+  fs,
+  io::{Read, Write},
+  path::PathBuf,
+};
 
 const MODEL_URL: &str =
   "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
@@ -12,16 +14,13 @@ const MODEL_FILENAME: &str = "ggml-tiny.en.bin";
 // Verified SHA-256 from huggingface.co/ggerganov/whisper.cpp at the
 // time of writing. If the upstream rotates, update this constant and
 // re-run the test fetch.
-const MODEL_SHA256: &str =
-  "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
+const MODEL_SHA256: &str = "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f";
 
-const WAV_URL: &str =
-  "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav";
+const WAV_URL: &str = "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav";
 const WAV_FILENAME: &str = "jfk.wav";
 // 11-second JFK quote, mono, 16 kHz. SHA-256 of the upstream file at
 // the time of writing.
-const WAV_SHA256: &str =
-  "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e";
+const WAV_SHA256: &str = "59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e";
 
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
@@ -103,10 +102,7 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
   let wav_path = fixture_dir.join(WAV_FILENAME);
   if wav_path.exists() {
     if let Ok(true) = verify_sha256(&wav_path, WAV_SHA256) {
-      println!(
-        "cargo:rustc-env=WHISPERY_JFK_WAV={}",
-        wav_path.display()
-      );
+      println!("cargo:rustc-env=WHISPERY_JFK_WAV={}", wav_path.display());
       return;
     }
     let _ = fs::remove_file(&wav_path);
@@ -120,10 +116,7 @@ fn fetch_jfk_wav(fixture_dir: &std::path::Path) {
     return;
   }
   if let Ok(true) = verify_sha256(&wav_path, WAV_SHA256) {
-    println!(
-      "cargo:rustc-env=WHISPERY_JFK_WAV={}",
-      wav_path.display()
-    );
+    println!("cargo:rustc-env=WHISPERY_JFK_WAV={}", wav_path.display());
   }
 }
 
@@ -131,9 +124,7 @@ fn find_target_dir() -> Option<PathBuf> {
   let out = std::env::var_os("OUT_DIR")?;
   let mut p = PathBuf::from(&out);
   while let Some(parent) = p.parent().map(PathBuf::from) {
-    if parent.file_name().and_then(|s| s.to_str()) == Some("target")
-      || parent.ends_with("target")
-    {
+    if parent.file_name().and_then(|s| s.to_str()) == Some("target") || parent.ends_with("target") {
       return Some(parent);
     }
     p = parent;

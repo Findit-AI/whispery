@@ -41,9 +41,7 @@ pub use core::{
 pub mod runner;
 
 #[cfg(feature = "runner")]
-pub use runner::{
-    ManagedTranscriber, ManagedTranscriberBuilder, RunnerError, WhisperPoolConfig,
-};
+pub use runner::{ManagedTranscriber, ManagedTranscriberBuilder, RunnerError, WhisperPoolConfig};
 
 // Re-export whisper-rs types that appear on the runner's public
 // API (so consumers don't need a direct whisper-rs dep just to name

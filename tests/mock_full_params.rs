@@ -21,8 +21,7 @@
 
 #![cfg(feature = "runner")]
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use whispery::core::{AsrParams, SamplingStrategy};
 
@@ -31,26 +30,29 @@ use whispery::core::{AsrParams, SamplingStrategy};
 /// build performs (set_temperature, set_temperature_inc, set_max_decoding_failures).
 #[test]
 fn ladder_steps_construct_without_panic() {
-    let p = AsrParams::default()
-        .with_strategy(SamplingStrategy::Greedy { best_of: 1 })
-        .with_max_attempts(6)
-        .with_initial_temperature(0.0)
-        .with_temperature_increment(0.2);
-    let mut t = p.initial_temperature();
-    for _ in 0..p.max_attempts() {
-        let flag = Arc::new(AtomicBool::new(false));
-        // full_params_from is private to the runner module; we re-export
-        // it as `pub(crate)` for testing only via the runner's tests:
-        // the test below goes through the public ManagedTranscriber
-        // path instead. Here we assert temperature progression
-        // analytically.
-        assert!(t >= 0.0 && t <= 1.0 + 1e-6,
-            "ladder step {} out of range", t);
-        t += p.temperature_increment();
-    }
-    let _ = flag_unused();
+  let p = AsrParams::default()
+    .with_strategy(SamplingStrategy::Greedy { best_of: 1 })
+    .with_max_attempts(6)
+    .with_initial_temperature(0.0)
+    .with_temperature_increment(0.2);
+  let mut t = p.initial_temperature();
+  for _ in 0..p.max_attempts() {
+    let flag = Arc::new(AtomicBool::new(false));
+    // full_params_from is private to the runner module; we re-export
+    // it as `pub(crate)` for testing only via the runner's tests:
+    // the test below goes through the public ManagedTranscriber
+    // path instead. Here we assert temperature progression
+    // analytically.
+    assert!(
+      t >= 0.0 && t <= 1.0 + 1e-6,
+      "ladder step {} out of range",
+      t
+    );
+    t += p.temperature_increment();
+  }
+  let _ = flag_unused();
 }
 
 fn flag_unused() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
+  Arc::new(AtomicBool::new(false))
 }

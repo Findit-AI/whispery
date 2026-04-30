@@ -8,8 +8,7 @@
 
 #![cfg(feature = "runner")]
 
-use core::num::NonZeroU32;
-use core::time::Duration;
+use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
 // Plan note: the plan's example imports `ManagedTranscriber` and
@@ -18,8 +17,10 @@ use mediatime::{Timebase, Timestamp};
 // the existing `whispery::runner` path to keep the test self-contained
 // (no lib.rs change in this task's file list), mirroring the same
 // workaround used in `tests/runner_e2e.rs` and `tests/saturation_no_loss.rs`.
-use whispery::{LanguagePolicy, VadSegment};
-use whispery::runner::{ManagedTranscriber, WhisperPoolConfig};
+use whispery::{
+  LanguagePolicy, VadSegment,
+  runner::{ManagedTranscriber, WhisperPoolConfig},
+};
 
 const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
 
@@ -35,38 +36,40 @@ const MODEL_PATH: Option<&str> = option_env!("WHISPERY_TINY_EN_MODEL");
 #[test]
 #[ignore = "drain hangs against real ggml-tiny model — investigation follow-up"]
 fn parked_command_resumes_after_worker_drain() {
-    let model_path = match MODEL_PATH {
-        Some(p) => p,
-        None => return,
-    };
-    // Saturate aggressively: 1 worker, 1-slot queue, 4 chunks.
-    let pool = WhisperPoolConfig::new(model_path)
-        .with_worker_count(1)
-        .with_max_queued_chunks(1)
-        .with_dispatch_idle_poll(Duration::from_millis(5));
-    let mut runner = ManagedTranscriber::from_config(pool)
-        .expect("build pool config")
-        .chunk_size(Duration::from_secs(2))
-        .language_policy(LanguagePolicy::Lock { hint: whispery::Lang::En })
-        .build()
-        .expect("build runner");
+  let model_path = match MODEL_PATH {
+    Some(p) => p,
+    None => return,
+  };
+  // Saturate aggressively: 1 worker, 1-slot queue, 4 chunks.
+  let pool = WhisperPoolConfig::new(model_path)
+    .with_worker_count(1)
+    .with_max_queued_chunks(1)
+    .with_dispatch_idle_poll(Duration::from_millis(5));
+  let mut runner = ManagedTranscriber::from_config(pool)
+    .expect("build pool config")
+    .chunk_size(Duration::from_secs(2))
+    .language_policy(LanguagePolicy::Lock {
+      hint: whispery::Lang::En,
+    })
+    .build()
+    .expect("build runner");
 
-    let tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
-    let samples = vec![0.0_f32; 128_000]; // 4 chunks of 2 s
-    let vads: Vec<_> = (0..4u64)
-        .map(|i| VadSegment::new(i * 32_000, (i + 1) * 32_000))
-        .collect();
-    // process_packet pumps the dispatch loop; saturation triggers
-    // multiple unpoll_command/wait_for_progress cycles internally.
-    runner
-        .process_packet(Timestamp::new(0, tb), &samples, &vads, None)
-        .expect("process_packet");
-    runner.signal_eof().unwrap();
-    runner.drain().unwrap();
+  let tb = Timebase::new(1, NonZeroU32::new(48_000).unwrap());
+  let samples = vec![0.0_f32; 128_000]; // 4 chunks of 2 s
+  let vads: Vec<_> = (0..4u64)
+    .map(|i| VadSegment::new(i * 32_000, (i + 1) * 32_000))
+    .collect();
+  // process_packet pumps the dispatch loop; saturation triggers
+  // multiple unpoll_command/wait_for_progress cycles internally.
+  runner
+    .process_packet(Timestamp::new(0, tb), &samples, &vads, None)
+    .expect("process_packet");
+  runner.signal_eof().unwrap();
+  runner.drain().unwrap();
 
-    let mut count = 0;
-    while runner.poll_transcript().is_some() {
-        count += 1;
-    }
-    assert_eq!(count, 4, "all 4 saturation-routed chunks must emit");
+  let mut count = 0;
+  while runner.poll_transcript().is_some() {
+    count += 1;
+  }
+  assert_eq!(count, 4, "all 4 saturation-routed chunks must emit");
 }
