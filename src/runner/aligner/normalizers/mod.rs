@@ -7,6 +7,8 @@
 mod chinese;
 mod english;
 mod japanese;
+#[cfg(test)]
+mod tests;
 
 pub use chinese::ChineseNormalizer;
 pub use english::EnglishNormalizer;
