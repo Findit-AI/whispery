@@ -7,10 +7,16 @@ mod whisper_pool;
 
 #[cfg(feature = "alignment")]
 mod aligner;
+#[cfg(feature = "alignment")]
+mod alignment_pool;
 
 pub use errors::RunnerError;
 pub use managed_transcriber::{ManagedTranscriber, ManagedTranscriberBuilder};
 pub use whisper_pool::WhisperPoolConfig;
 
 #[cfg(feature = "alignment")]
-pub use aligner::{AlignerKey, AlignmentFallback};
+pub use aligner::{
+    Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
+    ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer,
+    NormalizationError, NormalizedText, TextNormalizer,
+};
