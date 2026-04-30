@@ -1,6 +1,7 @@
 //! Aligner subsystem — wav2vec2 forced alignment via ort.
 
 mod aligner;
+mod algorithm;
 mod key;
 mod normalizer;
 mod normalizers;
