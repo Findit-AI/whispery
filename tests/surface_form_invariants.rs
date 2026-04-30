@@ -1,0 +1,47 @@
+//! Surface-form preservation + special-token skipping regressions.
+//! Spec §6.3.2 step 9, step 7.
+
+#![cfg(feature = "alignment")]
+
+use whispery::EnglishNormalizer;
+use whispery::TextNormalizer;
+
+#[test]
+fn english_preserves_casing_in_original_words() {
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("The QUICK brown Fox").unwrap();
+    assert_eq!(nt.normalized(), "the quick brown fox");
+    let originals: Vec<&str> = nt.original_words().iter().map(|c| c.as_ref()).collect();
+    assert_eq!(originals, vec!["The", "QUICK", "brown", "Fox"]);
+}
+
+#[test]
+fn english_preserves_punctuation_in_original_words() {
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("Hello, world!").unwrap();
+    assert_eq!(nt.normalized(), "hello world");
+    let originals: Vec<&str> = nt.original_words().iter().map(|c| c.as_ref()).collect();
+    assert_eq!(originals, vec!["Hello,", "world!"]);
+}
+
+#[test]
+fn contraction_expansion_duplicates_surface() {
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("Don't go.").unwrap();
+    assert_eq!(nt.normalized(), "do not go");
+    let originals: Vec<&str> = nt.original_words().iter().map(|c| c.as_ref()).collect();
+    assert_eq!(originals, vec!["Don't", "Don't", "go."]);
+}
+
+// Special-token skipping is enforced by:
+//   src/runner/aligner/algorithm/compose.rs::tests::delimiter_token_is_skipped
+// We re-document the contract here.
+
+#[test]
+fn delimiter_token_skipping_documented() {
+    // Token-level delimiters (the `|` token in wav2vec2 vocabs)
+    // must have word_idx_per_token=None and must be skipped by
+    // step 7's per-word accumulator. Verified directly by the
+    // compose.rs unit test; this integration shell documents the
+    // contract.
+}
