@@ -706,31 +706,35 @@ fn worker_loop(
         }
         let state = state_opt.as_mut().expect("state present");
 
-        // Spawn a watchdog that flips abort_flag if asr_timeout elapses.
+        // Spawn a watchdog that flips abort_flag if asr_timeout
+        // elapses. We use a one-shot Sender to cancel the watchdog
+        // early once inference completes — a `thread::sleep` would
+        // wait the full timeout regardless, blocking `watchdog.join()`
+        // and adding `asr_timeout` of latency per chunk.
         let abort_flag = job.abort_flag.clone();
         let timeout = job.asr_timeout;
+        let (cancel_tx, cancel_rx) = bounded::<()>(1);
         let watchdog = std::thread::Builder::new()
             .name("whispery-asr-watchdog".into())
             .spawn(move || {
-                std::thread::sleep(timeout);
-                abort_flag.store(true, Ordering::Relaxed);
+                // Block on the cancel channel for up to `timeout`.
+                // If the worker drops cancel_tx (or sends), we exit
+                // early without flipping the abort_flag. If the
+                // recv times out, we flip — which whisper.cpp's
+                // abort_callback will pick up and abort inference.
+                if cancel_rx.recv_timeout(timeout).is_err() {
+                    abort_flag.store(true, Ordering::Relaxed);
+                }
             })
             .expect("spawn watchdog");
 
         let started_at = std::time::Instant::now();
         let outcome = run_with_temperature_ladder(state, &job, started_at);
 
-        // Watchdog cleanup: setting the flag is harmless if work
-        // already completed; the watchdog thread exits in any case.
-        // We don't explicitly join (the watchdog thread terminates on
-        // its own after the sleep). To prevent a leaked watchdog from
-        // burning resources between jobs, we cancel via the flag flip
-        // path by setting it ourselves once the inference is complete:
-        job.abort_flag.store(true, Ordering::Relaxed);
+        // Cancel the watchdog by dropping cancel_tx; the watchdog's
+        // recv_timeout returns Err(Disconnected) and exits cleanly.
+        drop(cancel_tx);
         let _ = watchdog.join();
-        // Reset the flag for next job. (A fresh AsrWorkItem brings its
-        // own Arc, but the per-worker state is local; the next iteration
-        // sees a fresh atomic anyway.)
 
         let was_timeout = matches!(
             outcome,

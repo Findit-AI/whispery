@@ -32,6 +32,12 @@ pub struct ManagedTranscriber {
     core: Transcriber,
     whisper_pool: WhisperPool,
     asr_params_default: AsrParams,
+    /// Per-packet override active during the current `process_packet`
+    /// call. Set on entry, cleared on exit. `try_dispatch` merges it
+    /// on top of the core's emitted params (which carry the locked
+    /// language from `LanguagePolicy`). Sparse layering preserves
+    /// fields the override doesn't set.
+    pending_override: Option<AsrParamsOverride>,
     asr_timeout: Duration,
     drain_timeout: Duration,
     block_on_full_queue: bool,
@@ -50,17 +56,26 @@ impl ManagedTranscriber {
     ) -> DispatchOutcome {
         let item = match cmd {
             Command::RunAsr { chunk_id, samples, params, sample_rate: _ } => {
-                // Honor the runner's per-packet override (set via
-                // swap_asr_default). The core's emitted `params` came
-                // from its own default; for the runner we always use
-                // the current `asr_params_default` which already has
-                // any active override merged in.
-                let _ = params; // ignored; runner's authoritative copy wins
+                // Use the core's emitted params (which already include
+                // the locked language from LanguagePolicy::Lock /
+                // AutoLockAfter). If a per-packet override is active
+                // for this process_packet call, merge it on top —
+                // sparse override fields layer cleanly without
+                // clobbering the language lock the core just set.
+                //
+                // Pre-fix code substituted `self.asr_params_default`
+                // here, which discarded the locked language and made
+                // whisper auto-detect every chunk → temperature ladder
+                // exhausted on every chunk → drain hangs.
+                let final_params = match &self.pending_override {
+                    Some(ovr) => merge_overrides(&params, ovr),
+                    None => params,
+                };
                 let abort_flag = Arc::new(AtomicBool::new(false));
                 AsrWorkItem {
                     chunk_id,
                     samples,
-                    params: self.asr_params_default.clone(),
+                    params: final_params,
                     asr_timeout,
                     abort_flag,
                 }
@@ -316,6 +331,7 @@ impl ManagedTranscriberBuilder {
             core: Transcriber::new(core_config),
             whisper_pool,
             asr_params_default: self.asr_params,
+            pending_override: None,
             asr_timeout: self.worker_timeouts_asr,
             drain_timeout,
             block_on_full_queue: self.pool_config.block_on_full_queue(),
@@ -393,14 +409,11 @@ impl ManagedTranscriber {
         vad_segments: &[VadSegment],
         params_override: Option<AsrParamsOverride>,
     ) -> Result<(), RunnerError> {
-        // Step 1: apply per-call AsrParams override on top of the
-        // runner's defaults. Restore at end-of-call regardless of
+        // Step 1: stash the per-call override. `try_dispatch` reads
+        // it and merges on top of the core's emitted params (which
+        // carry the locked language). Cleared on exit regardless of
         // outcome — the override is per-packet, not sticky.
-        let saved_default = if params_override.is_some() {
-            Some(self.swap_asr_default(params_override.as_ref().unwrap()))
-        } else {
-            None
-        };
+        self.pending_override = params_override;
 
         // Step 2: push samples (may return Backpressure / PtsRegression / etc.)
         let push_result = self.push_samples_internal(starts_at, samples);
@@ -412,10 +425,8 @@ impl ManagedTranscriber {
         // Step 4: pump the dispatch loop until idle or saturation.
         let drive_result = result.and_then(|()| self.pump_until_idle_or_progress());
 
-        // Step 5: restore default AsrParams.
-        if let Some(saved) = saved_default {
-            self.restore_asr_default(saved);
-        }
+        // Step 5: clear the override.
+        self.pending_override = None;
 
         drive_result
     }
