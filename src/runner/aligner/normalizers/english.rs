@@ -25,8 +25,12 @@ use crate::runner::aligner::normalizer::{NormalizationError, NormalizedText, Tex
 ///
 /// **Empty result:** if normalisation produces zero words (input
 /// was all whitespace/punctuation), `normalize` returns
-/// [`NormalizationError::EmptyText`]; callers convert to
-/// `WorkFailure::AlignmentFailed { kind: EmptyText, .. }`.
+/// [`NormalizationError::EmptyText`]. `Aligner::align` treats
+/// this as a non-fatal short-circuit and returns
+/// `Ok(AlignmentResult::new(Vec::new()))`, so the cached ASR
+/// transcript surfaces as `Transcript { text, words: [] }`
+/// rather than `Event::Error` — alignment is optional, not a
+/// data-loss path on punctuation-only ASR output.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct EnglishNormalizer;
 

@@ -275,22 +275,28 @@ impl Aligner {
     }
 
     // Step 1: normalise.
-    let normalized = self.normalizer.normalize(text).map_err(|e| match e {
-      crate::runner::aligner::normalizer::NormalizationError::EmptyText => {
-        WorkFailure::AlignmentFailed {
-          kind: AlignmentFailureKind::EmptyText,
-          message: alloc::format!("empty text after normalisation"),
-          language: self.language.clone(),
-        }
+    //
+    // `NormalizationError::EmptyText` (punctuation-only or
+    // whitespace-only ASR output) is *not* an error here — it
+    // mirrors the empty-tokens short-circuit below. Returning
+    // `Ok(empty AlignmentResult)` lets the cached ASR
+    // transcript surface as `Transcript { text, words: [] }`
+    // instead of `Event::Error`. Codex round-12 [medium] flagged
+    // this as a data-loss path that contradicts the
+    // `AlignmentResult` contract.
+    let normalized = match self.normalizer.normalize(text) {
+      Ok(nt) => nt,
+      Err(crate::runner::aligner::normalizer::NormalizationError::EmptyText) => {
+        return Ok(AlignmentResult::new(alloc::vec::Vec::new()));
       }
-      crate::runner::aligner::normalizer::NormalizationError::RuleFailed { detail } => {
-        WorkFailure::AlignmentFailed {
+      Err(crate::runner::aligner::normalizer::NormalizationError::RuleFailed { detail }) => {
+        return Err(WorkFailure::AlignmentFailed {
           kind: AlignmentFailureKind::NormalizationFailed,
           message: detail,
           language: self.language.clone(),
-        }
+        });
       }
-    })?;
+    };
 
     let n_words = normalized.original_words().len();
 
@@ -420,5 +426,75 @@ mod tests {
     // negative trait bounds; the Mutex<Aligner> in
     // AlignmentSet is the runtime check.
     assert_send::<Aligner>();
+  }
+
+  /// Codex round-12 [medium] regression: punctuation-only ASR
+  /// text normalises to empty, but alignment must NOT turn the
+  /// successful ASR transcript into `Event::Error`. The fix
+  /// short-circuits `EmptyText` to `Ok(empty AlignmentResult)`
+  /// inside `Aligner::align`; this test exercises that path
+  /// without ONNX inference (the short-circuit returns before
+  /// `encode_log_softmax` runs).
+  ///
+  /// Skips when the build.rs fixture isn't present (offline /
+  /// `WHISPERY_OFFLINE=1`); aligner_load already verifies the
+  /// fixture loads, so we know `Aligner::from_paths` succeeds
+  /// when the env vars are set.
+  #[test]
+  fn empty_normalised_text_returns_empty_alignment_result() {
+    use core::sync::atomic::AtomicBool;
+
+    use mediatime::{TimeRange, Timebase};
+
+    use crate::runner::aligner::normalizers::EnglishNormalizer;
+
+    let model_path = match option_env!("WHISPERY_W2V_MODEL") {
+      Some(p) => p,
+      None => return,
+    };
+    let tokenizer_path = match option_env!("WHISPERY_W2V_TOKENIZER") {
+      Some(p) => p,
+      None => return,
+    };
+
+    let mut aligner = Aligner::from_paths(
+      Lang::En,
+      Path::new(model_path),
+      Path::new(tokenizer_path),
+      alloc::boxed::Box::new(EnglishNormalizer::new()),
+    )
+    .expect("Aligner::from_paths");
+
+    // 16 kHz silence buffer — never read because `EmptyText`
+    // short-circuits before encode runs.
+    let samples = alloc::vec![0.0_f32; 16_000];
+    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let abort = AtomicBool::new(false);
+    let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
+
+    // Punctuation-only input → EnglishNormalizer returns
+    // `EmptyText`; align must surface as Ok(empty), not Err.
+    let result = aligner
+      .align(
+        &samples,
+        &sub_segments,
+        /* text: */ "!!!...",
+        /* chunk_first_sample_in_stream: */ 0,
+        |start, end| {
+          TimeRange::new(
+            start as i64,
+            end as i64,
+            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+          )
+        },
+        &abort,
+        &run_options,
+      )
+      .expect("EmptyText must short-circuit to Ok, not propagate as AlignmentFailed");
+    assert!(
+      result.words().is_empty(),
+      "empty normalisation must yield zero words; got {:?}",
+      result.words()
+    );
   }
 }

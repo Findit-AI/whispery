@@ -2,7 +2,15 @@
 name        = "whispery"
 version     = "0.1.0"
 edition     = "2024"
-rust-version = "1.85"
+# 1.89 floor:
+# - AVX-512 intrinsics (`_mm512_reduce_add_ps` etc.) used by the
+#   alignment SIMD backend stabilised in 1.89.
+# - Let-chains (`if let Some(_) && cond`) used in
+#   `tokenize.rs` stabilised in 1.88.
+# - Edition 2024 needs 1.85 minimum.
+# Bumping to 1.89 covers all three; dropping AVX-512 alone
+# would only get us to 1.88.
+rust-version = "1.89"
 license     = "MIT OR Apache-2.0"
 description = "Sans-I/O cut/batch/whisper/align state machine for speech-to-text indexing pipelines"
 repository  = "https://github.com/findit-studio/whispery"
