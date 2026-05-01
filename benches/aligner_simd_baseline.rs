@@ -161,6 +161,8 @@ fn bench_ctc_viterbi(c: &mut Criterion) {
   group.bench_function(
     BenchmarkId::new("scalar", format!("T={T_FRAMES}_M={TOKENS_LEN}_V={VOCAB}")),
     |b| {
+      // Bench has no abort path — just point at a never-set flag.
+      static NEVER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
       b.iter(|| {
         // Discard through `black_box` so the optimiser can't
         // elide the call — we don't care about the result, just
@@ -169,6 +171,7 @@ fn bench_ctc_viterbi(c: &mut Criterion) {
           black_box(&log_probs),
           black_box(&tokens),
           /* blank_id: */ 0,
+          &NEVER,
           black_box(&Lang::En),
         ));
       });

@@ -334,11 +334,16 @@ impl Aligner {
       return Err(timed_out());
     }
 
-    // Steps 5-6: CTC lattice + Viterbi.
+    // Steps 5-6: CTC lattice + Viterbi. The DP checks
+    // `abort_flag` once per frame row so a pathological (long
+    // chunk × long token sequence) lattice can't run past the
+    // alignment worker's `align_timeout` and starve every
+    // chunk queued behind it on the single worker.
     let path = ctc_viterbi(
       &log_probs,
       &tokenized.token_ids,
       self.blank_token_id,
+      abort_flag,
       &self.language,
     )?;
 

@@ -1,10 +1,11 @@
 //! Steps 5-6 of the alignment algorithm: CTC lattice + Viterbi.
 
 use alloc::{string::String, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
   runner::aligner::algorithm::encode::LogProbsTV,
-  types::{AlignmentFailureKind, Lang, WorkFailure},
+  types::{AlignmentFailureKind, Lang, WorkFailure, WorkerKind},
 };
 
 /// Result of CTC Viterbi alignment.
@@ -25,6 +26,17 @@ pub struct ViterbiPath {
 /// `Aligner::from_paths` time). `tokens` is the tokenised
 /// normalised text from step 2.
 ///
+/// `abort_flag` is the alignment worker's per-job watchdog flag
+/// (the same one passed to `Aligner::align`). The DP checks it
+/// once per frame row so that a hallucinated long token sequence
+/// or pathologically wide lattice can't keep the single-worker
+/// alignment pool CPU-bound past `align_timeout`. When the flag
+/// is observed set, this returns
+/// `WorkFailure::WorkerHangTimeout { kind: Alignment, .. }` with
+/// `elapsed = Duration::ZERO`; the wrapping `run_one_alignment`
+/// overwrites the elapsed value with its `started_at`-anchored
+/// measurement.
+///
 /// Returns the highest-probability monotonic path through the
 /// (2|Y|+1)-state CTC lattice. The state-per-frame vector lets
 /// the next stage (step 7) walk frame-by-frame and accumulate
@@ -37,6 +49,7 @@ pub fn ctc_viterbi(
   log_probs: &LogProbsTV,
   tokens: &[u32],
   blank_id: u32,
+  abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<ViterbiPath, WorkFailure> {
   let t = log_probs.t;
@@ -129,6 +142,19 @@ pub fn ctc_viterbi(
   }
 
   for t_idx in 1..t {
+    // Cooperative cancellation. Checking once per row is cheap
+    // (one Relaxed atomic load against ~n_states inner-loop
+    // iterations) and keeps the DP responsive to the alignment
+    // pool's watchdog. Without this, a pathological (large T,
+    // large m) lattice could sit CPU-bound past `align_timeout`,
+    // blocking every later alignment job behind it on the
+    // single worker.
+    if abort_flag.load(Ordering::Relaxed) {
+      return Err(WorkFailure::WorkerHangTimeout {
+        kind: WorkerKind::Alignment,
+        elapsed: core::time::Duration::ZERO,
+      });
+    }
     for s in 0..n_states {
       let emit = log_probs.at(t_idx, state_token(s) as usize);
       // Predecessors of state s:
@@ -222,10 +248,23 @@ mod tests {
     LogProbsTV { t, v, data: vals }
   }
 
+  /// All-tests helper: `ctc_viterbi` with a never-aborting flag.
+  /// Tests that need to assert cooperative-cancellation behaviour
+  /// build their own flag and call the public function directly.
+  fn ctc_viterbi_no_abort(
+    log_probs: &LogProbsTV,
+    tokens: &[u32],
+    blank_id: u32,
+    language: &Lang,
+  ) -> Result<ViterbiPath, WorkFailure> {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    ctc_viterbi(log_probs, tokens, blank_id, &NEVER, language)
+  }
+
   #[test]
   fn empty_tokens_errors() {
     let log_probs = lp(5, 3, alloc::vec![0.0; 15]);
-    let err = ctc_viterbi(&log_probs, &[], 0, &Lang::En).unwrap_err();
+    let err = ctc_viterbi_no_abort(&log_probs, &[], 0, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::AlignmentFailed {
@@ -240,7 +279,7 @@ mod tests {
     // tokens=[1, 1] (repeated) => need 2 + 1 = 3 frames minimum
     // (one per token + one blank between them). T=2 is too short.
     let log_probs = lp(2, 3, alloc::vec![0.0; 6]);
-    let err = ctc_viterbi(&log_probs, &[1, 1], 0, &Lang::En).unwrap_err();
+    let err = ctc_viterbi_no_abort(&log_probs, &[1, 1], 0, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::AlignmentFailed {
@@ -259,7 +298,7 @@ mod tests {
     data[0 * 3 + 1] = -0.1; // frame 0: token 1
     data[1 * 3 + 2] = -0.1; // frame 1: token 2
     let log_probs = lp(2, 3, data);
-    let path = ctc_viterbi(&log_probs, &[1, 2], 0, &Lang::En).expect("path");
+    let path = ctc_viterbi_no_abort(&log_probs, &[1, 2], 0, &Lang::En).expect("path");
     // Visit both token states.
     assert!(path.state_per_frame.contains(&1));
     assert!(path.state_per_frame.contains(&3));
@@ -271,7 +310,7 @@ mod tests {
     // smaller projection than the tokenizer expects). Must
     // surface ModelInferenceFailed, not panic.
     let log_probs = lp(2, 3, alloc::vec![0.0; 6]);
-    let err = ctc_viterbi(&log_probs, &[1], 5, &Lang::En).unwrap_err();
+    let err = ctc_viterbi_no_abort(&log_probs, &[1], 5, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::AlignmentFailed {
@@ -287,7 +326,7 @@ mod tests {
     // TokenizationFailed (mismatch points at the tokenizer side),
     // not panic.
     let log_probs = lp(2, 3, alloc::vec![0.0; 6]);
-    let err = ctc_viterbi(&log_probs, &[1, 99], 0, &Lang::En).unwrap_err();
+    let err = ctc_viterbi_no_abort(&log_probs, &[1, 99], 0, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
       WorkFailure::AlignmentFailed {
@@ -295,6 +334,63 @@ mod tests {
         ..
       }
     ));
+  }
+
+  /// Adversarial regression: a large lattice with the abort flag
+  /// pre-flipped must surface `WorkerHangTimeout` after the first
+  /// frame-row check rather than CPU-bind the worker. Sized at
+  /// T=2000, m=200 so the DP would normally do ~800k state ops
+  /// — pre-fix this would have completed in milliseconds; the
+  /// fix returns at the first row-boundary check (after t_idx=1).
+  #[test]
+  fn abort_flag_short_circuits_dp_with_worker_hang_timeout() {
+    let t = 2_000;
+    let v = 4;
+    let m = 200;
+
+    let mut data = alloc::vec![-100.0_f32; t * v];
+    // Give every frame a non-zero mass on token 1 so the DP
+    // would otherwise have a finite path. (We never actually
+    // run the DP to completion — abort fires first.)
+    for ti in 0..t {
+      data[ti * v + 1] = -0.1;
+    }
+    let log_probs = lp(t, v, data);
+    let tokens: Vec<u32> = (0..m as u32).map(|_| 1).collect();
+
+    let abort = AtomicBool::new(true);
+    let err = ctc_viterbi(&log_probs, &tokens, 0, &abort, &Lang::En).unwrap_err();
+    assert!(
+      matches!(
+        err,
+        WorkFailure::WorkerHangTimeout {
+          kind: WorkerKind::Alignment,
+          ..
+        }
+      ),
+      "expected WorkerHangTimeout; got {err:?}"
+    );
+  }
+
+  /// Companion: when the abort flag is *not* set, the same
+  /// large lattice still completes (sanity that the new check
+  /// path doesn't accidentally short-circuit the happy path).
+  #[test]
+  fn unaborted_dp_completes_without_hang_timeout() {
+    let t = 100;
+    let v = 4;
+    let m = 5;
+
+    let mut data = alloc::vec![-100.0_f32; t * v];
+    for ti in 0..t {
+      data[ti * v + 1] = -0.1;
+    }
+    let log_probs = lp(t, v, data);
+    let tokens: Vec<u32> = alloc::vec![1; m];
+
+    let abort = AtomicBool::new(false);
+    let path = ctc_viterbi(&log_probs, &tokens, 0, &abort, &Lang::En).expect("path");
+    assert_eq!(path.state_per_frame.len(), t);
   }
 
   #[test]
@@ -306,7 +402,7 @@ mod tests {
     data[1 * 3 + 0] = -0.1; // frame 1: blank
     data[2 * 3 + 1] = -0.1; // frame 2: token 1 again
     let log_probs = lp(3, 3, data);
-    let path = ctc_viterbi(&log_probs, &[1, 1], 0, &Lang::En).expect("path");
+    let path = ctc_viterbi_no_abort(&log_probs, &[1, 1], 0, &Lang::En).expect("path");
     assert_eq!(path.state_per_frame, alloc::vec![1, 2, 3]);
   }
 
@@ -338,7 +434,7 @@ mod tests {
     data[4 * 3 + 2] = -100.0;
 
     let log_probs = lp(5, 3, data);
-    let path = ctc_viterbi(&log_probs, &[1, 2], 0, &Lang::En).expect("path");
+    let path = ctc_viterbi_no_abort(&log_probs, &[1, 2], 0, &Lang::En).expect("path");
     // Expected state sequence: [0, 1, 2, 3, 4]
     assert_eq!(path.state_per_frame, alloc::vec![0, 1, 2, 3, 4]);
   }
@@ -359,7 +455,7 @@ mod tests {
     data[1 * 3 + 1] = -0.1;
     data[3 * 3 + 1] = -0.1;
     let log_probs = lp(6, 3, data);
-    let path = ctc_viterbi(&log_probs, &[1, 1], 0, &Lang::En).expect("path");
+    let path = ctc_viterbi_no_abort(&log_probs, &[1, 1], 0, &Lang::En).expect("path");
     // The path must visit state 2 (the inter-token blank) before
     // state 3 (the second token).
     let visited_2 = path.state_per_frame.contains(&2);

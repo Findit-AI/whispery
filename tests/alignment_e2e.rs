@@ -42,21 +42,21 @@ fn read_wav_16k_mono_f32(path: &str) -> Vec<f32> {
   }
 }
 
-// TODO(plan-c followup): This test currently hangs in `runner.drain()`
-// for >10 minutes against the real ggml-tiny.en model on the JFK clip,
-// inheriting the same drain hang Plan B's runner_e2e.rs / worker_hang.rs
-// / saturation_no_loss.rs / unpoll_round_trip.rs all observed (whisper.cpp
-// `state.full()` blocks during encode, abort_callback is never reached).
-// The test infrastructure (build.rs model+WAV+ONNX+tokenizer fetcher,
-// hound WAV decode, AlignmentSet construction, word-level assertions)
-// is preserved here for follow-up debugging. Run manually with:
+// Codex round-9 [critical]: the round-9 drain-event fix in
+// `drive_one_step` (drain core events into the runner's per-chunk
+// queues) makes `drain` return in real time instead of the
+// previous 10+ minute hang. Verified locally — test panics on
+// the empty-transcript assertion in ~0.4 s rather than running
+// out the drain budget.
 //
-//   cargo test --features alignment --test alignment_e2e -- --ignored --nocapture --test-threads=1
-//
-// Re-enabling requires the deeper whisper.cpp issue to be resolved
-// (see the Plan B follow-up TODOs in tests/runner_e2e.rs).
+// Still `#[ignore]`'d because the upstream encode issue affects
+// alignment too: the ASR worker returns `GenericError(-6)` on
+// the JFK clip, so no `Transcript` is emitted (only an `Error`),
+// and the alignment-result assertions can't run. See
+// `tests/runner_e2e.rs` for the underlying whisper.cpp /
+// whisper-rs 0.13.2 issue. Re-enable once that's resolved.
 #[test]
-#[ignore = "drain hangs against real ggml-tiny model — investigation follow-up"]
+#[ignore = "ggml-tiny.en + JFK fixture: whisper.cpp encode returns GenericError(-6); drain itself works"]
 fn jfk_alignment_emits_words_within_transcript_range() {
   let (model_path, wav_path, w2v_model, w2v_tok) =
     match (MODEL_PATH, WAV_PATH, W2V_MODEL_PATH, W2V_TOKENIZER_PATH) {
@@ -87,6 +87,13 @@ fn jfk_alignment_emits_words_within_transcript_range() {
     .expect("build pool config")
     .chunk_size(Duration::from_secs(30))
     .language_policy(LanguagePolicy::Lock { hint: Lang::En })
+    // Tight timeouts so a regression that re-introduces the
+    // drain hang surfaces as a clean DrainTimeout error rather
+    // than an unbounded test runtime. The JFK clip is 11s of
+    // audio; tiny.en encode + wav2vec2-base align fit
+    // comfortably inside these budgets on commodity hardware.
+    .worker_timeouts(Duration::from_secs(15), Duration::from_secs(10))
+    .drain_timeout(Duration::from_secs(30))
     .with_alignment(set)
     .build()
     .expect("build runner");

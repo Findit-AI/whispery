@@ -296,13 +296,23 @@ impl ManagedTranscriber {
       }
     }
 
-    // Phase 2: drain core's events. Plan A's Transcriber emits
-    // events directly via poll_event, but ManagedTranscriber
-    // exposes them via poll_transcript / poll_error (split by
-    // Event variant). We pull events into the per-Transcriber
-    // emit queue, which lives inside the core itself (no extra
-    // channel needed).
-    // (No code here — `poll_transcript` calls poll_event inline.)
+    // Phase 2: drain core events into the runner's local
+    // pending_transcripts / pending_errors buckets. Without this,
+    // every Transcript / Error sits on `core.pending_events`
+    // until the caller hits `poll_transcript` / `poll_error`,
+    // and `core.is_idle()` (which checks `pending_events.is_empty()`)
+    // never goes true. `drain` would then loop until
+    // `drain_timeout` fires even when every worker has long since
+    // returned its result — exactly the codex round-9
+    // [critical] drain hang. Pulling here keeps `is_idle` honest:
+    // it goes true as soon as the last chunk's event is bucketed.
+    while let Some(ev) = self.core.poll_event() {
+      progress = true;
+      match ev {
+        Event::Transcript(tr) => self.pending_transcripts.push_back(tr),
+        Event::Error { chunk_id, error } => self.pending_errors.push_back((chunk_id, error)),
+      }
+    }
 
     // Phase 3: drain commands and try to dispatch each.
     while let Some(cmd) = self.core.poll_command() {

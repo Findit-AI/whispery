@@ -52,21 +52,26 @@ fn levenshtein(a: &str, b: &str) -> usize {
   prev[b.len()]
 }
 
-// TODO(plan-b followup): This test currently hangs in `runner.drain()`
-// for >10 minutes against the real ggml-tiny.en model on the JFK clip.
-// Drain timeout default is 600s, but the test runs past it, suggesting
-// either a bug in the drain timeout check, a deadlock in
-// `wait_for_progress` / `Select::ready_timeout`, or the worker thread
-// silently failing. The test infrastructure (build.rs model+WAV
-// fetcher, hound WAV decode, Levenshtein assertion) is preserved here
-// for follow-up debugging. Run manually with:
+// Codex round-9 [critical]: the round-9 fix to `drive_one_step`
+// now drains core events into the runner's per-chunk queues, so
+// `drain` returns in real time. Verified locally — the test
+// completes in ~0.3 s instead of the previous 10+ minute hang.
 //
-//   cargo test --features runner --test runner_e2e -- --ignored --nocapture
+// Still `#[ignore]`'d because the bundled `ggml-tiny.en` + JFK
+// fixture combination triggers `whisper_full_with_state: failed
+// to encode` (whisper.cpp `GenericError(-6)`) on every chunk on
+// this host. The failure is reproducible without alignment, so
+// it predates this work and isn't introduced by Plan B/C; the
+// likely culprit is a whisper.cpp / whisper-rs 0.13.2 issue with
+// this specific model + audio combination, fixable by either
+// bumping whisper-rs upstream or swapping the fixture.
 //
-// Re-enabling will require reproducing in a debugger or adding more
-// instrumentation to drive_one_step / worker_loop.
+// Run manually after fixing the encode issue:
+//
+//   cargo test --features runner --test runner_e2e --release \
+//       -- --ignored --nocapture --test-threads=1
 #[test]
-#[ignore = "drain hangs against real ggml-tiny model — investigation follow-up"]
+#[ignore = "ggml-tiny.en + JFK fixture: whisper.cpp encode returns GenericError(-6); drain itself works"]
 fn end_to_end_jfk_quote() {
   let model_path = match MODEL_PATH {
     Some(p) => p,
@@ -92,6 +97,12 @@ fn end_to_end_jfk_quote() {
     .language_policy(LanguagePolicy::Lock {
       hint: whispery::Lang::En,
     })
+    // Tight-but-realistic budgets: tiny.en encode + the JFK
+    // clip's 11s of audio fit inside ~5s on commodity hardware;
+    // 30s drain leaves headroom for slow CI without masking a
+    // regression of the round-9 drain hang.
+    .worker_timeouts(Duration::from_secs(15), Duration::from_secs(10))
+    .drain_timeout(Duration::from_secs(30))
     .build()
     .expect("build runner");
 
