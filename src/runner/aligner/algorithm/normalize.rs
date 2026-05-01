@@ -50,6 +50,35 @@
 
 use alloc::vec::Vec;
 
+/// f32 horizontal-sum overflow recovery shared across all SIMD
+/// backends. Real audio in `[-1, 1]` never trips the check;
+/// high-dynamic-range or pathological f32 inputs (`[1e38, ...]`)
+/// saturate the f32 horizontal-add before the f64 cast — when
+/// that happens we redo the sum in scalar f64 so every backend
+/// matches the scalar reference within tolerance for any finite
+/// f32 input.
+#[inline]
+fn reconcile_mean(simd_sum: f64, samples: &[f32]) -> f64 {
+  if simd_sum.is_finite() {
+    simd_sum
+  } else {
+    scalar::scalar_mean(samples)
+  }
+}
+
+/// Same overflow-recovery contract as [`reconcile_mean`], applied
+/// to the variance pass. Codex round-10 [medium]: `[1e20, -1e20]`
+/// keeps `var ≈ 1e40` in f64 but overflows the f32 `d * d` to
+/// `inf`; the fallback pulls the result back to scalar parity.
+#[inline]
+fn reconcile_var_sum(simd_var_sum: f64, samples: &[f32], mean: f64) -> f64 {
+  if simd_var_sum.is_finite() {
+    simd_var_sum
+  } else {
+    scalar::scalar_var_sum(samples, mean)
+  }
+}
+
 /// Public entry point — picks the best implementation available at
 /// runtime (under `feature = "std"`) or compile time (without).
 /// `pub` for the `feature = "bench-internals"` re-export; consumers
@@ -119,23 +148,42 @@ pub mod scalar {
       return Vec::new();
     }
     let n = samples.len() as f64;
-    let mut sum = 0.0_f64;
-    for &s in samples {
-      sum += s as f64;
-    }
-    let mean = sum / n;
-    let mut var_sum = 0.0_f64;
-    for &s in samples {
-      let d = s as f64 - mean;
-      var_sum += d * d;
-    }
-    let var = var_sum / n;
+    let mean = scalar_mean(samples) / n;
+    let var = scalar_var_sum(samples, mean) / n;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
     let mut out = Vec::with_capacity(samples.len());
     for &s in samples {
       out.push(((s as f64 - mean) * inv_std) as f32);
     }
     out
+  }
+
+  /// Scalar f64 sum of `samples`. Used by the SIMD backends as
+  /// the precision-recovery fallback when their f32 horizontal
+  /// sum overflowed (see [`super::neon`] for the overflow
+  /// detection pattern).
+  pub(super) fn scalar_mean(samples: &[f32]) -> f64 {
+    let mut sum = 0.0_f64;
+    for &s in samples {
+      sum += s as f64;
+    }
+    sum
+  }
+
+  /// Scalar f64 sum of squared deviations. Used by the SIMD
+  /// backends as the precision-recovery fallback when the f32
+  /// `d * d` overflowed for high-dynamic-range inputs (Codex
+  /// round-10 [medium]: `[1e20, -1e20]` overflows f32 but stays
+  /// finite in f64). Real audio in `[-1, 1]` never trips this;
+  /// pathological inputs go down the slow path with full
+  /// precision instead of producing backend-skewed output.
+  pub(super) fn scalar_var_sum(samples: &[f32], mean: f64) -> f64 {
+    let mut var_sum = 0.0_f64;
+    for &s in samples {
+      let d = s as f64 - mean;
+      var_sum += d * d;
+    }
+    var_sum
   }
 }
 
@@ -177,7 +225,7 @@ pub mod neon {
       sum += samples[i] as f64;
       i += 1;
     }
-    let mean = sum / nf;
+    let mean = super::reconcile_mean(sum, samples) / nf;
 
     // ---- pass 2: variance (sum of squared deviations, f64 acc).
     let mean_f32 = mean as f32;
@@ -198,7 +246,7 @@ pub mod neon {
       var_sum += d * d;
       i += 1;
     }
-    let var = var_sum / nf;
+    let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
     // ---- pass 3: (x - mean) * inv_std into a fresh Vec.

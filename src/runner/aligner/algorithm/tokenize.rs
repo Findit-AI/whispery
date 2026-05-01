@@ -159,14 +159,16 @@ pub(crate) fn tokenize_with_word_map(
     last_emitted_word = Some(word_idx);
   }
 
-  if token_ids.is_empty() {
-    return Err(WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::TokenizationFailed,
-      message: String::from("tokenisation produced empty token list"),
-      language: language.clone(),
-    });
-  }
-
+  // An empty token list is *not* an error. A chunk like
+  // `"1000"` against an uppercase-only English wav2vec2 vocab
+  // legitimately maps every character to `<unk>` and produces
+  // zero in-vocab tokens. Returning `TokenizationFailed` here
+  // would convert the successful ASR `Transcript` into an
+  // `Event::Error` at the dispatch layer — alignment becoming
+  // a data-loss path for numeric/symbol-only speech. Pass the
+  // empty result up the stack so `Aligner::align` can
+  // short-circuit to an empty `AlignmentResult` and the chunk
+  // emits a `Transcript` with `words: []` (text preserved).
   Ok(TokenizedText {
     token_ids,
     word_idx_per_token,
@@ -266,18 +268,19 @@ mod tests {
     assert_eq!(result.token_ids, expected.to_vec());
   }
 
-  /// All-`<unk>` chunk still rejects — but now via the
-  /// chunk-level `token_ids.is_empty()` guard, not per-word
-  /// failure. Lowercase input + `uppercase_input=false`: every
-  /// char hits `<unk>`, all chars get skipped, the resulting
-  /// token list is empty, and the function reports
-  /// `TokenizationFailed` for the chunk.
+  /// All-`<unk>` chunk returns `Ok(empty TokenizedText)` so the
+  /// caller (`Aligner::align`) can short-circuit to an empty
+  /// `AlignmentResult` and preserve the underlying ASR
+  /// transcript. Pre-fix this returned `TokenizationFailed`,
+  /// which made alignment a data-loss path for
+  /// numeric/symbol-only speech (`"1000"` against an A-Z
+  /// vocab).
   #[test]
-  fn all_unk_chunk_rejects_with_tokenization_failed() {
+  fn all_unk_chunk_returns_empty_token_list() {
     let tok = uppercase_tokenizer();
     let unk = tok.token_to_id("<unk>");
 
-    let err = tokenize_with_word_map(
+    let result = tokenize_with_word_map(
       &tok,
       "hello",
       /* word_count: */ 1,
@@ -286,14 +289,26 @@ mod tests {
       /* unk_token_id: */ unk,
       &Lang::En,
     )
-    .expect_err("all-<unk> chunk must reject");
-    assert!(matches!(
-      err,
-      WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::TokenizationFailed,
-        ..
-      }
-    ));
+    .expect("all-<unk> input must yield Ok(empty), not Err");
+    assert!(result.token_ids.is_empty());
+    assert!(result.word_idx_per_token.is_empty());
+  }
+
+  /// `"1000"` against the A-Z English vocab — Codex round-10
+  /// regression. Digits are all-OOV; tokenisation must produce
+  /// zero tokens (empty result, not error) so alignment can
+  /// short-circuit and the ASR transcript survives.
+  #[test]
+  fn digits_against_uppercase_alphabet_yield_empty_not_error() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    let result = tokenize_with_word_map(&tok, "1000", 1, true, true, unk, &Lang::En).expect("ok");
+    assert!(
+      result.token_ids.is_empty(),
+      "1000 has no in-vocab chars, must produce zero tokens; got {:?}",
+      result.token_ids
+    );
   }
 
   /// The new per-char skip: `U.S.A.` (three letters separated by

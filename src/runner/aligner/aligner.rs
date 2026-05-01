@@ -304,8 +304,8 @@ impl Aligner {
     // Chinese/Japanese where whitespace is an indexing artefact).
     // `vocab_uppercase_only` triggers ASCII case projection so a
     // lowercase normaliser doesn't feed <unk>s into a vocab like
-    // wav2vec2-base-960h's. `unk_token_id` lets the tokeniser
-    // reject any word that would have aligned to <unk>.
+    // wav2vec2-base-960h's. `unk_token_id` is the per-character
+    // skip target.
     let tokenized = tokenize_with_word_map(
       &self.tokenizer,
       normalized.normalized(),
@@ -315,6 +315,17 @@ impl Aligner {
       self.unk_token_id,
       &self.language,
     )?;
+
+    // No-alignable-tokens short-circuit: a chunk like `"1000"`
+    // against the uppercase-only English vocab legitimately
+    // produces zero in-vocab tokens (every digit is <unk>).
+    // Returning an empty `AlignmentResult` makes the dispatch
+    // emit the cached ASR transcript with `words: []` instead
+    // of converting it into `Event::Error` — alignment becoming
+    // optional, not a data-loss path.
+    if tokenized.token_ids.is_empty() {
+      return Ok(AlignmentResult::new(alloc::vec::Vec::new()));
+    }
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
