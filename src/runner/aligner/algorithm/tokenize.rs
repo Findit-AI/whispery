@@ -56,13 +56,19 @@ pub(crate) struct TokenizedText {
 /// word whose every character maps to `<unk>` (digits inside an
 /// uppercase-only English vocab, say) contributes zero tokens —
 /// it has no entry in `word_idx_per_token`, so `compose_words`
-/// later drops it from the output without a `Word` rather than
-/// failing the whole chunk's alignment.
+/// later drops it from the output without a `Word`.
+///
+/// **Empty result is `Ok`, not `Err`.** A chunk like `"1000"`
+/// against an A-Z vocab maps every character to `<unk>` and
+/// returns `TokenizedText { token_ids: vec![], .. }`.
+/// `Aligner::align` short-circuits empty results to an empty
+/// `AlignmentResult` so the dispatch emits the cached ASR
+/// transcript with `words: []` instead of converting it into
+/// `Event::Error` (which would lose the transcript text).
 ///
 /// Returns `WorkFailure::AlignmentFailed { kind: TokenizationFailed,
-/// .. }` if the tokeniser's `encode` call errors or *every* word
-/// reduced to zero in-vocab tokens (the `token_ids.is_empty()`
-/// check below).
+/// .. }` only on a true tokeniser failure (an `encode` error or a
+/// `word_count` mismatch).
 pub(crate) fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,

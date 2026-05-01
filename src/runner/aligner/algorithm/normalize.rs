@@ -320,7 +320,7 @@ pub mod x86_sse41 {
       sum += samples[i] as f64;
       i += 1;
     }
-    let mean = sum / nf;
+    let mean = super::reconcile_mean(sum, samples) / nf;
 
     // Pass 2: variance.
     let mean_f32 = mean as f32;
@@ -341,7 +341,7 @@ pub mod x86_sse41 {
       var_sum += d * d;
       i += 1;
     }
-    let var = var_sum / nf;
+    let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
     // Pass 3: write-out.
@@ -415,7 +415,7 @@ pub mod x86_avx2 {
       sum += samples[i] as f64;
       i += 1;
     }
-    let mean = sum / nf;
+    let mean = super::reconcile_mean(sum, samples) / nf;
 
     // Pass 2: variance.
     let mean_f32 = mean as f32;
@@ -436,7 +436,7 @@ pub mod x86_avx2 {
       var_sum += d * d;
       i += 1;
     }
-    let var = var_sum / nf;
+    let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
     // Pass 3: write-out.
@@ -497,7 +497,7 @@ pub mod x86_avx512 {
       sum += samples[i] as f64;
       i += 1;
     }
-    let mean = sum / nf;
+    let mean = super::reconcile_mean(sum, samples) / nf;
 
     // Pass 2: variance.
     let mean_f32 = mean as f32;
@@ -518,7 +518,7 @@ pub mod x86_avx512 {
       var_sum += d * d;
       i += 1;
     }
-    let var = var_sum / nf;
+    let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
     // Pass 3: write-out.
@@ -634,5 +634,85 @@ mod tests {
     let xs = alloc::vec![3.7_f32; 100];
     let out = zero_mean_unit_var_normalize(&xs);
     assert!(out.iter().all(|&v| v.abs() < 1e-3));
+  }
+
+  /// Codex round-10 [medium]: high-dynamic-range f32 inputs
+  /// `[1e20, -1e20, ...]` overflow the SIMD f32 squared-deviation
+  /// pass to `+inf`, while the scalar f64 reference keeps a
+  /// finite `var ≈ 1e40`. The SIMD backends must detect the
+  /// overflow and fall back to scalar so the dispatched result
+  /// matches the scalar reference.
+  ///
+  /// We pad the sequence to 4 / 8 / 16 lane-sized chunks plus
+  /// a 1-element tail to also exercise the per-backend tail
+  /// loops on the recovery path.
+  fn high_dynamic_range_input() -> Vec<f32> {
+    let mut xs = alloc::vec::Vec::with_capacity(33);
+    for _ in 0..16 {
+      xs.push(1e20_f32);
+      xs.push(-1e20_f32);
+    }
+    xs.push(1e19_f32); // tail
+    xs
+  }
+
+  #[test]
+  fn dispatched_high_dynamic_range_matches_scalar() {
+    let xs = high_dynamic_range_input();
+    let s = scalar::zero_mean_unit_var_normalize(&xs);
+    let d = zero_mean_unit_var_normalize(&xs);
+    assert_matches_scalar(&d, &s);
+    // Sanity: scalar produces finite, near-unit-variance output
+    // (mean ≈ 0, |x| ≈ 1 for the bulk values, all finite).
+    assert!(s.iter().all(|x| x.is_finite()));
+  }
+
+  #[cfg(target_arch = "aarch64")]
+  #[test]
+  fn neon_high_dynamic_range_matches_scalar() {
+    let xs = high_dynamic_range_input();
+    let s = scalar::zero_mean_unit_var_normalize(&xs);
+    let v = unsafe { neon::zero_mean_unit_var_normalize(&xs) };
+    assert_matches_scalar(&v, &s);
+    assert!(v.iter().all(|x| x.is_finite()));
+  }
+
+  #[cfg(target_arch = "x86_64")]
+  #[test]
+  fn x86_sse41_high_dynamic_range_matches_scalar() {
+    if !std::is_x86_feature_detected!("sse4.1") {
+      return;
+    }
+    let xs = high_dynamic_range_input();
+    let s = scalar::zero_mean_unit_var_normalize(&xs);
+    let v = unsafe { x86_sse41::zero_mean_unit_var_normalize(&xs) };
+    assert_matches_scalar(&v, &s);
+    assert!(v.iter().all(|x| x.is_finite()));
+  }
+
+  #[cfg(target_arch = "x86_64")]
+  #[test]
+  fn x86_avx2_high_dynamic_range_matches_scalar() {
+    if !std::is_x86_feature_detected!("avx2") {
+      return;
+    }
+    let xs = high_dynamic_range_input();
+    let s = scalar::zero_mean_unit_var_normalize(&xs);
+    let v = unsafe { x86_avx2::zero_mean_unit_var_normalize(&xs) };
+    assert_matches_scalar(&v, &s);
+    assert!(v.iter().all(|x| x.is_finite()));
+  }
+
+  #[cfg(target_arch = "x86_64")]
+  #[test]
+  fn x86_avx512_high_dynamic_range_matches_scalar() {
+    if !std::is_x86_feature_detected!("avx512f") {
+      return;
+    }
+    let xs = high_dynamic_range_input();
+    let s = scalar::zero_mean_unit_var_normalize(&xs);
+    let v = unsafe { x86_avx512::zero_mean_unit_var_normalize(&xs) };
+    assert_matches_scalar(&v, &s);
+    assert!(v.iter().all(|x| x.is_finite()));
   }
 }
