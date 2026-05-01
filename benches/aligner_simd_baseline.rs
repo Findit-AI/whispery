@@ -177,5 +177,69 @@ fn bench_ctc_viterbi(c: &mut Criterion) {
   group.finish();
 }
 
-criterion_group!(benches, bench_normalize, bench_ctc_viterbi);
+/// Standalone scalar log-softmax over a synthetic `(T, V)` raw
+/// logit buffer. Mirrors the inline body of `encode_log_softmax`'s
+/// post-ORT reduction (`max → sum exp(x-max) → subtract log_z`)
+/// without taking ORT's `Session::run` cost into account, so we
+/// can size up whether the reduction itself is worth a SIMD
+/// pass. Returns the same f64-accumulator shape the real code
+/// uses.
+fn scalar_log_softmax(raw: &[f32], t: usize, v: usize) -> Vec<f32> {
+  let mut data = Vec::with_capacity(t * v);
+  for t_idx in 0..t {
+    let row = &raw[t_idx * v..(t_idx + 1) * v];
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0_f64;
+    for &x in row {
+      sum += ((x - max) as f64).exp();
+    }
+    let log_z = max + (sum.ln() as f32);
+    for &x in row {
+      data.push(x - log_z);
+    }
+  }
+  data
+}
+
+fn bench_log_softmax(c: &mut Criterion) {
+  // wav2vec2-base-960h's typical post-encode shape: T=1500
+  // (50 frames/sec × 30 s), V=32 (vocab + specials).
+  const T_FRAMES: usize = 1500;
+  const VOCAB: usize = 32;
+
+  // Synthetic logits: deterministic noise + a strong peak per
+  // frame so the softmax actually has work to do (uniform input
+  // would short-circuit).
+  let mut raw: Vec<f32> = Vec::with_capacity(T_FRAMES * VOCAB);
+  let mut state: u32 = 0xc0ffee;
+  for ti in 0..T_FRAMES {
+    let target = ti % VOCAB;
+    for vi in 0..VOCAB {
+      state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      let noise = ((state >> 8) as i32) as f32 / 16_777_216.0;
+      let base = if vi == target { -0.1 } else { -3.0 };
+      raw.push(base + noise);
+    }
+  }
+
+  let mut group = c.benchmark_group("log_softmax");
+  group.throughput(Throughput::Elements((T_FRAMES * VOCAB) as u64));
+  group.bench_function(
+    BenchmarkId::new("scalar", format!("T={T_FRAMES}_V={VOCAB}")),
+    |b| {
+      b.iter(|| {
+        let out = scalar_log_softmax(black_box(&raw), T_FRAMES, VOCAB);
+        black_box(out);
+      });
+    },
+  );
+  group.finish();
+}
+
+criterion_group!(
+  benches,
+  bench_normalize,
+  bench_ctc_viterbi,
+  bench_log_softmax
+);
 criterion_main!(benches);
