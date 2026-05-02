@@ -457,20 +457,30 @@ impl Transcriber {
   /// alignment worker keeps it alive across thread boundaries via
   /// `Arc<dyn Fn>`.
   ///
-  /// Returns `None` before the first `push_samples` (the timebase
-  /// is not yet established).
+  /// Returns `None` if `chunk_id` is not in flight (e.g. already
+  /// drained as `Transcript`/`Failed`).
   ///
   /// The closure operates in *stream coordinates*: the sample
   /// indices it accepts are absolute positions in the input audio
-  /// stream. The aligner has the chunk's
-  /// `chunk_first_sample_in_stream` offset and adds `frame * hop`
-  /// to land in the same coordinate system.
+  /// stream **as they were at chunk-extract time**. The aligner
+  /// has the chunk's `chunk_first_sample_in_stream` offset and
+  /// adds `frame * hop` to land in the same coordinate system.
+  ///
+  /// Codex round-19: a previous live-buffer-based variant
+  /// captured the buffer's *current* PTS anchor, which a
+  /// `restart_at` between chunk-extract and ASR-finish would
+  /// have re-anchored — mapping the chunk's pre-restart sample
+  /// indices through the post-restart PTS origin and emitting
+  /// word ranges far outside the transcript's own range. The
+  /// per-chunk form snapshots the anchor pair at extract time
+  /// (see [`super::dispatch::ChunkRecord::output_tb`]) so the
+  /// rebuilt closure stays in the chunk's own epoch.
   #[cfg(feature = "alignment")]
-  pub(crate) fn samples_to_output_range_fn(
+  pub(crate) fn chunk_samples_to_output_range_fn(
     &self,
+    chunk_id: ChunkId,
   ) -> Option<alloc::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync>> {
-    self.buffer.output_timebase()?;
-    Some(self.buffer.samples_to_output_range_fn())
+    self.dispatch.chunk_samples_to_output_range_fn(chunk_id)
   }
 
   /// Stream-coordinate first 16 kHz sample index of the chunk
@@ -970,6 +980,80 @@ mod tests {
     // own Arc<[f32]>s and will emit normally.
     // (Spec §5.4.1 + §5.5 invariant 4 exception: drain is
     // allowed to exceed max_in_flight transiently.)
+  }
+
+  /// Codex round-19 finding [high]: a `restart_at` between a
+  /// chunk's extraction and its ASR-finish callback used to
+  /// silently corrupt that chunk's word timestamps. The
+  /// alignment dispatch built `samples_to_output_range` from
+  /// the *live* buffer, which `restart_at` had just re-anchored
+  /// onto a new PTS epoch — but the chunk's
+  /// `chunk_first_sample_in_stream` was still in the
+  /// pre-restart epoch. Result: words landed at
+  /// `new_anchor + (pre_restart_sample * scale)`, often far
+  /// outside the surviving chunk's own `Transcript::range`.
+  /// Fix: snapshot `(output_tb, base_pts_out_anchor)` onto
+  /// `ChunkRecord` at extract time, and rebuild the closure
+  /// from those captured fields at alignment-dispatch time.
+  #[cfg(feature = "alignment")]
+  #[test]
+  fn chunk_samples_to_output_range_fn_uses_extract_time_anchor_after_restart() {
+    use crate::core::command::Command;
+
+    let config = TranscriberOptions::default()
+      .with_chunk_size(Duration::from_millis(125)) // 2_000 samples
+      .with_max_in_flight(4)
+      .with_buffer_cap_samples(100_000);
+    let mut t = Transcriber::new(config);
+
+    // Pre-restart epoch: anchor at PTS 0 in the 1/48000 timebase.
+    t.push_samples(ts(0), &[0.0; 4_000]).unwrap();
+    t.push_vad_segment(VadSegment::new(0, 2_000)).unwrap();
+
+    // Drain RunAsr — chunk 0 is now in_flight, ASR not yet
+    // resolved. This is the surviving pre-restart chunk.
+    let cmd = t.poll_command().expect("RunAsr for chunk 0");
+    let chunk_id = match cmd {
+      Command::RunAsr { chunk_id, .. } => chunk_id,
+      other => panic!("expected RunAsr, got {other:?}"),
+    };
+
+    // Sanity: closure built *before* any restart anchors at PTS 0.
+    let closure_pre = t
+      .chunk_samples_to_output_range_fn(chunk_id)
+      .expect("chunk in flight");
+    let pre = closure_pre(0, 16_000);
+    assert_eq!(pre.start_pts(), 0, "pre-restart closure starts at PTS 0");
+    // 16_000 samples at 1/16000 → 1 second → 48_000 in 1/48000.
+    assert_eq!(pre.end_pts(), 48_000, "pre-restart closure ends at PTS 48_000");
+
+    // Restart far ahead in PTS-space — 5e9 in 1/48000 ticks,
+    // ~28.9 hours, so any leakage of the new anchor is loud.
+    let new_anchor_pts: i64 = 5_000_000_000;
+    t.restart_at(ts(new_anchor_pts)).unwrap();
+
+    // The pre-restart chunk is still in_flight (it owns its
+    // audio in an `Arc<[f32]>`). Its alignment-dispatch
+    // closure must STILL anchor at PTS 0, not at the post-
+    // restart anchor — otherwise word ranges land 28.9 hours
+    // past the chunk's own `Transcript::range`.
+    let closure_post = t
+      .chunk_samples_to_output_range_fn(chunk_id)
+      .expect("pre-restart chunk survives restart");
+    let post = closure_post(0, 16_000);
+    assert_eq!(
+      post.start_pts(),
+      0,
+      "post-restart closure for pre-restart chunk must use the chunk's extract-time anchor (got {})",
+      post.start_pts()
+    );
+    assert_eq!(
+      post.end_pts(),
+      48_000,
+      "post-restart closure end_pts drifted (got {})",
+      post.end_pts()
+    );
+    assert_eq!(post.start().timebase(), tb_48k());
   }
 
   /// Codex round-1 finding [high]: trim must NOT drop audio still

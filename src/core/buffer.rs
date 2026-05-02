@@ -59,6 +59,19 @@ impl SampleBuffer {
     self.output_tb
   }
 
+  /// PTS-anchor at stream-zero, in the current output timebase.
+  /// Mutates only on `restart_at`; chunks extracted within a
+  /// single between-restart epoch share this value. The
+  /// alignment dispatch snapshots it onto each chunk record at
+  /// extract time so post-restart word-mapping for surviving
+  /// pre-restart chunks uses the original epoch's anchor
+  /// rather than whatever the buffer is currently anchored at.
+  /// (Codex round-19.)
+  #[cfg(feature = "alignment")]
+  pub(crate) fn base_pts_out_anchor(&self) -> i64 {
+    self.base_pts_out_anchor
+  }
+
   /// Append a packet of samples whose first sample's PTS is
   /// `starts_at` in the output timebase. Returns `Backpressure`
   /// when the buffer would exceed its cap; `PtsRegression` /
@@ -213,45 +226,29 @@ impl SampleBuffer {
     mediatime::TimeRange::new(start_out, end_out, tb)
   }
 
-  /// Build an `Arc<dyn Fn(u64, u64) -> TimeRange>` that converts
-  /// stream-coordinate sample indices to output-timebase
-  /// `TimeRange`s. The closure captures the buffer's timebase and
-  /// pts-anchor at construction time; subsequent `trim_to` /
-  /// `restart_at` mutations on the original buffer do NOT
-  /// invalidate the closure (it operates on captured snapshots).
+  /// Build a `samples_to_output_range` closure from an explicit
+  /// `(timebase, base_pts_out_anchor)` snapshot rather than from
+  /// the buffer's current state. The dispatch layer captures the
+  /// pair onto each chunk record at extract time (see
+  /// `dispatch::ChunkRecord::output_tb`) and feeds it back here
+  /// at alignment-dispatch time, so word ranges stay anchored in
+  /// the chunk's own PTS epoch even after a `restart_at` shifts
+  /// the live buffer onto a new one. (Codex round-19.)
   ///
-  /// Drift-free invariant: identical to `samples_to_output_range`
-  /// (which is `pub(crate)` and uses the same conversion math).
-  ///
-  /// Plan A's PTS anchor pair is `(starts_at_sample = 0,
-  /// starts_at_pts = base_pts_out_anchor)`: `range.start` /
-  /// `range.end` in `samples_to_output_range` are already
-  /// stream-coordinate sample indices since stream zero, so the
-  /// implicit "starts_at_sample" is 0 and the anchor PTS is the
-  /// `base_pts_out_anchor` recorded at the first push.
-  ///
-  /// # Panics
-  ///
-  /// Panics if called before the first `push_samples` (the
-  /// timebase is not yet established). Callers should reach this
-  /// path only via `Transcriber::samples_to_output_range_fn`,
-  /// which returns `None` in that case.
+  /// Conversion math is identical to
+  /// [`samples_to_output_range`](Self::samples_to_output_range)
+  /// (drift-free): `out_pts = base_pts_out_anchor + rescale(sample, ANALYSIS_TIMEBASE, tb)`.
   #[cfg(feature = "alignment")]
-  pub(crate) fn samples_to_output_range_fn(
-    &self,
+  pub(crate) fn samples_to_output_range_fn_at(
+    tb: Timebase,
+    base_pts_out_anchor: i64,
   ) -> alloc::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync> {
-    let tb = self
-      .output_tb
-      .expect("samples_to_output_range_fn called before any push");
-    let starts_at_pts = self.base_pts_out_anchor;
     alloc::sync::Arc::new(
       move |start_sample: u64, end_sample: u64| -> mediatime::TimeRange {
-        // Conversion math is identical to `samples_to_output_range`:
-        // delta_samples = sample - 0 = sample; rescale through the
-        // analysis timebase; add to the captured pts anchor.
         let s_pts =
-          starts_at_pts + Timebase::rescale_pts(start_sample as i64, ANALYSIS_TIMEBASE, tb);
-        let e_pts = starts_at_pts + Timebase::rescale_pts(end_sample as i64, ANALYSIS_TIMEBASE, tb);
+          base_pts_out_anchor + Timebase::rescale_pts(start_sample as i64, ANALYSIS_TIMEBASE, tb);
+        let e_pts =
+          base_pts_out_anchor + Timebase::rescale_pts(end_sample as i64, ANALYSIS_TIMEBASE, tb);
         mediatime::TimeRange::new(s_pts, e_pts, tb)
       },
     )

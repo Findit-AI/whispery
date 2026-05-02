@@ -71,6 +71,22 @@ pub(crate) struct ChunkRecord {
   #[cfg(feature = "alignment")]
   #[allow(dead_code)] // exposed via Dispatch::chunk_sub_segments_samples
   pub sub_segments_samples: Vec<(u64, u64)>,
+  /// Output timebase snapshot, captured at chunk-extract time.
+  /// Held alongside [`Self::base_pts_out_anchor`] so the
+  /// runner's alignment dispatch can rebuild a
+  /// `samples_to_output_range` closure for *this* chunk's
+  /// epoch — necessary because `Transcriber::restart_at` resets
+  /// the live buffer's anchor while in-flight chunks survive,
+  /// so a fresh closure built post-restart would map this
+  /// chunk's pre-restart sample indices through the wrong PTS
+  /// origin. (Codex round-19.)
+  #[cfg(feature = "alignment")]
+  pub output_tb: mediatime::Timebase,
+  /// PTS-anchor snapshot at stream-zero in `output_tb`,
+  /// captured at chunk-extract time. See
+  /// [`Self::output_tb`] for the rationale.
+  #[cfg(feature = "alignment")]
+  pub base_pts_out_anchor: i64,
   #[allow(dead_code)] // used by alignment in Plan C
   pub sub_origins: Vec<SubOrigin>,
   pub phase: ChunkPhase,
@@ -98,6 +114,17 @@ pub(crate) struct ExtractedChunk {
   /// indices for the aligner's silence mask (Plan C, Task 22).
   #[cfg(feature = "alignment")]
   pub sub_segments_samples: Vec<(u64, u64)>,
+  /// Output timebase snapshot captured at extract time. Promoted
+  /// onto [`ChunkRecord::output_tb`] so the runner's alignment
+  /// dispatch can rebuild a per-chunk
+  /// `samples_to_output_range` closure that survives a later
+  /// `restart_at`. (Codex round-19.)
+  #[cfg(feature = "alignment")]
+  pub output_tb: mediatime::Timebase,
+  /// PTS anchor at stream-zero, captured at extract time. See
+  /// [`Self::output_tb`] for the rationale.
+  #[cfg(feature = "alignment")]
+  pub base_pts_out_anchor: i64,
   pub sub_origins: Vec<SubOrigin>,
   /// Per-packet `AsrParamsOverride` snapshot captured at the
   /// moment this chunk was extracted from the live buffer. The
@@ -139,6 +166,16 @@ impl ExtractedChunk {
       .map(|s| (s.range.start, s.range.end))
       .collect();
     let sub_origins: Vec<SubOrigin> = chunk.subs.iter().map(|s| s.origin).collect();
+    // Capture the output timebase + PTS anchor *now*, before
+    // any later `restart_at` shifts the buffer onto a new
+    // epoch. Promoted to `ChunkRecord` at promote-time and
+    // consulted at alignment-dispatch time. (Codex round-19.)
+    #[cfg(feature = "alignment")]
+    let output_tb = buffer
+      .output_timebase()
+      .expect("output timebase established by first push (extract_from runs after push)");
+    #[cfg(feature = "alignment")]
+    let base_pts_out_anchor = buffer.base_pts_out_anchor();
     Self {
       chunk_id,
       samples,
@@ -147,6 +184,10 @@ impl ExtractedChunk {
       sub_segments,
       #[cfg(feature = "alignment")]
       sub_segments_samples,
+      #[cfg(feature = "alignment")]
+      output_tb,
+      #[cfg(feature = "alignment")]
+      base_pts_out_anchor,
       sub_origins,
       override_at_creation: asr_params_override,
     }
@@ -403,6 +444,10 @@ impl Dispatch {
       sub_segments: ext.sub_segments,
       #[cfg(feature = "alignment")]
       sub_segments_samples: ext.sub_segments_samples,
+      #[cfg(feature = "alignment")]
+      output_tb: ext.output_tb,
+      #[cfg(feature = "alignment")]
+      base_pts_out_anchor: ext.base_pts_out_anchor,
       sub_origins: ext.sub_origins,
       phase: ChunkPhase::AwaitingAsr,
       asr_result: None,
@@ -732,6 +777,26 @@ impl Dispatch {
   ) -> Option<alloc::vec::Vec<(u64, u64)>> {
     let record = self.in_flight.get(&chunk_id)?;
     Some(record.sub_segments_samples.clone())
+  }
+
+  /// Build the `samples_to_output_range` closure for `chunk_id`
+  /// using the chunk's *captured-at-extract-time* `(timebase,
+  /// base_pts_out_anchor)` pair, so word ranges land in the
+  /// chunk's own PTS epoch even after a `restart_at` has shifted
+  /// the live buffer's anchor.
+  ///
+  /// Returns `None` if `chunk_id` is not in flight (e.g. already
+  /// drained as `Transcript`/`Failed`). Codex round-19.
+  #[cfg(feature = "alignment")]
+  pub(crate) fn chunk_samples_to_output_range_fn(
+    &self,
+    chunk_id: ChunkId,
+  ) -> Option<alloc::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync>> {
+    let record = self.in_flight.get(&chunk_id)?;
+    Some(crate::core::buffer::SampleBuffer::samples_to_output_range_fn_at(
+      record.output_tb,
+      record.base_pts_out_anchor,
+    ))
   }
 
   /// True iff every queue is empty: no buffered samples (caller

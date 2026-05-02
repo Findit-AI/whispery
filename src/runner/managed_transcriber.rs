@@ -130,7 +130,14 @@ impl ManagedTranscriber {
 
         // Need the bound `samples_to_output_range` closure for
         // the worker's wav2vec2 frame → output-timebase mapping.
-        let Some(samples_to_output_range) = self.core.samples_to_output_range_fn() else {
+        // Pulled from the chunk's record (anchor snapshot at
+        // extract time) rather than the live buffer, so word
+        // ranges stay in this chunk's PTS epoch even if a
+        // `restart_at` happened between extract and now.
+        // (Codex round-19.)
+        let Some(samples_to_output_range) =
+          self.core.chunk_samples_to_output_range_fn(chunk_id)
+        else {
           return DispatchOutcome::Backpressure(Command::RunAlignment {
             chunk_id,
             samples,
