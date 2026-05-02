@@ -232,11 +232,7 @@ fn accumulate_per_word(
         continue; // leading blank
       }
       let prev_token_idx = k - 1;
-      let Some(word_idx) = word_idx_per_token
-        .get(prev_token_idx)
-        .copied()
-        .flatten()
-      else {
+      let Some(word_idx) = word_idx_per_token.get(prev_token_idx).copied().flatten() else {
         // Previous token is a delimiter / unmapped; its
         // blank-stay slot belongs to that delimiter, not to
         // any word. Skip — same rule WhisperX's `merge_words`
@@ -438,10 +434,10 @@ where
     let Some(accum) = slot else {
       continue;
     };
-    let start_sample = chunk_first_sample_in_stream
-      + (accum.start_frame as f64 * samples_per_frame).round() as u64;
-    let end_sample = chunk_first_sample_in_stream
-      + (accum.end_frame as f64 * samples_per_frame).round() as u64;
+    let start_sample =
+      chunk_first_sample_in_stream + (accum.start_frame as f64 * samples_per_frame).round() as u64;
+    let end_sample =
+      chunk_first_sample_in_stream + (accum.end_frame as f64 * samples_per_frame).round() as u64;
 
     // If the word's first speech-supported frame is already
     // past the chunk's audio, drop the word — there's no
