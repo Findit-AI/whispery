@@ -79,6 +79,45 @@ fn reconcile_var_sum(simd_var_sum: f64, samples: &[f32], mean: f64) -> f64 {
   }
 }
 
+/// Per-backend low-variance fallback: when the SIMD write-out
+/// pass's f32 mean rounding can leak more per-sample error than
+/// the dispatcher's parity tolerance, fall back to scalar f64.
+///
+/// The SIMD pass-3 broadcasts `mean` and `inv_std` into f32 lanes
+/// and computes `(s - mean_f32) * inv_std_f32`. The dominant
+/// loss is the mean cast: f32 has 23 bits of mantissa, so
+/// rounding `|mean|` to f32 costs at most `|mean| * 2^-23` of
+/// magnitude. Multiplied by `inv_std`, the per-sample output
+/// error is bounded by `|mean| * 2^-23 * inv_std`. Bail when
+/// that exceeds the parity tolerance.
+///
+/// Note we use `|mean| * 2^-23` (the *worst-case* f32 round)
+/// rather than the actual `|mean_f32 - mean|`. For Codex's cited
+/// `[1.0, next_up(1.0), ...]` case the f32 mean lands at exactly
+/// 1.0 (mid-ULP rounds to even), so the actual rounding *of the
+/// f64 mean* is zero — but the SIMD pass-1 *itself* already lost
+/// precision when collapsing f32 lanes, producing a different
+/// mean than scalar f64 would. Bounding via `|mean| * 2^-23`
+/// catches both flavours: it's a correctness ceiling for the
+/// SIMD pipeline's f32 mean-cast error, regardless of which
+/// stage actually introduced the loss.
+///
+/// For typical audio (`|mean| ≈ 0`, `inv_std ≈ 3-10`) this is
+/// `~1e-9`. For near-constant inputs (`var → 0`,
+/// `inv_std → 1/√eps ≈ 3162`) it explodes — exactly the
+/// regime that needs the scalar fallback.
+///
+/// Threshold: `5e-5`, half the test contract's `1e-4` so the
+/// dispatched backend stays comfortably within tolerance.
+#[inline]
+fn simd_path_loses_precision(mean: f64, inv_std: f64) -> bool {
+  const SIMD_PRECISION_TOLERANCE: f64 = 5e-5;
+  // 2^-23: f32 mantissa step at unit magnitude.
+  const F32_MANTISSA_RELATIVE_ULP: f64 = 1.0_f64 / (1u64 << 23) as f64;
+  let max_per_sample_err = mean.abs() * F32_MANTISSA_RELATIVE_ULP * inv_std;
+  max_per_sample_err > SIMD_PRECISION_TOLERANCE
+}
+
 /// Magnitude threshold above which the SIMD backends' f32-lane
 /// reductions diverge measurably from the scalar f64 reference.
 ///
@@ -247,6 +286,92 @@ pub mod scalar {
   }
 }
 
+/// Silence-mask-preserving normalisation. Computes mean / variance
+/// over speech samples only, transforms the speech samples by
+/// `(s - mean) / sqrt(var + eps)`, and forces non-speech samples
+/// back to zero in the output.
+///
+/// **Why a separate helper.** The plain
+/// [`zero_mean_unit_var_normalize`] computes statistics over the
+/// *whole* buffer. When the caller has pre-zeroed non-speech
+/// regions (the silence-mask step), folding those zeros into the
+/// reduction biases the mean toward the speech values' magnitude
+/// and `(0 - mean) / std` then becomes a non-zero value at every
+/// silence position. That contradicts the silence-mask contract —
+/// wav2vec2 must see uniform silence in masked regions, not a
+/// mean-shifted residue. Codex round-14 [high].
+///
+/// **Mirrors HF behaviour.** `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm`
+/// with an `attention_mask` does exactly this: stats over masked-in
+/// positions, masked-out positions stay zero in the output.
+///
+/// `samples` is the chunk's audio buffer at 16 kHz. `speech_mask`
+/// is a parallel `&[bool]` of identical length; `true` marks
+/// samples inside any sub-VAD-segment. When `speech_mask` has no
+/// `true` entries (chunk consists entirely of silence) the
+/// function returns a fresh zero buffer — wav2vec2 with all-zero
+/// input emits blank tokens uniformly, and downstream
+/// `compose_words` drops every word for lack of speech support.
+///
+/// Always scalar f64 — the per-sample branch on the mask is
+/// SIMD-hostile, and the silence-aware path is not on the SIMD
+/// hot loop (typical chunks are ≤ 1 % of total ORT inference
+/// time even when scalar). Keeping it scalar avoids the
+/// per-backend duplication the SIMD `zero_mean_unit_var_normalize`
+/// requires.
+#[inline]
+pub(crate) fn normalize_with_silence_mask(samples: &[f32], speech_mask: &[bool]) -> Vec<f32> {
+  debug_assert_eq!(samples.len(), speech_mask.len());
+
+  if samples.is_empty() {
+    return Vec::new();
+  }
+
+  // Pass 1: count and sum speech samples.
+  let mut sum = 0.0_f64;
+  let mut count: usize = 0;
+  for (s, &is_speech) in samples.iter().zip(speech_mask.iter()) {
+    if is_speech {
+      sum += *s as f64;
+      count += 1;
+    }
+  }
+
+  // No speech in the chunk → uniform-zero output. wav2vec2 sees
+  // pure silence, the CTC graph emits all blanks, and compose
+  // drops every word — exactly what the silence-mask contract
+  // says should happen for an all-silent chunk.
+  if count == 0 {
+    return alloc::vec![0.0_f32; samples.len()];
+  }
+
+  let mean = sum / count as f64;
+
+  // Pass 2: variance over speech samples only.
+  let mut var_sum = 0.0_f64;
+  for (s, &is_speech) in samples.iter().zip(speech_mask.iter()) {
+    if is_speech {
+      let d = *s as f64 - mean;
+      var_sum += d * d;
+    }
+  }
+  let var = var_sum / count as f64;
+  let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
+
+  // Pass 3: write-out. Speech samples get the affine transform;
+  // non-speech samples stay exactly zero so the silence-mask
+  // contract survives.
+  let mut out = Vec::with_capacity(samples.len());
+  for (s, &is_speech) in samples.iter().zip(speech_mask.iter()) {
+    if is_speech {
+      out.push(((*s as f64 - mean) * inv_std) as f32);
+    } else {
+      out.push(0.0_f32);
+    }
+  }
+  out
+}
+
 /// aarch64 NEON backend. Vectorises the three sequential passes
 /// (sum, var, write-out) over `float32x4_t` lanes. The scalar tail
 /// handles the trailing `len % 4` samples without falling through
@@ -308,6 +433,15 @@ pub mod neon {
     }
     let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
+
+    // Codex round-14 [medium]: low-variance inputs drive
+    // `inv_std` so high that the f32 rounding of `mean` for the
+    // SIMD write-out lanes leaks visible per-sample error
+    // relative to scalar. Detect and route to scalar f64 to keep
+    // the dispatched output within parity tolerance.
+    if super::simd_path_loses_precision(mean, inv_std) {
+      return super::scalar::zero_mean_unit_var_normalize(samples);
+    }
 
     // ---- pass 3: (x - mean) * inv_std into a fresh Vec.
     let inv_std_f32 = inv_std as f32;
@@ -404,6 +538,15 @@ pub mod x86_sse41 {
     let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
+    // Codex round-14 [medium]: low-variance inputs drive
+    // `inv_std` so high that the f32 rounding of `mean` for the
+    // SIMD write-out lanes leaks visible per-sample error
+    // relative to scalar. Detect and route to scalar f64 to keep
+    // the dispatched output within parity tolerance.
+    if super::simd_path_loses_precision(mean, inv_std) {
+      return super::scalar::zero_mean_unit_var_normalize(samples);
+    }
+
     // Pass 3: write-out.
     let inv_std_f32 = inv_std as f32;
     let inv_v = unsafe { _mm_set1_ps(inv_std_f32) };
@@ -499,6 +642,15 @@ pub mod x86_avx2 {
     let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
 
+    // Codex round-14 [medium]: low-variance inputs drive
+    // `inv_std` so high that the f32 rounding of `mean` for the
+    // SIMD write-out lanes leaks visible per-sample error
+    // relative to scalar. Detect and route to scalar f64 to keep
+    // the dispatched output within parity tolerance.
+    if super::simd_path_loses_precision(mean, inv_std) {
+      return super::scalar::zero_mean_unit_var_normalize(samples);
+    }
+
     // Pass 3: write-out.
     let inv_std_f32 = inv_std as f32;
     let inv_v = unsafe { _mm256_set1_ps(inv_std_f32) };
@@ -580,6 +732,15 @@ pub mod x86_avx512 {
     }
     let var = super::reconcile_var_sum(var_sum, samples, mean) / nf;
     let inv_std = 1.0_f64 / (var + 1e-7_f64).sqrt();
+
+    // Codex round-14 [medium]: low-variance inputs drive
+    // `inv_std` so high that the f32 rounding of `mean` for the
+    // SIMD write-out lanes leaks visible per-sample error
+    // relative to scalar. Detect and route to scalar f64 to keep
+    // the dispatched output within parity tolerance.
+    if super::simd_path_loses_precision(mean, inv_std) {
+      return super::scalar::zero_mean_unit_var_normalize(samples);
+    }
 
     // Pass 3: write-out.
     let inv_std_f32 = inv_std as f32;
@@ -826,5 +987,156 @@ mod tests {
     assert!(!samples_within_simd_safe_range(&[1.0, f32::NAN]));
     assert!(!samples_within_simd_safe_range(&[1.0, f32::INFINITY]));
     assert!(samples_within_simd_safe_range(&[]));
+  }
+
+  // ---- Codex round-14 [high]: silence-aware normalisation ------
+
+  /// Speech with non-zero mean must NOT shift masked-silence
+  /// positions away from zero in the output. Pre-fix, the
+  /// non-mask-aware normaliser computed a global mean over the
+  /// already-masked buffer, so masked positions ended up at
+  /// `(0 - mean) / std` ≠ 0 — wav2vec2 then saw "silence" with
+  /// a residue, and word boundaries leaked into masked gaps.
+  #[test]
+  fn silence_mask_normalize_keeps_masked_positions_at_zero() {
+    // 16 samples: [speech with DC offset]+[silence]+[speech with DC offset].
+    let mut samples = alloc::vec![0.0_f32; 16];
+    // Speech region 1: indices 0..4, DC = 0.5 with small ripple.
+    samples[0] = 0.5;
+    samples[1] = 0.6;
+    samples[2] = 0.4;
+    samples[3] = 0.5;
+    // Silence region: indices 4..12 stay at 0.0.
+    // Speech region 2: indices 12..16, DC = 0.5 with small ripple.
+    samples[12] = 0.5;
+    samples[13] = 0.6;
+    samples[14] = 0.4;
+    samples[15] = 0.5;
+
+    let mut speech_mask = alloc::vec![false; 16];
+    for slot in &mut speech_mask[0..4] {
+      *slot = true;
+    }
+    for slot in &mut speech_mask[12..16] {
+      *slot = true;
+    }
+
+    let normed = normalize_with_silence_mask(&samples, &speech_mask);
+    assert_eq!(normed.len(), samples.len());
+    for i in 4..12 {
+      assert_eq!(
+        normed[i], 0.0_f32,
+        "masked silence at index {i} must stay exactly 0; got {}",
+        normed[i],
+      );
+    }
+    // Speech regions are non-zero (the affine transform shifts
+    // them around 0 — sanity that we didn't accidentally zero
+    // everything).
+    let any_nonzero_speech =
+      normed[..4].iter().any(|&v| v != 0.0) || normed[12..].iter().any(|&v| v != 0.0);
+    assert!(any_nonzero_speech, "speech samples must not all be zero");
+  }
+
+  /// Empty mask (no speech anywhere) → uniform-zero output.
+  /// wav2vec2 sees pure silence; CTC graph emits all blanks;
+  /// compose drops every word — the contract for an all-silent
+  /// chunk.
+  #[test]
+  fn silence_mask_normalize_all_silence_yields_zeros() {
+    let samples = alloc::vec![0.5_f32, 0.6, 0.4, 0.5];
+    let speech_mask = alloc::vec![false; 4];
+    let normed = normalize_with_silence_mask(&samples, &speech_mask);
+    assert_eq!(normed, alloc::vec![0.0_f32; 4]);
+  }
+
+  /// Speech-only mask → identical to the regular
+  /// `zero_mean_unit_var_normalize` to within scalar f64
+  /// precision. The silence-aware path doesn't introduce drift
+  /// for the all-speech case.
+  #[test]
+  fn silence_mask_normalize_all_speech_matches_regular_normalize() {
+    let samples = alloc::vec![0.5_f32, 0.6, 0.4, 0.5, -0.3, -0.1, 0.2, 0.8];
+    let speech_mask = alloc::vec![true; samples.len()];
+    let masked = normalize_with_silence_mask(&samples, &speech_mask);
+    let regular = scalar::zero_mean_unit_var_normalize(&samples);
+    assert_matches_scalar(&masked, &regular);
+  }
+
+  // ---- Codex round-14 [medium]: low-variance SIMD parity ------
+
+  /// `[1.0, 1.0_f32::next_up(), 1.0, 1.0_f32::next_up(), ...]`
+  /// — Codex's literal cited case. Rounding mean to f32 in the
+  /// SIMD write-out lanes leaks ~1.88e-4 of error against
+  /// scalar f64. The dispatcher must detect this regime and
+  /// route to scalar; we assert the dispatched output matches
+  /// scalar to within tolerance.
+  #[test]
+  fn dispatched_low_variance_near_one_matches_scalar() {
+    let next_up_one = f32::from_bits(1.0_f32.to_bits() + 1);
+    let mut xs = alloc::vec::Vec::with_capacity(64);
+    for _ in 0..32 {
+      xs.push(1.0_f32);
+      xs.push(next_up_one);
+    }
+    let s = scalar::zero_mean_unit_var_normalize(&xs);
+    let d = zero_mean_unit_var_normalize(&xs);
+    assert_matches_scalar(&d, &s);
+  }
+
+  /// Same shape, larger DC magnitude (still below the 1e4
+  /// safe-range threshold). f32 ULP at magnitude `M` is
+  /// `M * 2^-23`, so this magnifies the cancellation by `M`.
+  /// The fallback must catch all such cases inside the
+  /// safe-range, not only near 1.0.
+  #[test]
+  fn dispatched_low_variance_at_high_magnitude_matches_scalar() {
+    // Magnitude 100; safe-range threshold is 1e4 so this
+    // passes the magnitude guard. ULP at 100 is ~1.2e-5;
+    // alternating values produce sub-ULP variance and
+    // pathological inv_std. Without the precision fallback,
+    // the dispatched output drifts from scalar by orders of
+    // magnitude more than 1e-4.
+    let mag = 100.0_f32;
+    let next_up = f32::from_bits(mag.to_bits() + 1);
+    let mut xs = alloc::vec::Vec::with_capacity(64);
+    for _ in 0..32 {
+      xs.push(mag);
+      xs.push(next_up);
+    }
+    let s = scalar::zero_mean_unit_var_normalize(&xs);
+    let d = zero_mean_unit_var_normalize(&xs);
+    assert_matches_scalar(&d, &s);
+  }
+
+  /// The precision-fallback predicate's worst-case bound:
+  /// `|mean| * 2^-23 * inv_std > 5e-5`. Audio-shaped inputs
+  /// stay safely below; low-variance / high-magnitude inputs
+  /// trip it.
+  #[test]
+  fn simd_path_loses_precision_fires_only_on_low_variance() {
+    // Codex's cited regime: `[1.0, next_up(1.0), ...]` →
+    // mean ≈ 1.0, inv_std ≈ 3162. Worst-case per-sample
+    // error: 1.0 * 1.19e-7 * 3162 = 3.76e-4 ≫ 5e-5. Predicate
+    // must fire.
+    assert!(simd_path_loses_precision(1.0, 3_162.0));
+
+    // Typical audio: |mean| ≈ 0.01, inv_std ≈ 5 → ~6e-9. Must
+    // NOT fire; SIMD takes the fast path.
+    assert!(!simd_path_loses_precision(0.01, 5.0));
+
+    // Zero mean → zero error regardless of inv_std. Constant-0
+    // signal short-circuits at this guard.
+    assert!(!simd_path_loses_precision(0.0, 1e9));
+
+    // High-magnitude (1e3) audio with normal variance still
+    // safe: 1e3 * 1.19e-7 * 5 = 5.96e-4… hmm that fires.
+    // Actually that's a bit inconvenient — let me check: at
+    // magnitude 1000 the SIMD vs scalar error per sample is up
+    // to ~6e-4 in the worst case, so falling back is the
+    // correct call. Real audio doesn't sit at magnitude 1000
+    // so the safe-range threshold (1e4) keeps us well clear in
+    // practice.
+    assert!(simd_path_loses_precision(1e3, 5.0));
   }
 }

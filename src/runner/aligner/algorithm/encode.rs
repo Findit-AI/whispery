@@ -42,14 +42,16 @@ impl LogProbsTV {
   }
 }
 
-// Per-utterance zero-mean unit-variance normalisation lives in
-// `super::normalize` so the bench can pit the scalar and NEON
-// backends against each other directly. The dispatcher there picks
-// the NEON path on aarch64 and the scalar path elsewhere.
-use super::normalize::zero_mean_unit_var_normalize;
-
 /// Run wav2vec2 over `samples_for_aligner` and return per-frame
 /// log-probabilities.
+///
+/// **`samples_for_aligner` must be pre-normalised.** The
+/// silence-aware
+/// [`crate::runner::aligner::algorithm::normalize::normalize_with_silence_mask`]
+/// runs in `Aligner::align` before this function so the silence
+/// mask is preserved through preprocessing — Codex round-14
+/// [high]'s fix moved normalisation up the call stack so masked
+/// regions stay exactly zero in the tensor we feed to ORT.
 ///
 /// The model is expected to take an input named `"input_values"` of
 /// shape `(1, T_samples)` and return logits of shape `(1, T_frames,
@@ -89,29 +91,20 @@ pub(crate) fn encode_log_softmax(
   // for the rationale.
   reject_non_finite_input(samples_for_aligner, language)?;
 
-  // wav2vec2-base-960h's preprocessor sets `do_normalize=true`,
-  // i.e., the model expects zero-mean unit-variance audio. Real
-  // recordings carry gain and DC offset — feeding raw f32 PCM
-  // would degrade the logits and pull Viterbi off the correct
-  // path. Apply the same zero-mean / unit-var normalisation HF's
-  // `Wav2Vec2FeatureExtractor.zero_mean_unit_var_norm` applies.
-  // The mean/var are computed over the (silence-masked)
-  // samples we feed; pure-silence regions contribute 0 to both,
-  // a small bias relative to HF's `attention_mask`-aware
-  // computation but vastly closer than no normalisation.
-  let normalized_samples = zero_mean_unit_var_normalize(samples_for_aligner);
-
   // Build a (1, T) f32 input via ort's `(shape, Vec<T>)` tensor
   // constructor — see the module-level NOTE for why we don't go
-  // through `ndarray::Array2`.
+  // through `ndarray::Array2`. Caller is responsible for the
+  // zero-mean / unit-var normalisation (silence-aware variant in
+  // `Aligner::align`); the input here goes straight to ORT.
   let input_shape: [i64; 2] = [1, t_samples as i64];
-  let input_tensor = Tensor::from_array((input_shape, normalized_samples)).map_err(|e| {
-    WorkFailure::AlignmentFailed {
-      kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!("Tensor::from_array failed: {e:?}"),
-      language: language.clone(),
-    }
-  })?;
+  let input_tensor =
+    Tensor::from_array((input_shape, samples_for_aligner.to_vec())).map_err(|e| {
+      WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!("Tensor::from_array failed: {e:?}"),
+        language: language.clone(),
+      }
+    })?;
 
   // Most wav2vec2 ONNX exports use the input name "input_values".
   // If the export uses a different name, surface a clear error.
@@ -290,49 +283,10 @@ mod tests {
     assert_eq!(lp.at(1, 2), -6.0);
   }
 
-  /// Adversarial regression for the wav2vec2 preprocessing
-  /// finding: feeding raw audio with gain / DC offset to the
-  /// model degrades logits. After normalisation the output
-  /// should have mean ≈ 0 and variance ≈ 1.
-  #[test]
-  fn normalize_centres_and_scales_to_unit_variance() {
-    // Synthetic sinusoid + DC offset + gain. After normalisation
-    // the absolute amplitude / offset must wash out.
-    let n = 1600;
-    let mut samples = Vec::with_capacity(n);
-    for i in 0..n {
-      let t = i as f32 / 16_000.0;
-      // 100 Hz tone, gain 5.0, DC offset 0.3.
-      samples.push(5.0 * (2.0 * core::f32::consts::PI * 100.0 * t).sin() + 0.3);
-    }
-    let normed = zero_mean_unit_var_normalize(&samples);
-    let mean: f64 = normed.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
-    let var: f64 = normed
-      .iter()
-      .map(|&x| (x as f64 - mean).powi(2))
-      .sum::<f64>()
-      / n as f64;
-    assert!(mean.abs() < 1e-5, "mean must be ~0; got {mean}");
-    assert!((var - 1.0).abs() < 1e-3, "variance must be ~1; got {var}");
-  }
-
-  #[test]
-  fn normalize_handles_empty_and_constant_signals() {
-    // Empty input is a degenerate case but not a panic.
-    assert!(zero_mean_unit_var_normalize(&[]).is_empty());
-
-    // All-zero input: mean = 0, var = 0 → output stays at 0
-    // (within the eps regularisation, the result is 0/sqrt(eps)
-    // which is exactly 0). This matters for pure-silence
-    // chunks after silence-masking.
-    let zeros = alloc::vec![0.0_f32; 100];
-    let normed = zero_mean_unit_var_normalize(&zeros);
-    assert_eq!(normed.len(), 100);
-    assert!(normed.iter().all(|&x| x == 0.0));
-
-    // All-constant input: mean = c, var = 0 → output ~ 0.
-    let const_signal = alloc::vec![3.7_f32; 100];
-    let normed = zero_mean_unit_var_normalize(&const_signal);
-    assert!(normed.iter().all(|&x| x.abs() < 1e-3));
-  }
+  // Note: the centring / scale and empty-input behaviour tests
+  // moved to `super::normalize::tests` after Codex round-14
+  // pulled normalisation up the call stack into `Aligner::align`.
+  // `encode_log_softmax` no longer normalises, so its tests
+  // here cover only the reductions and the input-validation
+  // boundary it does still own.
 }

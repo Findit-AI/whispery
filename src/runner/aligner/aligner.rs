@@ -199,7 +199,6 @@ impl Aligner {
       runner::aligner::algorithm::{
         compose::{build_speech_frames, compose_words},
         encode::encode_log_softmax,
-        silence_mask::build_masked_samples,
         tokenize::tokenize_with_word_map,
         viterbi::ctc_viterbi,
       },
@@ -226,44 +225,31 @@ impl Aligner {
       return Err(timed_out());
     }
 
-    // Step 0: silence-mask non-speech regions.
-    // The output_range_to_chunk_local closure converts an
-    // output-timebase TimeRange to chunk-local 16 kHz indices.
-    // We use samples_to_output_range as our bridge: invert it
-    // by converting (range.start_pts, range.end_pts) back to
-    // chunk-local sample offsets via the chunk_first_sample
-    // offset.
+    // Step 0: silence-aware preprocessing.
     //
-    // Actually: the worker stage already converts sub_segment
-    // TimeRanges into the output timebase from Plan A's
-    // ExtractedChunk; the inversion at this layer is identical
-    // to the conversion the worker did. We accept TimeRanges
-    // here and the worker passes a closure that does the
-    // chunk-local conversion (Task 21 wires this).
-    //
-    // For the v1 pipeline, the closure is constructed by the
-    // alignment worker (run_one_alignment in Task 18); the
-    // signature here takes a Fn(TimeRange) -> (u64, u64) but
-    // we don't have it as a parameter. The pragmatic approach:
-    // the worker pre-converts sub_segments to chunk-local
-    // (start_sample, end_sample) pairs and passes those in
-    // place of TimeRanges. We change the signature to take
-    // pre-converted ranges to avoid a redundant closure.
-    //
-    // Rather than introducing a fourth closure parameter, we
-    // build the mask directly from sub_segments expressed in
-    // sample space. Caller (worker) is responsible for
-    // expressing sub_segments in chunk-local 16 kHz indices.
-    // To keep the public Aligner::align contract honest,
-    // sub_segments is documented as "chunk-local sample
-    // ranges, not output-timebase TimeRanges" — see the
-    // worker's run_one_alignment (Task 18) for the conversion.
-    let masked = build_masked_samples(samples, sub_segments, |seg| {
-      // `seg` is documented as carrying chunk-local 16 kHz
-      // sample indices in its PTS units. Caller builds the
-      // ranges with a tb of (1/16000) so PTS == sample idx.
-      (seg.start_pts() as u64, seg.end_pts() as u64)
-    });
+    // The chunk-local sub_segments come in as `TimeRange`s in a
+    // 1/16 kHz timebase, so `start_pts()` / `end_pts()` are
+    // chunk-local sample indices. Build a per-sample boolean
+    // speech mask for the silence-aware normaliser; once that
+    // returns the buffer it's already been (1) normalised over
+    // speech samples only and (2) zeroed at non-speech
+    // positions, so the silence-mask invariant survives all the
+    // way to ORT. Codex round-14 [high]: pre-fix this was two
+    // steps — `build_masked_samples` then a non-mask-aware
+    // normalise inside `encode_log_softmax`. The intermediate
+    // zeros got mean-shifted by the normaliser, so masked
+    // regions became `(0 - mean) / std` ≠ 0 by the time they
+    // reached the model.
+    let mut speech_mask = alloc::vec![false; samples.len()];
+    for &seg in sub_segments {
+      let start = (seg.start_pts() as u64 as usize).min(samples.len());
+      let end = (seg.end_pts() as u64 as usize).min(samples.len());
+      if end > start {
+        for slot in &mut speech_mask[start..end] {
+          *slot = true;
+        }
+      }
+    }
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
@@ -340,7 +326,23 @@ impl Aligner {
     // post-encode `abort_flag` check below catches the watchdog's
     // race-window cases (terminate fired, run already returning
     // success).
-    let log_probs = encode_log_softmax(&mut self.session, &masked, run_options, &self.language)?;
+    //
+    // The samples we hand to ORT have already gone through the
+    // silence-aware normaliser above — `encode_log_softmax`
+    // expects pre-normalised input. (Codex round-14 [high]: the
+    // pre-fix internal-normalise inside `encode_log_softmax`
+    // broke the silence mask.)
+    let normalized_samples =
+      crate::runner::aligner::algorithm::normalize::normalize_with_silence_mask(
+        samples,
+        &speech_mask,
+      );
+    let log_probs = encode_log_softmax(
+      &mut self.session,
+      &normalized_samples,
+      run_options,
+      &self.language,
+    )?;
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
