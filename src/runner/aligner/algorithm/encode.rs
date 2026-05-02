@@ -154,22 +154,67 @@ pub(crate) fn encode_log_softmax(
     });
   }
 
-  // Log-softmax over V.
+  // Codex round-17 [high]: validate logits + log-softmax for
+  // finiteness. See `log_softmax_with_finite_guard`.
+  let data = log_softmax_with_finite_guard(raw, t, v, language)?;
+  Ok(LogProbsTV { t, v, data })
+}
+
+/// Compute row-major `(T, V)` log-softmax of `raw` with a fatal
+/// finiteness guard.
+///
+/// Codex round-17 [high]: pre-fix a NaN / ±inf in any logit
+/// produced a NaN row in the output; Viterbi then computed a
+/// non-finite final `dp_prev` and surfaced `NoAlignmentPath`,
+/// which the alignment pool classifies as recoverable per
+/// round-16 — silently swallowing a backend numeric failure
+/// (model export bug, GPU / ORT regression, NaN propagation
+/// from upstream) as "no words". This helper checks each row's
+/// input and the resulting `log_z`; either non-finite returns
+/// `ModelInferenceFailed` so the runner emits `Event::Error`
+/// and the operator learns about the broken backend.
+///
+/// Pulled out of the public `encode_log_softmax` body so unit
+/// tests can exercise the rejection paths without a `Session`.
+pub(crate) fn log_softmax_with_finite_guard(
+  raw: &[f32],
+  t: usize,
+  v: usize,
+  language: &Lang,
+) -> Result<Vec<f32>, WorkFailure> {
   let mut data = Vec::with_capacity(t * v);
   for t_idx in 0..t {
     let row = &raw[t_idx * v..(t_idx + 1) * v];
+    if let Some(bad_v) = row.iter().position(|x| !x.is_finite()) {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!(
+          "ORT returned non-finite logit at frame {t_idx}, vocab {bad_v}: {}",
+          row[bad_v]
+        ),
+        language: language.clone(),
+      });
+    }
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0_f64;
     for &x in row {
       sum += ((x - max) as f64).exp();
     }
     let log_z = max + (sum.ln() as f32);
+    if !log_z.is_finite() {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!(
+          "log-softmax normaliser non-finite at frame {t_idx}: log_z={log_z}, max={max}, sum={sum}"
+        ),
+        language: language.clone(),
+      });
+    }
     for &x in row {
       data.push(x - log_z);
     }
   }
-
-  Ok(LogProbsTV { t, v, data })
+  Ok(data)
 }
 
 /// Reject non-finite (NaN / ±inf) samples before any audio
@@ -281,6 +326,88 @@ mod tests {
     assert_eq!(lp.at(0, 2), -3.0);
     assert_eq!(lp.at(1, 0), -4.0);
     assert_eq!(lp.at(1, 2), -6.0);
+  }
+
+  /// Codex round-17 [high]: NaN logits from a broken backend
+  /// must surface as fatal `ModelInferenceFailed`, not get
+  /// swallowed into NaN log-probs that Viterbi later
+  /// classifies as `NoAlignmentPath` (round-16 recoverable).
+  #[test]
+  fn log_softmax_rejects_nan_logits_with_model_inference_failed() {
+    use crate::types::Lang;
+    let raw = alloc::vec![0.0_f32, f32::NAN, 0.0]; // 1×3
+    let err = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).unwrap_err();
+    match err {
+      WorkFailure::AlignmentFailed { kind, message, .. } => {
+        assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+        assert!(
+          message.contains("non-finite logit"),
+          "message must call out the non-finite logit; got {message:?}"
+        );
+        assert!(message.contains("frame 0"));
+        assert!(message.contains("vocab 1"));
+      }
+      other => panic!("expected AlignmentFailed; got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn log_softmax_rejects_positive_infinity_logits() {
+    use crate::types::Lang;
+    let raw = alloc::vec![0.0_f32, f32::INFINITY, 0.0];
+    assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
+  }
+
+  #[test]
+  fn log_softmax_rejects_negative_infinity_logits() {
+    use crate::types::Lang;
+    let raw = alloc::vec![f32::NEG_INFINITY, 0.0, 0.0];
+    assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
+  }
+
+  /// All-`-inf` row passes the per-element finiteness check
+  /// (each element IS finite under f32::is_finite for normal
+  /// numbers, but NEG_INFINITY is not finite — let me re-check).
+  /// `f32::NEG_INFINITY.is_finite()` returns false, so this
+  /// fails at the per-element check. Document that path:
+  /// even pathological all-inf rows surface as
+  /// `ModelInferenceFailed`.
+  #[test]
+  fn log_softmax_rejects_all_neg_infinity_row() {
+    use crate::types::Lang;
+    let raw = alloc::vec![f32::NEG_INFINITY; 3];
+    assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
+  }
+
+  /// Sanity: a finite, well-behaved row produces a finite
+  /// log-softmax row that sums to 1 in linear space.
+  #[test]
+  fn log_softmax_finite_input_roundtrips() {
+    use crate::types::Lang;
+    let raw = alloc::vec![1.0_f32, 2.0, 3.0];
+    let out = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).expect("ok");
+    assert_eq!(out.len(), 3);
+    assert!(out.iter().all(|x| x.is_finite()));
+    let sum: f32 = out.iter().map(|x| x.exp()).sum();
+    assert!((sum - 1.0).abs() < 1e-5);
+  }
+
+  /// Multi-frame: a NaN in frame 2 surfaces with `frame 2` in
+  /// the message. Locks in that the frame index is precise
+  /// (helpful for debugging upstream backend issues).
+  #[test]
+  fn log_softmax_locates_nan_to_specific_frame() {
+    use crate::types::Lang;
+    // 3 frames × 2 vocab; frame 2's first element is NaN.
+    let raw = alloc::vec![0.0_f32, 0.1, 0.0, 0.1, f32::NAN, 0.1];
+    let err = log_softmax_with_finite_guard(&raw, 3, 2, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(
+      message.contains("frame 2"),
+      "must locate the bad frame; got {message:?}"
+    );
   }
 
   // Note: the centring / scale and empty-input behaviour tests
