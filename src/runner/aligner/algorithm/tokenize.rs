@@ -46,17 +46,25 @@ pub(crate) struct TokenizedText {
 /// producing a CTC graph that cannot meaningfully align word
 /// boundaries — the bug that motivated this parameter.
 ///
-/// `unk_token_id`, when supplied, is used to **skip individual
-/// out-of-vocab characters** rather than fail the whole chunk.
-/// Real-world Whisper output regularly contains punctuation the
-/// CTC vocab can't cover (`U.S.A.`, `1,000`, emojis, smart
-/// quotes). Per-character skipping means `U.S.A.` encodes to the
-/// three letter ids and aligns USA correctly while the original
-/// surface form `U.S.A.` is preserved on the emitted `Word`. A
-/// word whose every character maps to `<unk>` (digits inside an
-/// uppercase-only English vocab, say) contributes zero tokens —
-/// it has no entry in `word_idx_per_token`, so `compose_words`
-/// later drops it from the output without a `Word`.
+/// `unk_token_id`, when supplied, is used to **detect
+/// out-of-vocab characters and drop the whole word** rather
+/// than fail the whole chunk. Whitelisted unspoken punctuation
+/// (currently just internal `.`) is pre-stripped from the word
+/// before encoding — `U.S.A.` becomes `USA` and aligns
+/// correctly with the original surface form preserved on the
+/// emitted `Word`. *After* that strip, any remaining `<unk>`
+/// in the encoded ids represents a *semantic* OOV character
+/// the model can't align (a digit in a letters-only vocab, an
+/// `&` in `AT&T`, an accented letter against an ASCII-only
+/// vocab). The whole word's group is set to empty in that
+/// case, so the word never appears in `word_idx_per_token` and
+/// `compose_words` drops it from the output. Pre-fix the
+/// tokenizer dropped `<unk>` ids one by one, keeping the
+/// in-vocab subset and emitting a `Word` whose `text` was the
+/// full original surface (`A1` / `B2B` / `AT&T` / `café`)
+/// while the timing range covered only the in-vocab letters
+/// — search/highlighting consumers would land on the wrong
+/// audio.
 ///
 /// **Empty result is `Ok`, not `Err`.** A chunk like `"1000"`
 /// against an A-Z vocab maps every character to `<unk>` and
@@ -69,6 +77,21 @@ pub(crate) struct TokenizedText {
 /// Returns `WorkFailure::AlignmentFailed { kind: TokenizationFailed,
 /// .. }` only on a true tokeniser failure (an `encode` error or a
 /// `word_count` mismatch).
+/// Internal punctuation that's never pronounced as a separate
+/// sound and is safe to strip before encoding so the
+/// surrounding letters still align. Currently just the period:
+/// `U.S.A.`, `D.C.`, `etc.` are pronounced as their letters.
+///
+/// Other in-word punctuation either belongs in the vocab
+/// (apostrophe — `don't`, `we're`) or is a semantic character
+/// the model legitimately can't align (`&` in `AT&T`, digits
+/// in `B2B` against a letters-only vocab, accented characters
+/// against an ASCII-only vocab); those are caught by the
+/// post-encode `<unk>` check and drop the whole word.
+fn is_skippable_internal_punct(c: char) -> bool {
+  c == '.'
+}
+
 pub(crate) fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
   normalized: &str,
@@ -107,10 +130,27 @@ pub(crate) fn tokenize_with_word_map(
   // words.
   let mut per_word_tokens: Vec<Vec<u32>> = Vec::with_capacity(words.len());
   for word in &words {
-    let encode_input: Cow<'_, str> = if uppercase_input {
-      Cow::Owned(word.to_ascii_uppercase())
+    // Pre-strip whitelisted internal punctuation that's never
+    // spoken (currently just `.` for abbreviations like
+    // `U.S.A.`). Anything not on the whitelist either belongs
+    // in the vocab (apostrophe in contractions) or is a
+    // semantic character the model legitimately can't align —
+    // those go through the encoder as-is.
+    let needs_strip = word.contains(is_skippable_internal_punct);
+    let stripped: Cow<'_, str> = if needs_strip {
+      Cow::Owned(
+        word
+          .chars()
+          .filter(|c| !is_skippable_internal_punct(*c))
+          .collect(),
+      )
     } else {
       Cow::Borrowed(*word)
+    };
+    let encode_input: Cow<'_, str> = if uppercase_input {
+      Cow::Owned(stripped.to_ascii_uppercase())
+    } else {
+      stripped
     };
     let encoding = tokenizer
       .encode(encode_input.as_ref(), /* add_special_tokens = */ false)
@@ -119,19 +159,22 @@ pub(crate) fn tokenize_with_word_map(
         message: alloc::format!("encode({:?}) failed: {e:?}", word),
         language: language.clone(),
       })?;
-    let mut group: Vec<u32> = Vec::with_capacity(encoding.get_ids().len());
-    for &id in encoding.get_ids() {
-      // Per-character <unk>-skip. Individual chars that fall
-      // outside the vocab (an internal `.` in `U.S.A.`, a digit
-      // in a letters-only model, an emoji) are dropped here so
-      // the rest of the word still aligns.
-      if let Some(unk) = unk_token_id
-        && id == unk
-      {
-        continue;
-      }
-      group.push(id);
-    }
+    // Semantic-OOV check: if any encoded id is `<unk>` after
+    // the whitelist strip, the word has at least one character
+    // the model can't align. Dropping the *entire* word's
+    // group (rather than dropping individual `<unk>` ids and
+    // keeping the partial alignment) prevents emitting a
+    // `Word` whose `text` is the full surface form but whose
+    // timing range covers only the in-vocab subset.
+    let has_semantic_oov = match unk_token_id {
+      Some(unk) => encoding.get_ids().iter().any(|&id| id == unk),
+      None => false,
+    };
+    let group: Vec<u32> = if has_semantic_oov {
+      Vec::new()
+    } else {
+      encoding.get_ids().to_vec()
+    };
     per_word_tokens.push(group);
   }
 
@@ -350,6 +393,97 @@ mod tests {
     assert_eq!(result.token_ids, expected.to_vec());
     // All three letters tag word 0 (the abbreviation).
     assert_eq!(result.word_idx_per_token, alloc::vec![Some(0); 3]);
+  }
+
+  /// Partial-OOV alphanumeric word: `B2B` against the
+  /// uppercase-only vocab encodes `B 2 B`. Pre-fix the digit's
+  /// `<unk>` was dropped per-id and the remaining `[B, B]`
+  /// passed through with `word_idx=0` — `compose_words` then
+  /// emitted `Word { text: "B2B", range: covers two B's only }`,
+  /// which lands the consumer's highlight on the wrong audio.
+  /// Now the whole word's group is empty, so the word never
+  /// reaches `compose_words` and no misleading `Word` ships.
+  /// The chunk's `Transcript.text` still contains `B2B`.
+  #[test]
+  fn partial_oov_alphanumeric_word_drops_whole_alignment() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    let result = tokenize_with_word_map(&tok, "B2B", 1, true, true, unk, &Lang::En).expect("ok");
+    assert!(
+      result.token_ids.is_empty(),
+      "B2B has a semantic OOV (`2`); whole word must drop, not align lossy [B, B]; got {:?}",
+      result.token_ids
+    );
+    assert!(result.word_idx_per_token.is_empty());
+  }
+
+  /// Partial-OOV with a non-alphanumeric semantic char: `AT&T`
+  /// has the ampersand pronounced as "and". Old behaviour was
+  /// to drop the `&` and align `[A, T, T]` under text `AT&T`
+  /// — wrong audio range. New behaviour drops the whole word.
+  #[test]
+  fn partial_oov_ampersand_word_drops_whole_alignment() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    let result = tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &Lang::En).expect("ok");
+    assert!(
+      result.token_ids.is_empty(),
+      "AT&T has a semantic OOV (`&`); whole word must drop; got {:?}",
+      result.token_ids
+    );
+  }
+
+  /// Partial-OOV accented word: `café` against the ASCII-only
+  /// vocab encodes `C A F É`. The accented `É` is a real
+  /// pronounced character, not unspoken punctuation, so the
+  /// whole word drops rather than align as `[C, A, F]` under
+  /// text `café`.
+  #[test]
+  fn partial_oov_accented_word_drops_whole_alignment() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+
+    let result = tokenize_with_word_map(&tok, "café", 1, true, true, unk, &Lang::En).expect("ok");
+    assert!(
+      result.token_ids.is_empty(),
+      "`café` has a semantic OOV (`é`); whole word must drop; got {:?}",
+      result.token_ids
+    );
+  }
+
+  /// Mixed sentence: a partial-OOV word in the middle drops,
+  /// but the surrounding all-in-vocab words keep their
+  /// alignment and the inter-word `|` separates them
+  /// correctly (no orphan delimiter for the dropped word's
+  /// position).
+  #[test]
+  fn partial_oov_word_in_middle_doesnt_corrupt_neighbors() {
+    let tok = uppercase_tokenizer();
+    let unk = tok.token_to_id("<unk>");
+    let pipe = tok.token_to_id("|").unwrap();
+
+    let result =
+      tokenize_with_word_map(&tok, "hi B2B end", 3, true, true, unk, &Lang::En).expect("ok");
+
+    // word 0 = "hi" → [H, I]
+    // word 1 = "B2B" → empty (semantic OOV)
+    // word 2 = "end" → [E, N, D]
+    // Separator: only one `|` between hi and end (B2B's
+    // empty group must not leave an orphan delimiter).
+    let pipe_count = result.token_ids.iter().filter(|&&id| id == pipe).count();
+    assert_eq!(
+      pipe_count, 1,
+      "exactly one `|` between the two non-empty groups; got {pipe_count} in {:?}",
+      result.token_ids
+    );
+    // word 1 ("B2B") must not appear in word_idx_per_token.
+    assert!(
+      result.word_idx_per_token.iter().all(|w| *w != Some(1)),
+      "B2B (word 1) must contribute zero tokens; got {:?}",
+      result.word_idx_per_token
+    );
   }
 
   /// Leading all-OOV word: the orphan-delimiter fix makes sure
