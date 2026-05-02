@@ -139,6 +139,42 @@ fn accumulate_per_word(
     }
   }
 
+  // Codex round-16 [high]: the per-frame skip in the loop above
+  // keeps non-speech frames out of the score sum and frame
+  // count, but the accumulator's `[start_frame, end_frame)`
+  // span uses the FIRST and LAST contributing frame indices
+  // — silence frames that fall inside a word's span leak into
+  // the emitted `Word.range`. CTC monotonicity puts a single
+  // word's tokens in a contiguous lattice run, but masked
+  // silence inside that run is real audio the user marked as
+  // non-speech, so the word's range musn't span it.
+  //
+  // Post-pass: drop any word whose `[start, end)` covers a
+  // non-speech frame. Splitting the word into two ranges would
+  // be more informative but tougher to spec — both halves would
+  // share the same surface form; downstream consumers that
+  // expect at most one Word per normalised-word index would
+  // need updates. Dropping is conservative and matches the
+  // existing "no audio support → drop" contract.
+  for slot in per_word.iter_mut() {
+    if let Some(accum) = slot {
+      let start = accum.start_frame as usize;
+      let end = accum.end_frame as usize;
+      // `speech_frames` may be shorter than `path.state_per_frame`
+      // if the caller built the mask differently; treat the
+      // out-of-range tail as speech (already-existing convention
+      // on the per-frame skip). The realistic case is the lengths
+      // match exactly.
+      let crosses_silence = speech_frames
+        .get(start..end)
+        .map(|s| s.iter().any(|&b| !b))
+        .unwrap_or(false);
+      if crosses_silence {
+        *slot = None;
+      }
+    }
+  }
+
   per_word
 }
 
@@ -395,6 +431,71 @@ mod tests {
     );
     assert_eq!(result.words().len(), 1);
     assert_eq!(result.words()[0].text(), "hello");
+  }
+
+  /// Codex round-16 [high]: a word whose CTC span crosses a
+  /// silence-masked frame must be dropped — the score
+  /// reduction already excludes the silent frame, but the
+  /// emitted range used to span it.
+  ///
+  /// Path: word 0's token (state 1) emits at frames 0 and 4,
+  /// with frame 2 masked silent (frames 1 and 3 are blank).
+  /// Pre-fix the word's range was [0, 5); post-fix it drops
+  /// because [0, 5) covers the silent frame.
+  #[test]
+  fn word_spanning_silent_frame_is_dropped() {
+    // states: [y_0, blank, y_0, blank, y_0]
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![1, 0, 1, 0, 1],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(5, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("hello")];
+    // Speech at 0,1,3,4; silence at 2 (inside the word's span).
+    let speech_frames = alloc::vec![true, true, false, true, true];
+
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+    );
+    assert!(
+      result.words().is_empty(),
+      "word whose [start, end) spans a silent frame must drop; got {:?}",
+      result.words()
+    );
+  }
+
+  /// Companion: same path, no silence in the middle. Word
+  /// emits normally with span [0, 5).
+  #[test]
+  fn word_with_only_blanks_in_span_emits_normally() {
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![1, 0, 1, 0, 1],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(5, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("hello")];
+    let speech_frames = alloc::vec![true; 5]; // no silence
+
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      fake_samples_to_output_range,
+    );
+    assert_eq!(result.words().len(), 1);
   }
 
   #[test]

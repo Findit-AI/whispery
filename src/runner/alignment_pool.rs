@@ -282,21 +282,53 @@ fn run_one_alignment(
 /// (recoverable, ASR text preserved) vs fatal (event surfaces as
 /// `Event::Error`).
 ///
-/// Recoverable: anything the alignment compute legitimately
-/// gives up on — `AlignmentFailed { kind: NoAlignmentPath, .. }`
-/// from a too-short chunk or budget overflow,
-/// `TokenizationFailed` from upstream model/tokenizer skew,
-/// `ModelInferenceFailed` from a stuck graph, etc. Codex
-/// round-15 [high] flagged that these were dropping the ASR
-/// transcript.
+/// Codex round-16 [high] tightened this from "any
+/// `AlignmentFailed` is recoverable" to a per-`AlignmentFailureKind`
+/// classification. Backend / configuration failures must
+/// propagate so the caller learns about a broken setup —
+/// silently emitting empty alignments forever would mask a real
+/// problem.
 ///
-/// Fatal: `WorkerHangTimeout` (liveness — the worker thread or
-/// ORT graph misbehaved), `AsrFailed` (logically impossible on
-/// the alignment path; treat as a bug), and
-/// `LanguageUnsupportedForAlignment` (a configured-by-policy
-/// rejection from `AlignmentFallback::Error`).
+/// Recoverable (return empty `AlignmentResult`, preserve ASR
+/// text):
+///
+/// - `AlignmentFailed { kind: NoAlignmentPath, .. }` — viterbi
+///   gave up because of a too-short chunk, lattice budget
+///   overflow, or no finite path. Data-dependent.
+/// - `AlignmentFailed { kind: EmptyText, .. }` — empty
+///   normalisation. Already handled upstream in `Aligner::align`
+///   via the `NormalizationError::EmptyText` short-circuit, so
+///   this branch is defence in depth; if it ever fires we
+///   still want the ASR text preserved.
+///
+/// Fatal (propagate as `Event::Error`):
+///
+/// - `AlignmentFailed { kind: ModelInferenceFailed, .. }` — ORT
+///   error, non-finite samples, output shape mismatch, or
+///   blank-id-out-of-vocab. These point at a broken backend or
+///   model/tokenizer skew the caller needs to know about.
+/// - `AlignmentFailed { kind: TokenizationFailed, .. }` —
+///   tokenizer's `encode` errored, word_count mismatched the
+///   normaliser, or a token id was out of model vocab. Indicates
+///   a normaliser or tokenizer bug that won't go away on retry.
+/// - `AlignmentFailed { kind: NormalizationFailed, .. }` —
+///   `NormalizationError::RuleFailed` from the language
+///   normaliser. Indicates a normaliser bug, not a per-chunk
+///   miss.
+/// - `WorkerHangTimeout` — liveness; worker thread or ORT graph
+///   misbehaved.
+/// - `LanguageUnsupportedForAlignment` — opt-in
+///   `AlignmentFallback::Error` policy on registry miss.
+/// - `AsrFailed` — logically impossible on the alignment path;
+///   surface as a bug rather than swallow.
 fn alignment_failure_is_recoverable(failure: &WorkFailure) -> bool {
-  matches!(failure, WorkFailure::AlignmentFailed { .. })
+  matches!(
+    failure,
+    WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::NoAlignmentPath | AlignmentFailureKind::EmptyText,
+      ..
+    }
+  )
 }
 
 /// Lock the per-language `Mutex<Aligner>` and run the 8-step
@@ -360,22 +392,19 @@ mod tests {
     assert_send::<crossbeam_channel::Receiver<AlignResultMsg>>();
   }
 
-  /// Codex round-15 [high]: every flavour of `AlignmentFailed`
-  /// is best-effort and must NOT discard the cached ASR
-  /// transcript. The `run_one_alignment` path converts these to
-  /// `Ok(AlignmentResult::new(vec![]))` before the runner sees
-  /// them.
+  /// Codex round-16 [high]: only data-dependent alignment
+  /// failures preserve the ASR transcript. Backend / config
+  /// kinds (`ModelInferenceFailed` / `TokenizationFailed` /
+  /// `NormalizationFailed`) propagate as `Event::Error` so the
+  /// caller can detect a broken setup.
   #[test]
-  fn alignment_failed_kinds_are_recoverable() {
+  fn data_dependent_failures_are_recoverable() {
     use crate::types::AlignmentFailureKind;
-    let kinds = [
+    let recoverable = [
       AlignmentFailureKind::NoAlignmentPath,
-      AlignmentFailureKind::TokenizationFailed,
-      AlignmentFailureKind::ModelInferenceFailed,
-      AlignmentFailureKind::NormalizationFailed,
       AlignmentFailureKind::EmptyText,
     ];
-    for kind in kinds {
+    for kind in recoverable {
       let f = WorkFailure::AlignmentFailed {
         kind,
         message: alloc::string::String::new(),
@@ -383,17 +412,40 @@ mod tests {
       };
       assert!(
         alignment_failure_is_recoverable(&f),
-        "{kind:?} must be best-effort to preserve ASR text",
+        "{kind:?} must preserve ASR text",
       );
     }
   }
 
-  /// Liveness / configuration failures stay fatal. The runner
-  /// drops the ASR result and surfaces `Event::Error` for
-  /// these because they signal a worker or registry problem,
-  /// not a "couldn't compute alignment" outcome.
+  /// Backend / configuration alignment failures must stay
+  /// fatal. Pre-fix these were being silently swallowed into
+  /// `Ok(empty)`, masking broken backends.
   #[test]
-  fn liveness_and_config_failures_stay_fatal() {
+  fn backend_alignment_failures_stay_fatal() {
+    use crate::types::AlignmentFailureKind;
+    let fatal = [
+      AlignmentFailureKind::ModelInferenceFailed,
+      AlignmentFailureKind::TokenizationFailed,
+      AlignmentFailureKind::NormalizationFailed,
+    ];
+    for kind in fatal {
+      let f = WorkFailure::AlignmentFailed {
+        kind,
+        message: alloc::string::String::new(),
+        language: crate::types::Lang::En,
+      };
+      assert!(
+        !alignment_failure_is_recoverable(&f),
+        "{kind:?} signals a backend/config bug; must propagate",
+      );
+    }
+  }
+
+  /// Liveness / registry failures stay fatal. These signal a
+  /// worker or registry problem, not a "couldn't compute
+  /// alignment" outcome.
+  #[test]
+  fn liveness_and_registry_failures_stay_fatal() {
     use core::time::Duration;
 
     use crate::types::{AsrFailureKind, Lang, WorkerKind};

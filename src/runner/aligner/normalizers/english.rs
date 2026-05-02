@@ -105,6 +105,7 @@ fn is_word_punct(c: char) -> bool {
             | ';'
             | ':'
             | '"'
+            | '\'' // ASCII apostrophe — see comment below
             | '('
             | ')'
             | '['
@@ -120,6 +121,17 @@ fn is_word_punct(c: char) -> bool {
             | '\u{2019}' // right single quote
   )
 }
+
+// Note on ASCII `'` boundary handling: `is_word_punct` includes
+// `'`, but `strip_word_punct` only trims leading/trailing matches
+// (`trim_start_matches` / `trim_end_matches`). Internal apostrophes
+// inside contractions like `don't` survive the trim and trigger
+// the contraction-expansion table downstream — that's the desired
+// behaviour. Codex round-16 [medium] flagged that the previous
+// list omitted ASCII `'` entirely, so quoted text like `'hello'`
+// kept the surrounding apostrophes in the normalised string;
+// wav2vec2's tokeniser then forced unspoken apostrophe states
+// into the CTC graph, stealing frames from real-word states.
 
 fn strip_word_punct(s: &str) -> &str {
   let trimmed_left = s.trim_start_matches(is_word_punct);
@@ -303,6 +315,46 @@ mod tests {
     // "O'Brien" is not in CONTRACTIONS; lowercased pass-through
     // preserves the apostrophe in the normalised form.
     assert_eq!(nt.normalized(), "o'brien rocks");
+  }
+
+  /// Codex round-16 [medium]: quoted text like `'hello'` must
+  /// have its surrounding apostrophes stripped at boundaries so
+  /// the wav2vec2 tokeniser doesn't inject unspoken apostrophe
+  /// states into the CTC graph. Internal apostrophes inside
+  /// contractions / proper nouns must still survive.
+  #[test]
+  fn boundary_ascii_apostrophes_are_stripped() {
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("'hello'").unwrap();
+    assert_eq!(nt.normalized(), "hello");
+    // Surface form preservation is unchanged: original_words[0]
+    // still carries the input verbatim.
+    assert_eq!(nt.original_words()[0], "'hello'");
+  }
+
+  /// Quoted contraction: leading/trailing `'` strips, but the
+  /// internal one survives long enough to trigger the
+  /// contraction-expansion table.
+  #[test]
+  fn boundary_apostrophe_around_contraction_keeps_internal() {
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("'don't'").unwrap();
+    assert_eq!(nt.normalized(), "do not");
+    // Both expanded words point back to the same surface slice
+    // (which still has the surrounding quotes — that's what the
+    // user originally typed).
+    assert_eq!(nt.original_words()[0], "'don't'");
+    assert_eq!(nt.original_words()[1], "'don't'");
+  }
+
+  /// Mixed: trailing apostrophe + word + sentence punctuation.
+  /// `dogs'.` (possessive plural) is a realistic case.
+  #[test]
+  fn trailing_possessive_apostrophe_strips() {
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("the dogs'.").unwrap();
+    // "the" and "dogs" — the trailing `'` and `.` both strip.
+    assert_eq!(nt.normalized(), "the dogs");
   }
 
   #[test]
