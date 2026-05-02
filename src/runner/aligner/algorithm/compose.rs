@@ -78,19 +78,31 @@ pub(crate) fn build_speech_frames(
   hop_samples: u32,
   sub_segments: &[mediatime::TimeRange],
 ) -> alloc::vec::Vec<bool> {
-  let mut mask = alloc::vec![false; n_frames];
   if hop_samples == 0 {
-    return mask;
+    return alloc::vec![false; n_frames];
   }
   let hop = hop_samples as i64;
+  // A frame is marked "speech" only if at least half its
+  // `hop_samples` are inside some VAD sub-segment. Pre-fix any
+  // overlap, even 1 sample, promoted the whole frame — a tiny
+  // VAD island inside an otherwise-silent frame let the
+  // post-pass keep CTC-forced words whose ranges covered
+  // mostly zero-masked audio. ≥50 % is the natural threshold
+  // — frames whose majority of samples are silence don't
+  // qualify; frames whose majority is speech do.
+  let min_overlap_samples = hop / 2;
+  let mut overlap_per_frame = alloc::vec![0_i64; n_frames];
   for seg in sub_segments {
     let seg_start = seg.start_pts().max(0);
     let seg_end = seg.end_pts().max(0);
     if seg_end <= seg_start {
       continue;
     }
-    // Frame is "speech" if its sample range [f*hop, (f+1)*hop)
-    // overlaps the segment [seg_start, seg_end).
+    // Iterate every frame that touches the segment and
+    // accumulate the per-frame overlap. Adjacent VAD segments
+    // cumulatively contribute to the same frame, which matches
+    // the spirit of the old "any overlap" rule for cases where
+    // VAD splits a single voiced span across two segments.
     let frame_start = (seg_start / hop) as usize;
     let frame_end = ((seg_end + hop - 1) / hop) as usize;
     let upper = frame_end.min(n_frames);
@@ -98,10 +110,18 @@ pub(crate) fn build_speech_frames(
       continue;
     }
     for f in frame_start..upper {
-      mask[f] = true;
+      let frame_lo = (f as i64) * hop;
+      let frame_hi = frame_lo + hop;
+      let overlap = seg_end.min(frame_hi) - seg_start.max(frame_lo);
+      if overlap > 0 {
+        overlap_per_frame[f] = overlap_per_frame[f].saturating_add(overlap);
+      }
     }
   }
-  mask
+  overlap_per_frame
+    .into_iter()
+    .map(|o| o >= min_overlap_samples)
+    .collect()
 }
 
 /// Walk the Viterbi path and accumulate per-word `(start_frame,
@@ -906,6 +926,73 @@ mod tests {
   fn build_speech_frames_handles_no_segments() {
     let mask = build_speech_frames(4, 320, &[]);
     assert_eq!(mask, alloc::vec![false; 4]);
+  }
+
+  /// A 1-sample VAD island inside an otherwise-silent frame
+  /// must NOT promote the whole frame to speech. Pre-fix any
+  /// overlap was sufficient, so a ≤ 1/320 sliver could let the
+  /// silence-aware post-pass keep CTC-forced words whose
+  /// ranges covered mostly zero-masked audio. Threshold:
+  /// ≥ 50 % sample overlap (= 160 samples at hop=320).
+  #[test]
+  fn build_speech_frames_rejects_sub_threshold_vad_island() {
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    // A 1-sample island at sample 10 inside frame 0.
+    let segs = alloc::vec![TimeRange::new(10, 11, tb_16k)];
+    let mask = build_speech_frames(5, 320, &segs);
+    assert_eq!(mask, alloc::vec![false; 5]);
+  }
+
+  /// Boundary check: a VAD segment covering exactly half a
+  /// frame (`hop_samples / 2 = 160` samples) is at the
+  /// threshold and counts as speech (`>=`). One sample less
+  /// drops the frame.
+  #[test]
+  fn build_speech_frames_threshold_is_inclusive() {
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    // Exactly 160 samples in frame 0.
+    let segs_at = alloc::vec![TimeRange::new(0, 160, tb_16k)];
+    assert_eq!(
+      build_speech_frames(2, 320, &segs_at),
+      alloc::vec![true, false],
+      "exactly 50% overlap is at threshold and must count"
+    );
+    // 159 samples in frame 0 — just under threshold.
+    let segs_under = alloc::vec![TimeRange::new(0, 159, tb_16k)];
+    assert_eq!(
+      build_speech_frames(2, 320, &segs_under),
+      alloc::vec![false, false],
+      "1 sample under threshold must drop the frame"
+    );
+  }
+
+  /// Adjacent VAD segments contribute cumulatively to the same
+  /// frame's overlap. Splits in the VAD output (e.g. a
+  /// breath-between-words gap that VAD reports as two
+  /// 80-sample segments) shouldn't lose the frame just because
+  /// each segment alone is below the threshold.
+  #[test]
+  fn build_speech_frames_accumulates_overlap_across_adjacent_segments() {
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    // Two 80-sample segments inside frame 0 — together = 160.
+    let segs = alloc::vec![
+      TimeRange::new(0, 80, tb_16k),
+      TimeRange::new(160, 240, tb_16k),
+    ];
+    assert_eq!(
+      build_speech_frames(2, 320, &segs),
+      alloc::vec![true, false],
+      "two sub-threshold segments inside one frame must accumulate to clear threshold"
+    );
   }
 
   #[test]

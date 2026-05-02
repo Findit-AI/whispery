@@ -197,7 +197,14 @@ fn run_one_alignment(
   let abort_flag = job.abort_flag.clone();
   let timeout = job.align_timeout;
   let run_options_for_watchdog = run_options.clone();
-  let watchdog = std::thread::Builder::new()
+  // Spawn the watchdog. Under thread / fd / memory exhaustion
+  // the OS can refuse to spawn — we surface that as a fatal
+  // in-band `WorkFailure` rather than panic the only alignment
+  // worker. Running ORT without the watchdog risks the worker
+  // getting stuck on a pathological input with no way to
+  // cancel, so the right action is to fail this job fast and
+  // let the caller see the resource pressure.
+  let watchdog = match std::thread::Builder::new()
     .name("whispery-align-watchdog".into())
     .spawn(move || match cancel_rx.recv_timeout(timeout) {
       Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -211,8 +218,19 @@ fn run_one_alignment(
       Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
         // Cancelled by the worker — clean exit.
       }
-    })
-    .expect("spawn watchdog");
+    }) {
+    Ok(handle) => handle,
+    Err(e) => {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!(
+          "failed to spawn alignment watchdog ({e}); \
+           refusing to run inference without a cancellable timeout"
+        ),
+        language: job.language.clone(),
+      });
+    }
+  };
 
   let started_at = Instant::now();
 

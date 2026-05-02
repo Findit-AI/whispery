@@ -22,13 +22,21 @@ fn english_preserves_punctuation_in_original_words() {
   assert_eq!(originals, vec!["Hello,", "world!"]);
 }
 
+/// Contractions are preserved as a single normalised word with
+/// the apostrophe character intact. wav2vec2-base-960h's vocab
+/// has the `'` glyph (id 27) and was trained on LibriSpeech
+/// transcripts that write `DON'T` directly; expanding to
+/// `do not` would force the CTC graph to insert a `|` word
+/// delimiter the speaker never pronounces, shifting timings
+/// and emitting duplicate `Word.text()` entries that
+/// downstream consumers can't safely dedupe.
 #[test]
-fn contraction_expansion_duplicates_surface() {
+fn contraction_preserved_as_single_word() {
   let n = EnglishNormalizer::new();
   let nt = n.normalize("Don't go.").unwrap();
-  assert_eq!(nt.normalized(), "do not go");
+  assert_eq!(nt.normalized(), "don't go");
   let originals: Vec<&str> = nt.original_words().iter().map(|c| c.as_ref()).collect();
-  assert_eq!(originals, vec!["Don't", "Don't", "go."]);
+  assert_eq!(originals, vec!["Don't", "go."]);
 }
 
 // Special-token skipping is enforced by:
