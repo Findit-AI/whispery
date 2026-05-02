@@ -24,6 +24,49 @@ use crate::{
   types::{AsrFailureKind, ChunkId, Lang, WorkFailure, WorkerKind},
 };
 
+use std::{
+  collections::HashMap,
+  sync::{LazyLock, Mutex},
+};
+
+/// Process-wide intern table for `&'static str` representations of
+/// language codes passed to `whisper-rs`'s `FullParams::set_language`
+/// (which requires the borrow's lifetime to match `FullParams`'s, so
+/// our `FullParams<'static, 'static>` return type forces a `'static`
+/// `&str`).
+///
+/// Codex round-23 [medium]: the prior `Box::leak(Box::<str>::from(s))`
+/// in `full_params_from` allocated a fresh leak on every chunk
+/// attempt — bounded *per call* but unbounded over a long-running
+/// stream. With auto-lock, a 24-hour transcription can leak tens
+/// of thousands of identical `"en"` strings.
+///
+/// This intern table allocates+leaks at most **once per distinct
+/// language code** the process ever sees. Named [`Lang`] variants
+/// (≈ 100) cap the working set; `Lang::Other(...)` adds at most
+/// the cardinality of unknown ISO codes a caller actually feeds in.
+///
+/// `Mutex` over `HashMap` is fine — the lock is held for at most a
+/// hash lookup + a single allocation on first sight; ASR latency
+/// dwarfs that.
+static INTERNED_LANG_STRS: LazyLock<Mutex<HashMap<String, &'static str>>> =
+  LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Return a `&'static str` for `s`, allocating + leaking once per
+/// distinct value. Subsequent calls with the same `s` return the
+/// same pointer — bounded leak, see [`INTERNED_LANG_STRS`].
+fn intern_lang_str(s: &str) -> &'static str {
+  let mut map = INTERNED_LANG_STRS
+    .lock()
+    .expect("INTERNED_LANG_STRS mutex poisoned");
+  if let Some(&interned) = map.get(s) {
+    return interned;
+  }
+  let leaked: &'static str = Box::leak(Box::<str>::from(s));
+  map.insert(s.to_string(), leaked);
+  leaked
+}
+
 /// Configuration for the runner's whisper worker pool.
 ///
 /// Fields are private; use [`WhisperPoolOptions::new`] (or
@@ -365,10 +408,15 @@ pub(super) fn full_params_from(
     // the str into a leaked CString (`CString::into_raw`) inside
     // `set_language`, so the lifetime constraint is purely a
     // type-system requirement — the borrow does not actually
-    // outlive the call. We satisfy it by leaking a small
-    // `Box<str>` (≤ a handful of bytes per language code; the
-    // set of distinct codes is bounded by `Lang`'s variants).
-    let static_lang: &'static str = Box::leak(Box::<str>::from(lang.as_str()));
+    // outlive the call.
+    //
+    // Intern through `INTERNED_LANG_STRS` so we allocate+leak at
+    // most once per distinct language code over the process'
+    // lifetime, regardless of how many chunk attempts the
+    // temperature ladder makes. Codex round-23 [medium] flagged
+    // the per-attempt `Box::leak` as an unbounded leak under
+    // long-running locked-language streams.
+    let static_lang: &'static str = intern_lang_str(lang.as_str());
     p.set_language(Some(static_lang));
   } else {
     p.set_detect_language(true);
@@ -821,6 +869,26 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Codex round-23 [medium]: language-code interning must
+  /// allocate at most once per distinct value. Calling
+  /// `intern_lang_str` twice with the same string returns the
+  /// same `&'static str` pointer; calling with a different
+  /// string returns a different pointer. (The bounded-leak
+  /// invariant — per-attempt `Box::leak` was unbounded.)
+  #[test]
+  fn intern_lang_str_returns_stable_pointer_per_value() {
+    let a1 = intern_lang_str("en");
+    let a2 = intern_lang_str("en");
+    let b = intern_lang_str("zh");
+    assert_eq!(a1, "en");
+    assert_eq!(a2, "en");
+    assert!(
+      core::ptr::eq(a1, a2),
+      "same input must return the same `&'static str`; got distinct pointers"
+    );
+    assert_ne!(a1, b, "distinct inputs must intern to distinct strings");
+  }
 
   #[test]
   fn defaults_round_trip() {

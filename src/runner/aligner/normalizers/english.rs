@@ -127,15 +127,17 @@ impl TextNormalizer for EnglishNormalizer {
       if stripped.is_empty() {
         continue;
       }
-      let lower = lowercase_for_match(stripped);
 
       // Reconstruct the borrowed slice for the original word
       // (without punctuation strip, so Whisper's surface form
-      // is preserved verbatim — punctuation included).
+      // is preserved verbatim — punctuation included). Used
+      // for the no-separator path; the with-separator path
+      // emits per-piece surface slices so each emitted Word
+      // carries its own substring.
       let original_slice: &'a str = &text[word_start..word_start + word.len()];
 
-      // Split on internal separators (`hello-world` →
-      // `["hello", "world"]`). Each piece is a real word the
+      // Split on internal separators (`Hello-World` →
+      // `["Hello", "World"]`). Each piece is a real word the
       // wav2vec2 vocab can encode; without this the literal
       // `-` would survive into the normalised text and the
       // tokeniser's `<unk>` rejection would fail the whole
@@ -143,13 +145,34 @@ impl TextNormalizer for EnglishNormalizer {
       // internal separator, so `don't` stays one piece and
       // aligns as a single word with the `'` character emitted
       // inline by the wav2vec2 tokenizer (Codex round-22).
-      // Multiple pieces share one `original_slice` Cow to keep
-      // the surface-form invariant.
-      for piece in lower.split(is_internal_separator).filter(|p| !p.is_empty()) {
+      //
+      // Codex round-23 [medium]: each piece carries its own
+      // surface span, not the full hyphenated word. Pre-fix
+      // every split piece pointed back to the same
+      // `original_slice`, so `Hello-World` emitted two
+      // `Word.text() == "Hello-World"` entries that downstream
+      // consumers couldn't dedupe (real repeated words also
+      // exist). The split runs over `stripped` (no boundary
+      // punct) so each `piece_orig` is a borrow into the input
+      // text — surface form is preserved per piece.
+      if stripped.contains(is_internal_separator) {
+        for piece_orig in stripped.split(is_internal_separator).filter(|p| !p.is_empty()) {
+          let piece_lower = lowercase_for_match(piece_orig);
+          if !normalized.is_empty() {
+            normalized.push(' ');
+          }
+          normalized.push_str(&piece_lower);
+          original_words.push(Cow::Borrowed(piece_orig));
+        }
+      } else {
+        // No internal separator — the word is one piece.
+        // Preserve the full original_slice (with any
+        // boundary punctuation) for surface-form display.
+        let lower = lowercase_for_match(stripped);
         if !normalized.is_empty() {
           normalized.push(' ');
         }
-        normalized.push_str(piece);
+        normalized.push_str(&lower);
         original_words.push(Cow::Borrowed(original_slice));
       }
     }
@@ -210,17 +233,45 @@ mod tests {
     assert_eq!(nt.original_words()[1], "go.");
   }
 
+  /// Codex round-23 [medium]: em-dash-glued tokens split into
+  /// per-piece surface spans. Pre-fix every piece pointed back
+  /// to the full `hello—world` slice, so the emitted alignment
+  /// would carry two `Word.text() == "hello—world"` entries —
+  /// indistinguishable from a real repetition.
   #[test]
-  fn em_dash_strips_at_word_boundary() {
+  fn em_dash_splits_into_per_piece_surface_spans() {
     let n = EnglishNormalizer::new();
     let nt = n.normalize("hello\u{2014}world").unwrap();
-    // The em dash is in the middle, so split_whitespace doesn't
-    // split it; only edge punctuation strips. The whole token
-    // becomes "hello—world" → "hello—world" lowercased (dash is
-    // not stripped from the middle).
-    // For v1 we accept that internal punctuation is preserved.
-    // Whisper rarely emits em-dash-glued words.
-    assert_eq!(nt.original_words()[0], "hello\u{2014}world");
+    assert_eq!(nt.normalized(), "hello world");
+    assert_eq!(nt.original_words().len(), 2);
+    assert_eq!(nt.original_words()[0], "hello");
+    assert_eq!(nt.original_words()[1], "world");
+  }
+
+  /// Codex round-23 [medium]: hyphen-glued compound. Each piece
+  /// must carry its own surface span — the full `Hello-World`
+  /// would corrupt downstream word indexes / highlights and
+  /// break dedupe semantics.
+  #[test]
+  fn hyphen_compound_splits_into_per_piece_surface_spans() {
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("Hello-World").unwrap();
+    assert_eq!(nt.normalized(), "hello world");
+    assert_eq!(nt.original_words().len(), 2);
+    assert_eq!(nt.original_words()[0], "Hello");
+    assert_eq!(nt.original_words()[1], "World");
+  }
+
+  /// Slash-separated alternation (`and/or`). Same per-piece
+  /// surface contract.
+  #[test]
+  fn slash_alternation_splits_into_per_piece_surface_spans() {
+    let n = EnglishNormalizer::new();
+    let nt = n.normalize("and/or").unwrap();
+    assert_eq!(nt.normalized(), "and or");
+    assert_eq!(nt.original_words().len(), 2);
+    assert_eq!(nt.original_words()[0], "and");
+    assert_eq!(nt.original_words()[1], "or");
   }
 
   #[test]
@@ -307,21 +358,12 @@ mod tests {
     assert!(n.use_word_delimiter());
   }
 
-  #[test]
-  fn hyphenated_word_splits_into_pieces() {
-    // Adversarial regression: before this fix, `hello-world` kept
-    // the literal `-` in the normalised text, the tokeniser
-    // produced `<unk>` for the hyphen, and the new <unk>
-    // rejection failed the whole chunk on a single internal
-    // separator.
-    let n = EnglishNormalizer::new();
-    let nt = n.normalize("Hello-World").unwrap();
-    assert_eq!(nt.normalized(), "hello world");
-    // Both halves preserve the original surface form.
-    assert_eq!(nt.original_words().len(), 2);
-    assert_eq!(nt.original_words()[0], "Hello-World");
-    assert_eq!(nt.original_words()[1], "Hello-World");
-  }
+  // Codex round-23 [medium]: the old
+  // `hyphenated_word_splits_into_pieces` test pinned the
+  // pre-fix behaviour where every split piece pointed back to
+  // the full `Hello-World` surface — see
+  // `hyphen_compound_splits_into_per_piece_surface_spans`
+  // earlier in this module for the corrected contract.
 
   #[test]
   fn em_dash_and_slash_split() {

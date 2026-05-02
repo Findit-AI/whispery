@@ -164,23 +164,49 @@ impl Aligner {
   }
 
   /// Set [`Self::sample_rate`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value == 0`. A zero sample rate would make the
+  /// frame-timebase math collapse and downstream PTS conversions
+  /// produce nonsense ranges; failing fast at the construction
+  /// boundary is correct. Codex round-23.
   pub const fn set_sample_rate(&mut self, value: u32) {
+    assert!(value > 0, "sample_rate must be > 0");
     self.sample_rate = value;
   }
 
   /// Builder-style override for [`Self::sample_rate`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value == 0`. See [`Self::set_sample_rate`].
   pub const fn with_sample_rate(mut self, value: u32) -> Self {
+    assert!(value > 0, "sample_rate must be > 0");
     self.sample_rate = value;
     self
   }
 
   /// Set [`Self::hop_samples`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value == 0`. A zero hop would collapse the
+  /// frame→sample conversion in `compose_words` (every word
+  /// would land at the chunk's first sample), corrupting word
+  /// timings silently. Fail fast. Codex round-23.
   pub const fn set_hop_samples(&mut self, value: u32) {
+    assert!(value > 0, "hop_samples must be > 0");
     self.hop_samples = value;
   }
 
   /// Builder-style override for [`Self::hop_samples`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value == 0`. See [`Self::set_hop_samples`].
   pub const fn with_hop_samples(mut self, value: u32) -> Self {
+    assert!(value > 0, "hop_samples must be > 0");
     self.hop_samples = value;
     self
   }
@@ -411,6 +437,38 @@ impl Aligner {
       run_options,
       &self.language,
     )?;
+
+    // Codex round-23 [high]: validate the encoder's stride
+    // against the input audio length. wav2vec2's CNN
+    // downsamples by `hop_samples` (320 for *-base / *-large),
+    // so the encoded "time" `T * hop_samples` should be at
+    // most `samples.len()` plus a couple of frames of
+    // receptive-field slack. A grossly larger T means the
+    // model export uses a different stride or `hop_samples`
+    // is misconfigured — `compose_words`'s `frame * hop`
+    // mapping would otherwise emit plausible-looking word
+    // ranges past the chunk's audio boundary with no error
+    // surfaced. Fatal because the only recovery is fixing
+    // the model/config, not retrying.
+    let frame_extent = (log_probs.t as u64).saturating_mul(self.hop_samples as u64);
+    let chunk_extent = samples.len() as u64;
+    let max_allowed = chunk_extent.saturating_add(2 * self.hop_samples as u64);
+    if frame_extent > max_allowed {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!(
+          "ORT output stride mismatch: T={} × hop={} = {} sample-equivalents \
+           exceeds chunk ({} samples) + 2-frame slack ({}); model export \
+           uses a different stride or `hop_samples` is misconfigured",
+          log_probs.t,
+          self.hop_samples,
+          frame_extent,
+          chunk_extent,
+          max_allowed,
+        ),
+        language: self.language.clone(),
+      });
+    }
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
