@@ -62,7 +62,7 @@ pub use whisper_rs::{WhisperContext, WhisperContextParameters};
 pub use runner::{
   Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
   ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer, NormalizationError,
-  NormalizedText, TextNormalizer, wav2vec2_base_960h_tokenizer_json,
+  NormalizedText, TextNormalizer, bundled,
 };
 
 // Re-export ort types that appear on the alignment public API.

@@ -60,6 +60,12 @@ serde_json = "1"
 [build-dependencies]
 sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# Build-time JSON parser for the bundled wav2vec2-base-960h
+# tokenizer. Decoding once at build.rs and emitting Rust
+# constants into OUT_DIR means the runtime crate never sees
+# `serde_json`'s code path for the bundled vocab — alignment
+# starts up with already-parsed `&[(&str, u32)]` slices.
+serde_json = "1"
 
 [features]
 default  = ["std", "runner"]

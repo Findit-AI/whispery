@@ -23,5 +23,5 @@ pub use whisper_pool::WhisperPoolOptions;
 pub use aligner::{
   Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
   ChineseNormalizer, DynTextNormalizer, EnglishNormalizer, JapaneseNormalizer, NormalizationError,
-  NormalizedText, TextNormalizer, wav2vec2_base_960h_tokenizer_json,
+  NormalizedText, TextNormalizer, bundled,
 };

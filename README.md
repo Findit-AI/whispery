@@ -65,11 +65,17 @@ downloads only run when both env vars are set.
 
 ## Bundled assets
 
-The `wav2vec2-base-960h` tokenizer JSON ships in the crate
-(2 KB) and is available via `whispery::wav2vec2_base_960h_tokenizer_json()`
-under `feature = "alignment"`. The matching ONNX model
-(~378 MB) is too large for crates.io; download it once from
-HuggingFace and pass the path to `Aligner::from_paths`.
+The `wav2vec2-base-960h` tokenizer ships in the crate, but
+**parsed at build time** — `build.rs` reads
+`assets/wav2vec2_base_960h_tokenizer.json` (2 KB) and emits
+Rust constants under `OUT_DIR`. At runtime you can reach them
+via `whispery::bundled::wav2vec2_base_960h::{VOCAB,
+PAD_TOKEN_ID, UNK_TOKEN_ID, DELIMITER_TOKEN_ID, token_to_id}`
+under `feature = "alignment"` — no JSON parse, no
+`serde_json`, no allocations on the alignment hot path. The
+matching ONNX model (~378 MB) is too large for crates.io;
+download it once from HuggingFace and pass the path to
+`Aligner::from_paths`.
 
 ## WhisperX parity
 
@@ -79,7 +85,7 @@ weights as [WhisperX](https://github.com/m-bain/whisperX):
 | Component | WhisperX (PyTorch) | whispery (ONNX) |
 | --- | --- | --- |
 | EN aligner | `torchaudio` `WAV2VEC2_ASR_BASE_960H` (= `facebook/wav2vec2-base-960h`) | [`onnx-community/wav2vec2-base-960h-ONNX`](https://huggingface.co/onnx-community/wav2vec2-base-960h-ONNX) (direct ONNX export of the same weights) |
-| Tokenizer | bundled w/ torchaudio bundle | bundled in this crate (`wav2vec2_base_960h_tokenizer_json()`) |
+| Tokenizer | bundled w/ torchaudio bundle | bundled in this crate (parsed at build, exposed as `bundled::wav2vec2_base_960h` constants) |
 
 For other languages WhisperX picks language-specific
 `jonatasgrosman/wav2vec2-large-xlsr-53-{lang}` checkpoints.

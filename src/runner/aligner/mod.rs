@@ -13,62 +13,79 @@ mod normalizers;
 mod set;
 
 pub use aligner::Aligner;
-pub use bundled::wav2vec2_base_960h_tokenizer_json;
+pub use bundled::wav2vec2_base_960h;
 
-mod bundled {
-  /// Upstream `wav2vec2-base-960h` HuggingFace tokenizer JSON,
-  /// embedded at compile time.
+/// Bundled assets, decoded at build time.
+///
+/// The wav2vec2-base-960h vocab is parsed by `build.rs` from
+/// `assets/wav2vec2_base_960h_tokenizer.json` and emitted as
+/// Rust constants in `OUT_DIR/wav2vec2_base_960h_tokens.rs`.
+/// Runtime cost is zero — no JSON parsing, no `serde_json`
+/// reach, just static slices of `(&str, u32)` pairs and
+/// pre-resolved special-token ids.
+///
+/// See [`wav2vec2_base_960h`] for the exposed constants.
+pub mod bundled {
+  /// Bundled vocab + special-token ids for
+  /// `facebook/wav2vec2-base-960h` (= the canonical English
+  /// alignment model, bit-identical to what WhisperX uses via
+  /// torchaudio's `WAV2VEC2_ASR_BASE_960H`).
   ///
-  /// This is the bit-identical content of
-  /// <https://huggingface.co/onnx-community/wav2vec2-base-960h-ONNX/resolve/main/tokenizer.json>
-  /// (mirror of `facebook/wav2vec2-base-960h`'s tokenizer —
-  /// the same weights / vocab WhisperX uses for English forced
-  /// alignment via torchaudio's `WAV2VEC2_ASR_BASE_960H`).
-  ///
-  /// The file is < 2.5 KB; bundling it lets out-of-tree
-  /// consumers skip the network fetch for the tokenizer half
-  /// of the alignment pair while continuing to load the ONNX
-  /// model from disk (it's ~378 MB, way over crates.io's 10 MB
-  /// per-crate limit). Use with `Tokenizer::from_bytes` or
-  /// — once the runtime compat shim has its turn — pass the
-  /// bytes alongside `Aligner::from_paths`'s model path.
-  ///
-  /// **Format note:** the upstream file ships in the older
-  /// HuggingFace shape that `tokenizers 0.20`'s
-  /// `ModelUntagged` deserialiser rejects. The runtime
-  /// `load_tokenizer_with_compat` (used by `Aligner::from_paths`)
-  /// patches it on the fly. If you `Tokenizer::from_bytes` this
-  /// constant directly without the shim, you'll need to handle
-  /// that yourself; ship through `Aligner::from_paths` for the
-  /// transparent path.
-  pub fn wav2vec2_base_960h_tokenizer_json() -> &'static str {
-    include_str!("../../../assets/wav2vec2_base_960h_tokenizer.json")
+  /// Constants populated by `build.rs` codegen. Out-of-tree
+  /// consumers can use [`VOCAB`], [`PAD_TOKEN_ID`],
+  /// [`UNK_TOKEN_ID`], and [`DELIMITER_TOKEN_ID`] directly —
+  /// no JSON parse needed at runtime.
+  pub mod wav2vec2_base_960h {
+    include!(concat!(env!("OUT_DIR"), "/wav2vec2_base_960h_tokens.rs"));
+
+    /// Linear-search lookup of a token's id. The bundled vocab
+    /// is small (32 entries), so a hash table buys nothing
+    /// here — and a `const fn` linear scan is friendlier to
+    /// `no_std` consumers than a runtime `LazyLock<HashMap>`.
+    ///
+    /// Returns `None` for unknown tokens; callers typically
+    /// substitute [`UNK_TOKEN_ID`] in that case.
+    pub fn token_to_id(token: &str) -> Option<u32> {
+      VOCAB.iter().find(|(t, _)| *t == token).map(|(_, id)| *id)
+    }
   }
 
   #[cfg(test)]
   mod tests {
-    use super::*;
+    use super::wav2vec2_base_960h::*;
 
-    /// The bundled tokenizer is byte-identical to upstream
-    /// HuggingFace and parses through the runtime compat
-    /// shim. Sanity that bundling didn't accidentally
-    /// truncate or rewrite the file.
+    /// Codegen sanity: the parsed vocab has the special tokens
+    /// at the documented ids and is non-empty.
     #[test]
-    fn bundled_tokenizer_is_non_empty_and_contains_pad() {
-      let json = wav2vec2_base_960h_tokenizer_json();
-      assert!(
-        json.len() > 1_500,
-        "bundled JSON suspiciously short: {}",
-        json.len()
-      );
-      assert!(
-        json.contains("\"<pad>\""),
-        "bundled tokenizer must include the <pad> entry (CTC blank)"
-      );
-      assert!(
-        json.contains("\"|\""),
-        "bundled tokenizer must include the `|` word-delimiter token"
-      );
+    fn bundled_vocab_has_required_special_tokens() {
+      assert!(VOCAB.len() >= 32, "vocab suspiciously small: {}", VOCAB.len());
+      assert_eq!(token_to_id("<pad>"), Some(PAD_TOKEN_ID));
+      assert_eq!(token_to_id("<unk>"), Some(UNK_TOKEN_ID));
+      assert_eq!(token_to_id("|"), Some(DELIMITER_TOKEN_ID));
+    }
+
+    /// Vocab is sorted by id ascending. Order is load-bearing
+    /// — consumers that want O(1) lookup by id index directly.
+    #[test]
+    fn bundled_vocab_is_sorted_by_id() {
+      let ids: Vec<u32> = VOCAB.iter().map(|(_, id)| *id).collect();
+      let mut sorted = ids.clone();
+      sorted.sort();
+      assert_eq!(ids, sorted, "VOCAB must be sorted by id ascending");
+    }
+
+    /// Round-trip: `token_to_id` returns the same id for every
+    /// token in `VOCAB`.
+    #[test]
+    fn token_to_id_round_trips_every_vocab_entry() {
+      for (token, id) in VOCAB {
+        assert_eq!(token_to_id(token), Some(*id));
+      }
+    }
+
+    #[test]
+    fn token_to_id_returns_none_for_unknown() {
+      assert!(token_to_id("definitely-not-in-vocab").is_none());
     }
   }
 }
