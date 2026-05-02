@@ -47,6 +47,14 @@ pub struct Aligner {
   /// (lowercase-emitting) [`crate::EnglishNormalizer`] doesn't
   /// produce a stream of `<unk>`s on every English word.
   vocab_uppercase_only: bool,
+  /// Tokenizer vocab size (including added tokens) captured at
+  /// construction time. The model's ORT output `V` dimension
+  /// must match this exactly — otherwise Viterbi reads
+  /// posteriors from columns that don't correspond to the
+  /// tokenizer's tokens, emitting believable but corrupt
+  /// timings. Validated per-call in [`Self::align`] via
+  /// [`validate_vocab_dim`].
+  tokenizer_vocab_size: usize,
   /// Minimum `speech_emissions / total_emissions` ratio required
   /// for a word to survive the alignment composer's post-pass.
   /// Words whose CTC visit has too many masked frames drop —
@@ -127,6 +135,14 @@ impl Aligner {
     // rationale.
     validate_word_delimiter_present(&tokenizer, normalizer.use_word_delimiter())?;
 
+    // Snapshot the tokenizer's vocab size (including added
+    // tokens) so per-align validation can reject ORT outputs
+    // whose `V` dim doesn't match — otherwise the per-token id
+    // checks in `ctc_viterbi` would pass whenever the chunk's
+    // tokens happen to fit, then read posteriors from
+    // mis-aligned columns.
+    let tokenizer_vocab_size = tokenizer.get_vocab_size(true);
+
     Ok(Self {
       session,
       tokenizer,
@@ -137,6 +153,7 @@ impl Aligner {
       blank_token_id,
       unk_token_id,
       vocab_uppercase_only,
+      tokenizer_vocab_size,
       min_speech_coverage: crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE,
       max_intra_silent_run:
         crate::runner::aligner::algorithm::compose::DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -429,36 +446,35 @@ impl Aligner {
       &self.language,
     )?;
 
-    // Validate the encoder's stride against the input audio
-    // length. wav2vec2's CNN downsamples by `hop_samples` (320
-    // for *-base / *-large), so the encoded "time"
-    // `T * hop_samples` should be at most `samples.len()` plus
-    // a couple of frames of receptive-field slack. A grossly
-    // larger T means the model export uses a different stride
-    // or `hop_samples` is misconfigured — `compose_words`'s
-    // `frame * hop` mapping would otherwise emit
-    // plausible-looking word ranges past the chunk's audio
-    // boundary with no error surfaced. Fatal because the only
-    // recovery is fixing the model/config, not retrying.
-    let frame_extent = (log_probs.t as u64).saturating_mul(self.hop_samples as u64);
-    let chunk_extent = samples.len() as u64;
-    let max_allowed = chunk_extent.saturating_add(2 * self.hop_samples as u64);
-    if frame_extent > max_allowed {
-      return Err(WorkFailure::AlignmentFailed {
-        kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!(
-          "ORT output stride mismatch: T={} × hop={} = {} sample-equivalents \
-           exceeds chunk ({} samples) + 2-frame slack ({}); model export \
-           uses a different stride or `hop_samples` is misconfigured",
-          log_probs.t,
-          self.hop_samples,
-          frame_extent,
-          chunk_extent,
-          max_allowed,
-        ),
-        language: self.language.clone(),
-      });
-    }
+    // Two-sided stride check: the encoded time `T * hop_samples`
+    // must lie within `samples.len() ± 2*hop_samples`. Catches
+    // both stride-too-small (T*hop overshoots — `compose_words`
+    // would emit ranges past the chunk's audio) and
+    // stride-too-large (T*hop undershoots — `compose_words`
+    // would compress every word into the first portion of the
+    // chunk). Fatal: the only recovery is fixing the model /
+    // `hop_samples` config, not retrying.
+    crate::runner::aligner::algorithm::encode::validate_stride_extent(
+      log_probs.t,
+      self.hop_samples,
+      samples.len(),
+      &self.language,
+    )?;
+
+    // Vocab-axis check: model output `V` must equal the
+    // tokenizer's vocab size. A mismatch (e.g. wrong CTC head
+    // wired into the export, or a hidden-states tensor leaked
+    // out as the logits output) would otherwise let the
+    // per-token id check inside `ctc_viterbi` pass whenever
+    // the chunk's token ids happened to fit, then read
+    // posteriors from columns that don't correspond to the
+    // tokenizer's tokens — emitting plausible but corrupt
+    // timings.
+    crate::runner::aligner::algorithm::encode::validate_vocab_dim(
+      log_probs.v,
+      self.tokenizer_vocab_size,
+      &self.language,
+    )?;
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());

@@ -276,6 +276,107 @@ pub(crate) fn validate_output_dims(
   Ok((t, v))
 }
 
+/// Validate the encoder's frame count against the input audio
+/// length. wav2vec2's CNN downsamples by `hop_samples`, so the
+/// encoded "time" `T * hop_samples` should lie within
+/// `chunk_extent ± 2*hop_samples` (a couple of frames of
+/// receptive-field slack on each side).
+///
+/// Two-sided check — both bounds matter:
+///
+/// - **Upper bound** (`T * hop > chunk + 2*hop`): the model
+///   reports more frames than the input could plausibly support.
+///   Either the export uses a smaller stride than `hop_samples`
+///   or the configured `hop_samples` is too small. `compose_words`
+///   would otherwise emit ranges past the chunk's audio
+///   boundary.
+/// - **Lower bound** (`T * hop < chunk - 2*hop`): the model
+///   reports far fewer frames than the input should produce.
+///   Either the export uses a *larger* stride than
+///   `hop_samples` or `hop_samples` is too large. `compose_words`
+///   would otherwise emit ranges that compress every word into
+///   the first portion of the chunk — plausible-looking
+///   timestamps that all sit in (e.g.) the first half of the
+///   audio.
+///
+/// `chunk_extent.saturating_sub(slack)` lets very short chunks
+/// (where the slack is comparable to `chunk_extent`) pass without
+/// false positives — the lower bound clamps to 0. T == 0 cases
+/// are already routed to recoverable `NoAlignmentPath` by
+/// [`validate_output_dims`].
+pub(crate) fn validate_stride_extent(
+  t: usize,
+  hop_samples: u32,
+  chunk_extent: usize,
+  language: &Lang,
+) -> Result<(), WorkFailure> {
+  let frame_extent = (t as u64).saturating_mul(hop_samples as u64);
+  let chunk_extent_u64 = chunk_extent as u64;
+  let slack = 2u64.saturating_mul(hop_samples as u64);
+  let upper_bound = chunk_extent_u64.saturating_add(slack);
+  let lower_bound = chunk_extent_u64.saturating_sub(slack);
+  if frame_extent > upper_bound {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!(
+        "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
+         sample-equivalents exceeds chunk ({chunk_extent} samples) + 2-frame slack \
+         ({upper_bound}); model export uses a smaller stride than `hop_samples` \
+         or `hop_samples` is misconfigured"
+      ),
+      language: language.clone(),
+    });
+  }
+  if frame_extent < lower_bound {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!(
+        "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
+         sample-equivalents below chunk ({chunk_extent} samples) − 2-frame slack \
+         ({lower_bound}); model export uses a larger stride than `hop_samples` \
+         or `hop_samples` is misconfigured"
+      ),
+      language: language.clone(),
+    });
+  }
+  Ok(())
+}
+
+/// Validate the model output's vocab dimension against the
+/// tokenizer's vocab size. A wrong ONNX export (e.g. a hidden-
+/// states tensor with a much larger trailing dim, or a CTC head
+/// trained on a different alphabet) would otherwise pass the
+/// per-token id check in `ctc_viterbi` whenever the chunk's
+/// in-vocab token ids happen to fit, then read posteriors from
+/// columns the tokenizer thinks correspond to the wrong tokens
+/// — emitting believable but corrupt timings.
+///
+/// Strict equality matches the wav2vec2 ASR family (model output
+/// dim == tokenizer vocab size, including special tokens like
+/// `<pad>` / `<s>` / `</s>` / `<unk>` / `|`). If a future
+/// downstream model legitimately has a different output width,
+/// this helper would need a configured override; for the
+/// supported family, mismatch is always a model/tokenizer
+/// pairing bug.
+pub(crate) fn validate_vocab_dim(
+  v: usize,
+  expected_v: usize,
+  language: &Lang,
+) -> Result<(), WorkFailure> {
+  if v != expected_v {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!(
+        "ORT output vocab dim V={v} doesn't match tokenizer vocab size {expected_v}; \
+         model and tokenizer are paired incorrectly — Viterbi would otherwise read \
+         posteriors from columns that don't correspond to the tokenizer's tokens"
+      ),
+      language: language.clone(),
+    });
+  }
+  Ok(())
+}
+
 /// Compute row-major `(T, V)` log-softmax of `raw` with a fatal
 /// finiteness guard.
 ///
@@ -571,6 +672,116 @@ mod tests {
       "diagnostic must call out the shape/data inconsistency; got {message:?}"
     );
   }
+
+  // -------- stride / vocab-dim guards --------
+
+  /// Stride in range — e.g., 16 000-sample chunk at hop=320
+  /// gives T=49 (`49 × 320 = 15 680`, 320-sample slack from the
+  /// chunk extent). Within the ±2-frame band, accepted.
+  #[test]
+  fn validate_stride_extent_accepts_typical_under_extent() {
+    use crate::types::Lang;
+    assert!(validate_stride_extent(49, 320, 16_000, &Lang::En).is_ok());
+    // Exact integer match
+    assert!(validate_stride_extent(50, 320, 16_000, &Lang::En).is_ok());
+    // 1-frame over (within 2-frame slack)
+    assert!(validate_stride_extent(51, 320, 16_000, &Lang::En).is_ok());
+  }
+
+  /// Stride too small (T overshoots): the model emits more
+  /// frames than the chunk could produce, e.g. claimed stride
+  /// is 320 but real stride is 160 → T is roughly 2× expected.
+  /// Rejected as fatal `ModelInferenceFailed`.
+  #[test]
+  fn validate_stride_extent_rejects_t_too_large() {
+    use crate::types::Lang;
+    // 100 frames × 320 = 32 000 sample-equivalents for a
+    // 16 000-sample chunk. Way past the upper bound (16 640).
+    let err = validate_stride_extent(100, 320, 16_000, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+    assert!(
+      message.contains("smaller stride"),
+      "diagnostic must call out the smaller-stride case; got {message:?}"
+    );
+  }
+
+  /// Stride too large (T undershoots): the model emits far
+  /// fewer frames than the input audio supports, e.g. claimed
+  /// stride is 320 but real stride is 640. Without this check,
+  /// `compose_words` would compress every word into the first
+  /// half of the chunk's audio. Rejected as fatal
+  /// `ModelInferenceFailed`.
+  #[test]
+  fn validate_stride_extent_rejects_t_too_small() {
+    use crate::types::Lang;
+    // 25 frames × 320 = 8 000 sample-equivalents for a 16 000-
+    // sample chunk. Half the expected — far below the lower
+    // bound (15 360 = 16 000 − 640).
+    let err = validate_stride_extent(25, 320, 16_000, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+    assert!(
+      message.contains("larger stride"),
+      "diagnostic must call out the larger-stride case; got {message:?}"
+    );
+  }
+
+  /// Very short chunks where the slack is comparable to the
+  /// chunk extent — the lower bound saturates to 0 and small
+  /// `T` values pass. (T=0 itself is routed to recoverable
+  /// `NoAlignmentPath` upstream by `validate_output_dims`.)
+  #[test]
+  fn validate_stride_extent_accepts_very_short_chunk_with_small_t() {
+    use crate::types::Lang;
+    // 200-sample chunk, hop=320 → slack=640, lower=0.
+    // T=1 → frame_extent=320, within [0, 840]. Accepted.
+    assert!(validate_stride_extent(1, 320, 200, &Lang::En).is_ok());
+  }
+
+  /// Vocab-dim equality: model output V matches tokenizer
+  /// vocab size → accepted.
+  #[test]
+  fn validate_vocab_dim_accepts_exact_match() {
+    use crate::types::Lang;
+    assert!(validate_vocab_dim(32, 32, &Lang::En).is_ok());
+  }
+
+  /// Vocab-dim mismatch: model output V is larger than the
+  /// tokenizer's vocab. Rejected as fatal — Viterbi would
+  /// otherwise read posteriors from columns the tokenizer
+  /// thinks correspond to the wrong tokens.
+  #[test]
+  fn validate_vocab_dim_rejects_oversized_model_output() {
+    use crate::types::Lang;
+    let err = validate_vocab_dim(1024, 32, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+    assert!(
+      message.contains("doesn't match tokenizer vocab"),
+      "diagnostic must call out the vocab mismatch; got {message:?}"
+    );
+  }
+
+  /// Vocab-dim mismatch: model output V is smaller than the
+  /// tokenizer's vocab. Same rejection.
+  #[test]
+  fn validate_vocab_dim_rejects_undersized_model_output() {
+    use crate::types::Lang;
+    let err = validate_vocab_dim(16, 32, &Lang::En).unwrap_err();
+    let WorkFailure::AlignmentFailed { kind, .. } = err else {
+      panic!("expected AlignmentFailed");
+    };
+    assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+  }
+
+  // -------- end stride / vocab-dim guards --------
 
   #[test]
   fn validate_output_dims_rejects_buffer_length_mismatch() {
