@@ -84,6 +84,11 @@ pub(crate) fn encode_log_softmax(
     });
   }
 
+  // Codex round-13 [medium]: reject non-finite samples up front
+  // with a typed in-band failure. See [`reject_non_finite_input`]
+  // for the rationale.
+  reject_non_finite_input(samples_for_aligner, language)?;
+
   // wav2vec2-base-960h's preprocessor sets `do_normalize=true`,
   // i.e., the model expects zero-mean unit-variance audio. Real
   // recordings carry gain and DC offset — feeding raw f32 PCM
@@ -174,6 +179,36 @@ pub(crate) fn encode_log_softmax(
   Ok(LogProbsTV { t, v, data })
 }
 
+/// Reject non-finite (NaN / ±inf) samples before any audio
+/// processing runs.
+///
+/// Without this guard, a single bad sample propagates through
+/// `zero_mean_unit_var_normalize`'s mean/variance reductions
+/// (NaN poisons every downstream f64 op) and ends up in the
+/// tensor we hand to ORT. The model then returns either NaN
+/// logits (every word gets a NaN score) or the chunk fails
+/// downstream as `NoAlignmentPath` with no clue why — exactly
+/// the failure mode Codex round-13 [medium] flagged.
+///
+/// Pulled out as a helper so the unit tests can exercise the
+/// rejection path without spinning up a `Session` (the public
+/// `encode_log_softmax` consumes one). The `Aligner::align`
+/// integration tests cover the full encode path against the
+/// real ORT fixture.
+pub(crate) fn reject_non_finite_input(samples: &[f32], language: &Lang) -> Result<(), WorkFailure> {
+  if let Some(bad_idx) = samples.iter().position(|s| !s.is_finite()) {
+    return Err(WorkFailure::AlignmentFailed {
+      kind: AlignmentFailureKind::ModelInferenceFailed,
+      message: alloc::format!(
+        "samples_for_aligner contains non-finite value at index {bad_idx}: {}",
+        samples[bad_idx]
+      ),
+      language: language.clone(),
+    });
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -194,6 +229,52 @@ mod tests {
     for &v in &lp {
       assert!(v <= 0.0, "log-prob must be <= 0");
     }
+  }
+
+  /// Codex round-13 [medium] regression: NaN / ±inf input
+  /// must fail in-band with `ModelInferenceFailed` before the
+  /// scalar normaliser runs. The error message names the
+  /// offending index so a downstream operator has a hook for
+  /// debugging upstream audio pipelines.
+  #[test]
+  fn reject_non_finite_input_flags_nan() {
+    use crate::types::Lang;
+    let samples = alloc::vec![0.1_f32, 0.2, f32::NAN, 0.4];
+    let err = reject_non_finite_input(&samples, &Lang::En).unwrap_err();
+    match err {
+      WorkFailure::AlignmentFailed { kind, message, .. } => {
+        assert!(matches!(kind, AlignmentFailureKind::ModelInferenceFailed));
+        assert!(
+          message.contains("index 2"),
+          "message must name index; got {message:?}"
+        );
+      }
+      other => panic!("expected AlignmentFailed; got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn reject_non_finite_input_flags_positive_infinity() {
+    use crate::types::Lang;
+    let samples = alloc::vec![0.0_f32, f32::INFINITY];
+    assert!(reject_non_finite_input(&samples, &Lang::En).is_err());
+  }
+
+  #[test]
+  fn reject_non_finite_input_flags_negative_infinity() {
+    use crate::types::Lang;
+    let samples = alloc::vec![f32::NEG_INFINITY, 0.0_f32];
+    assert!(reject_non_finite_input(&samples, &Lang::En).is_err());
+  }
+
+  #[test]
+  fn reject_non_finite_input_passes_finite_audio() {
+    use crate::types::Lang;
+    // Both ordinary [-1, 1] audio and high-magnitude finite
+    // inputs are accepted at this layer — magnitude precision
+    // is the SIMD-precision-guard's job, not this guard's.
+    let samples = alloc::vec![-1.0_f32, 0.0, 1.0, 1e10, -1e10];
+    assert!(reject_non_finite_input(&samples, &Lang::En).is_ok());
   }
 
   #[test]

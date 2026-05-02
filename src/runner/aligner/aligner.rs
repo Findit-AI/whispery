@@ -85,12 +85,7 @@ impl Aligner {
       .map_err(|e| RunnerError::AlignerLoad {
         message: alloc::format!("commit_from_file({}) failed: {e:?}", model_path.display()),
       })?;
-    let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| RunnerError::AlignerLoad {
-      message: alloc::format!(
-        "Tokenizer::from_file({}) failed: {e:?}",
-        tokenizer_path.display()
-      ),
-    })?;
+    let tokenizer = load_tokenizer_with_compat(tokenizer_path)?;
 
     let blank_token_id =
       detect_blank_token_id(&tokenizer).ok_or_else(|| RunnerError::AlignerLoad {
@@ -406,6 +401,97 @@ fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
 /// via the `worker_timeouts(_, align)` builder hook in Plan B.
 pub(crate) const DEFAULT_ALIGN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Load a HuggingFace tokenizer.json with `tokenizers 0.20`
+/// compatibility shimming.
+///
+/// The canonical wav2vec2 tokenizer.json (e.g.,
+/// `facebook/wav2vec2-base-960h`, `onnx-community/wav2vec2-base-960h-ONNX`)
+/// ships in an older HF format whose `model` object carries
+/// only `vocab` — no `type` discriminator. `tokenizers 0.20`'s
+/// `ModelUntagged` deserialiser rejects that with `data did not
+/// match any variant of untagged enum ModelUntagged`. The repo's
+/// `build.rs` patches the build-time fixture, but a downstream
+/// consumer following the public `Aligner::from_paths` API with
+/// their own tokenizer file would have hit the same load
+/// failure. Codex round-13 [high].
+///
+/// We try the raw file first so already-compliant tokenizer
+/// JSONs (BPE / Unigram models, or modern WordLevel exports
+/// with `type`) take the fast path. On failure, we attempt one
+/// patch — inject `"type": "WordLevel"` and `"unk_token":
+/// "<unk>"` immediately inside the `"model": {` block — and
+/// retry. If the retry still fails we surface the *original*
+/// error, not the patched-version error, since the patch is
+/// only meaningful for the wav2vec2 shape.
+fn load_tokenizer_with_compat(path: &Path) -> Result<Tokenizer, RunnerError> {
+  let bytes = std::fs::read(path).map_err(|e| RunnerError::AlignerLoad {
+    message: alloc::format!("read tokenizer {}: {e}", path.display()),
+  })?;
+
+  let original_err = match Tokenizer::from_bytes(&bytes) {
+    Ok(tok) => return Ok(tok),
+    Err(e) => alloc::format!("{e:?}"),
+  };
+
+  if let Some(patched) = inject_wordlevel_model_type(&bytes)
+    && let Ok(tok) = Tokenizer::from_bytes(&patched)
+  {
+    return Ok(tok);
+  }
+
+  Err(RunnerError::AlignerLoad {
+    message: alloc::format!(
+      "Tokenizer::from_file({}) failed: {original_err}",
+      path.display()
+    ),
+  })
+}
+
+/// Inject `"type": "WordLevel"` and `"unk_token": "<unk>"` into
+/// the `model` object of an HF tokenizer.json. Returns `None` if
+/// the file already has a `type:` (no patch needed) or if we
+/// can't find the `"model": {` boundary (different schema —
+/// don't guess).
+fn inject_wordlevel_model_type(bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+  let s = core::str::from_utf8(bytes).ok()?;
+  // Find `"model"`'s opening brace. Robust to whitespace.
+  let model_idx = s.find("\"model\"")?;
+  let after_model = &s[model_idx..];
+  let brace_offset = after_model.find('{')?;
+  let brace_pos = model_idx + brace_offset;
+
+  // Already patched / already typed: leave it alone.
+  let model_body = &s[brace_pos..];
+  // Find the matching closing brace, conservatively by depth.
+  let mut depth = 0_i32;
+  let mut close_pos = None;
+  for (i, c) in model_body.char_indices() {
+    match c {
+      '{' => depth += 1,
+      '}' => {
+        depth -= 1;
+        if depth == 0 {
+          close_pos = Some(brace_pos + i);
+          break;
+        }
+      }
+      _ => {}
+    }
+  }
+  let close_pos = close_pos?;
+  if s[brace_pos..close_pos].contains("\"type\"") {
+    return None; // already discriminated
+  }
+
+  // Inject the discriminator fields right after `{`.
+  let injection = "\n        \"type\": \"WordLevel\",\n        \"unk_token\": \"<unk>\",";
+  let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(bytes.len() + injection.len());
+  out.extend_from_slice(s[..=brace_pos].as_bytes());
+  out.extend_from_slice(injection.as_bytes());
+  out.extend_from_slice(s[brace_pos + 1..].as_bytes());
+  Some(out)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -415,6 +501,72 @@ mod tests {
   // test exercises the actual loader against the build.rs-fetched
   // fixture. Here we lock in the type-level invariants and the
   // blank-token-id detection helper.
+
+  /// Codex round-13 [high] regression: the upstream wav2vec2
+  /// tokenizer.json (HF format, no `model.type` discriminator)
+  /// loaded directly via `Aligner::from_paths` used to fail
+  /// with `tokenizers 0.20`'s ModelUntagged deserialiser. The
+  /// build.rs fixture got patched, but a downstream consumer
+  /// loading their own copy from HuggingFace would have hit a
+  /// load-time error.
+  ///
+  /// Fix: `load_tokenizer_with_compat` patches in-memory and
+  /// retries. This test exercises that path with the canonical
+  /// minimal upstream shape — exactly what Hugging Face serves
+  /// for `facebook/wav2vec2-base-960h`'s `tokenizer.json`.
+  #[test]
+  fn load_tokenizer_with_compat_handles_unpatched_hf_format() {
+    // Minimal upstream HF tokenizer.json shape — `model` has
+    // only `vocab`, no `type` discriminator. `tokenizers 0.20`
+    // rejects this raw; the compat shim must inject the
+    // missing fields and retry.
+    let raw = br#"{
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [],
+      "normalizer": null,
+      "pre_tokenizer": {"type": "Split", "pattern": {"Regex": ""}, "behavior": "Isolated", "invert": false},
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "vocab": {
+          "<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4,
+          "A": 5, "B": 6, "C": 7
+        }
+      }
+    }"#;
+    // Confirm the raw form really does fail (otherwise the
+    // shim is exercising nothing). If `tokenizers` upstream
+    // ever relaxes its parser, this assert catches it.
+    assert!(
+      Tokenizer::from_bytes(raw).is_err(),
+      "tokenizers 0.20 unexpectedly accepted raw upstream HF format; \
+       the compat shim is no longer necessary"
+    );
+
+    // Shim must accept and patch.
+    let patched =
+      inject_wordlevel_model_type(raw).expect("inject_wordlevel_model_type must succeed");
+    let tok = Tokenizer::from_bytes(&patched).expect("patched JSON must parse");
+    assert_eq!(tok.token_to_id("A"), Some(5));
+    assert_eq!(tok.token_to_id("<unk>"), Some(3));
+  }
+
+  /// The shim must NOT mangle a tokenizer that already carries
+  /// a `type` discriminator (modern HF format, BPE / Unigram
+  /// models). It returns `None` and leaves the file untouched.
+  #[test]
+  fn load_tokenizer_with_compat_skips_already_patched_input() {
+    let already_typed = br#"{
+      "model": {
+        "type": "WordLevel",
+        "vocab": {"<unk>": 0, "A": 1},
+        "unk_token": "<unk>"
+      }
+    }"#;
+    assert!(inject_wordlevel_model_type(already_typed).is_none());
+  }
 
   #[test]
   fn aligner_is_send_not_sync() {
