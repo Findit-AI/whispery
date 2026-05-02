@@ -136,7 +136,10 @@ pub(crate) fn build_speech_frames(
 /// into a `Vec<Option<...>>` indexed by normalised-word position.
 ///
 /// Step 7:
-/// - Skip frames whose state is a blank (`state % 2 == 0`).
+/// - Skip frames whose state is a blank (`state % 2 == 0`) for
+///   the *emission* accumulators (logprob, counts), but use them
+///   to extend the LEFT-adjacent token's word `end_frame` — see
+///   below.
 /// - Skip frames whose mapped token's `word_idx_per_token == None`
 ///   (delimiters / `<unk>` / specials).
 /// - **Skip frames over silence-masked audio** (`!speech_frames[t]`).
@@ -148,6 +151,55 @@ pub(crate) fn build_speech_frames(
 ///   mask actually drop unsupported words from the output.
 /// - For non-blank, mapped, speech-supported frames: open the
 ///   entry on first sight, extend `end_frame`, accumulate logprob.
+///
+/// Blank-stay attribution (matches WhisperX's `merge_repeats` /
+/// `merge_words` semantics):
+///
+/// In WhisperX, the CTC path's `token_index` indexes into the
+/// cleaned character string `text_clean` (which includes `|`
+/// word separators). When the path "stays" at index `j`, the
+/// frame emits a blank but stays at character `j`. `merge_repeats`
+/// groups those frames into a `Segment` for the j-th character;
+/// `merge_words` then drops `|` segments and uses the last
+/// non-separator character's segment end as the word's end. So
+/// blank-stays attribute to **the character immediately to their
+/// left** in the path's traversal order — never carrying through
+/// a separator into the previous word.
+///
+/// Whispery's state machine encodes the same thing differently:
+/// - State `2*i + 1` = emit token `i`.
+/// - State `2*k`     = blank slot.
+///   - `k = 0`: leading blank (before any token has emitted).
+///   - `k ≥ 1`: blank slot between token `k-1` and token `k` —
+///     i.e. WhisperX's stays at `token_index = k-1`.
+///
+/// So a blank frame at state `2*k` (`k ≥ 1`) attributes to
+/// **token `k-1`**. If that token's `word_idx_per_token` is a
+/// real word, the blank extends that word's `end_frame`. If
+/// it's a delimiter / unmapped (e.g. WhisperX's `|`), the blank
+/// attributes to the delimiter slot and DOES NOT extend any
+/// word — exactly matching `merge_words`'s drop-`|` rule.
+///
+/// Blank-stay rules:
+/// - Blank-stays *only* extend `end_frame`; they do **not**
+///   contribute to `logprob_sum`, `speech_emissions`, or
+///   `total_emissions`. Coverage and score remain anchored to
+///   real emissions; otherwise the post-pass coverage semantics
+///   would silently change.
+/// - Blank-stays on non-speech frames are skipped; the speech-
+///   frame mask still gates everything.
+/// - Blank state `2*0` (`k = 0`, leading blank) belongs to no
+///   token; skip.
+/// - Blank state `2*k` (`k ≥ 1`) where token `k-1` maps to a
+///   delimiter (`word_idx_per_token == None`) belongs to that
+///   delimiter slot, not to any word; skip.
+/// - Extension only happens if the corresponding word slot has
+///   already been opened — i.e. the previous token emitted at
+///   least once. Otherwise a blank in state `2*k` for which
+///   token `k-1` has not yet emitted (e.g. fully masked) would
+///   open and extend a phantom range. Aligns with WhisperX:
+///   `merge_repeats` only includes frames where the path
+///   actually visited that token_index.
 ///
 /// Words that received no speech-supported emitting frames stay
 /// `None`. They are dropped by `compose_words` (step 8/9), not
@@ -164,20 +216,57 @@ fn accumulate_per_word(
   let mut per_word: Vec<Option<WordAccum>> = alloc::vec![None; n_words];
 
   for (t_idx, &state) in path.state_per_frame.iter().enumerate() {
-    if state % 2 == 0 {
-      continue; // blank
+    let is_speech = speech_frames.get(t_idx).copied().unwrap_or(true);
+    let is_blank = state % 2 == 0;
+
+    if is_blank {
+      // Blank-stay attribution: state `2*k` (`k ≥ 1`) is the
+      // blank slot AFTER token `k-1`; attribute to token `k-1`.
+      // State `2*0` is the leading blank (before any token has
+      // emitted) — belongs to no word.
+      if !is_speech {
+        continue;
+      }
+      let k = state / 2;
+      if k == 0 {
+        continue; // leading blank
+      }
+      let prev_token_idx = k - 1;
+      let Some(word_idx) = word_idx_per_token
+        .get(prev_token_idx)
+        .copied()
+        .flatten()
+      else {
+        // Previous token is a delimiter / unmapped; its
+        // blank-stay slot belongs to that delimiter, not to
+        // any word. Skip — same rule WhisperX's `merge_words`
+        // applies to `|` segments.
+        continue;
+      };
+      let Some(slot) = per_word.get_mut(word_idx) else {
+        continue;
+      };
+      // Only extend if the word's slot is already open — i.e.
+      // token `prev_token_idx` actually emitted. Otherwise a
+      // word that was never visited (every emission masked or
+      // skipped upstream) would get a phantom range from
+      // adjacent blank-stays.
+      if let Some(entry) = slot {
+        entry.end_frame = (t_idx + 1) as u32;
+      }
+      continue;
     }
+
+    // Non-blank frame.
     let token_idx = state / 2;
     let Some(word_idx) = word_idx_per_token.get(token_idx).copied().flatten() else {
-      continue; // delimiter / special; skip
+      continue; // delimiter / special
     };
     let Some(slot) = per_word.get_mut(word_idx) else {
       // word_idx out of range — caller / tokeniser bug. Skip
       // rather than panic.
       continue;
     };
-
-    let is_speech = speech_frames.get(t_idx).copied().unwrap_or(true);
 
     // Open the slot regardless of speech support so silent
     // emissions count toward `total_emissions` (the coverage
@@ -287,9 +376,13 @@ pub(crate) fn compose_words<F>(
   // samples. Word ranges are clamped to
   // `[chunk_first_sample, chunk_first_sample + n_samples]` so
   // the stride validator's 2-frame overshoot tolerance can't
-  // leak into emitted word timestamps. Pass `u64::MAX` to
-  // disable clamping (only meaningful for unit tests with
-  // synthetic frame counts).
+  // leak into emitted word timestamps. It also drives the
+  // effective samples-per-frame ratio (`n_samples / (T-1)`)
+  // that matches WhisperX's frame→time math; nominal
+  // `hop_samples` alone introduced a ~40 ms drift over 30 s
+  // because wav2vec2's CNN truncates one frame at the edge.
+  // Tests should pass `log_probs.t * hop_samples` so the
+  // effective ratio collapses back to ~`hop_samples`.
   n_samples: u64,
   samples_to_output_range: F,
   min_speech_coverage: f32,
@@ -325,14 +418,30 @@ where
   // is a safety net for the `u64::MAX` test sentinel.
   let chunk_end_sample = chunk_first_sample_in_stream.saturating_add(n_samples);
 
+  // Effective samples-per-frame from the actual encoder
+  // output count, matching WhisperX's
+  // `ratio = duration / (T - 1)` in `alignment.py`. Using
+  // nominal `hop_samples` (320) introduced a ~40 ms drift over
+  // a 30 s clip because wav2vec2's CNN truncates one frame at
+  // the edge (n_samples=480 000 → T=1499 not 1500).
+  let samples_per_frame = if log_probs.t >= 2 {
+    (n_samples as f64) / ((log_probs.t - 1) as f64)
+  } else {
+    // Single-frame or empty chunk: effective ratio
+    // undefined; fall back to nominal hop. Empty cases
+    // already short-circuit upstream.
+    hop_samples as f64
+  };
+
   let mut words: Vec<Word> = Vec::with_capacity(n_words);
   for (i, slot) in per_word.iter().enumerate() {
     let Some(accum) = slot else {
       continue;
     };
-    let start_sample =
-      chunk_first_sample_in_stream + (accum.start_frame as u64) * (hop_samples as u64);
-    let end_sample = chunk_first_sample_in_stream + (accum.end_frame as u64) * (hop_samples as u64);
+    let start_sample = chunk_first_sample_in_stream
+      + (accum.start_frame as f64 * samples_per_frame).round() as u64;
+    let end_sample = chunk_first_sample_in_stream
+      + (accum.end_frame as f64 * samples_per_frame).round() as u64;
 
     // If the word's first speech-supported frame is already
     // past the chunk's audio, drop the word — there's no
@@ -400,7 +509,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -434,7 +543,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -467,7 +576,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -478,9 +587,11 @@ mod tests {
   #[test]
   fn frame_to_output_range_uses_chunk_first_sample_offset() {
     // Confirm that chunk_first_sample_in_stream offsets the
-    // output range. With chunk_first_sample = 8000 and
-    // hop_samples = 320, frame 1 maps to sample 8320, frame 2
-    // to sample 8640.
+    // output range. With chunk_first_sample = 8000,
+    // hop_samples = 320, t = 3 and n_samples = 3*320 = 960,
+    // the effective samples-per-frame is 960/(3-1) = 480.
+    // Frame 1 maps to sample 8000 + 480 = 8480; frame 3 maps
+    // to sample 8000 + 1440 = 9440 (clamped to 8000+960=8960).
     let path = ViterbiPath {
       // states: [blank, y_0, y_0]; emit at frames 1, 2.
       state_per_frame: alloc::vec![0, 1, 1],
@@ -499,15 +610,15 @@ mod tests {
       &speech_frames,
       8_000,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     let r = result.words()[0].range();
-    // start_frame = 1 -> 8000 + 320 = 8320
-    // end_frame = 3 -> 8000 + 960 = 8960
-    assert_eq!(r.start_pts(), 8320);
+    // start_frame = 1 -> 8000 + 480 = 8480
+    // end_frame = 3 -> 8000 + 1440 = 9440, clamped to chunk_end = 8960
+    assert_eq!(r.start_pts(), 8480);
     assert_eq!(r.end_pts(), 8960);
   }
 
@@ -537,7 +648,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -570,7 +681,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -611,7 +722,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -664,7 +775,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -712,7 +823,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -837,7 +948,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -879,7 +990,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -898,7 +1009,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       Duration::from_millis(100),
@@ -937,7 +1048,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -958,7 +1069,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       0.9,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -998,7 +1109,7 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -1038,12 +1149,200 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     assert_eq!(result.words().len(), 1);
+  }
+
+  /// Trailing blank-stays at the *trailing-blank state* of a
+  /// word's last token must extend the word's `end_frame` to
+  /// match WhisperX's `merge_repeats` semantics. State `2*k`
+  /// (`k ≥ 1`) is the blank slot between token `k-1` and token
+  /// `k`; its frames attribute to token `k-1`.
+  ///
+  /// Path: state 1 (emit token 0) at frame 0; state 2 (blank
+  /// slot AFTER token 0) at frames 1, 2 — all speech-supported.
+  /// Pre-fix `end_frame` was 1 (one past the last non-blank
+  /// emission); post-fix it is 3 (one past the last
+  /// trailing-blank-stay attributable to token 0).
+  ///
+  /// `n_samples = 1500` keeps `samples_per_frame = 1500 / 2 =
+  /// 750`. start_frame = 0 → 0; end_frame = 3 → 3 * 750 = 2250,
+  /// clamped to chunk_end = 1500. Pre-fix end_pts would have
+  /// read 750.
+  ///
+  /// Score and coverage are unaffected: the blank-stays do not
+  /// contribute to `speech_emissions`, `total_emissions`, or
+  /// `logprob_sum` — only to `end_frame`.
+  #[test]
+  fn word_end_extends_through_trailing_blank_stays_for_held_word() {
+    let path = ViterbiPath {
+      // Frame 0: emit token 0 (state 1). Frames 1, 2:
+      // trailing-blank slot for token 0 (state 2 = 2*1 =
+      // blank between token 0 and token 1).
+      state_per_frame: alloc::vec![1, 2, 2],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(3, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("hi")];
+    let speech_frames = alloc::vec![true, true, true];
+
+    let n_samples: u64 = 1_500;
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      n_samples,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert_eq!(result.words().len(), 1);
+    let r = result.words()[0].range();
+    assert_eq!(r.start_pts(), 0);
+    // end_frame = 3, raw end = 3 * 750 = 2250, clamped to 1500.
+    assert_eq!(
+      r.end_pts(),
+      1_500,
+      "trailing speech-supported blank-stays at state 2*(i+1) must extend token i's word; got {}",
+      r.end_pts()
+    );
+  }
+
+  /// Companion: trailing **non-speech** blank-stays do NOT
+  /// extend the previous token's word `end_frame`. The
+  /// speech-frame mask still gates attribution — extending into
+  /// masked silence would smear the word's range over
+  /// non-speech audio.
+  ///
+  /// Path: state 1 emit at frame 0, then state-2 blanks at
+  /// frames 1, 2 with `speech_frames = [true, false, false]`.
+  /// `end_frame` stays at 1 (one past the last non-blank
+  /// speech-supported emission).
+  #[test]
+  fn trailing_non_speech_blank_stays_do_not_extend_word_end() {
+    let path = ViterbiPath {
+      state_per_frame: alloc::vec![1, 2, 2],
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(3, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("hi")];
+    // Only frame 0 is speech-supported; trailing blanks are
+    // masked silence.
+    let speech_frames = alloc::vec![true, false, false];
+
+    let n_samples: u64 = 1_500;
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      n_samples,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert_eq!(result.words().len(), 1);
+    let r = result.words()[0].range();
+    assert_eq!(r.start_pts(), 0);
+    // end_frame = 1, raw end = 1 * 750 = 750. If the speech-
+    // mask gate were broken, this would read 2250 (clamped to
+    // 1500) instead.
+    assert_eq!(
+      r.end_pts(),
+      750,
+      "non-speech blank-stays must NOT extend end_frame; got {}",
+      r.end_pts()
+    );
+  }
+
+  /// Blank slots between adjacent tokens attribute to the LEFT
+  /// token (the token immediately before the blank slot in the
+  /// CTC graph). Blanks at state `2*k` for `k ≥ 1` belong to
+  /// token `k - 1`. Crucially, when token `k - 1` is a
+  /// **delimiter** (`word_idx_per_token == None`), the blank
+  /// belongs to the delimiter slot — not to any word — exactly
+  /// matching WhisperX's `merge_words` rule that drops `|`
+  /// separator segments.
+  ///
+  /// Path layout: tokens = [hello-token, delim, world-token]
+  /// with `word_idx_per_token = [Some(0), None, Some(1)]`. The
+  /// blank slots interleave: state 0 (leading), state 1
+  /// (hello), state 2 (post-hello / pre-delim), state 3
+  /// (delim), state 4 (post-delim / pre-world), state 5
+  /// (world), state 6 (post-world).
+  ///
+  /// Frames: emit hello at 0; state-2 blank at 1; emit delim
+  /// at 2; state-4 blank at 3; emit world at 4; state-6 blank
+  /// at 5.
+  ///
+  /// Expected end_frames:
+  /// - hello: 2 (state-2 blank attributes to token 0 = hello).
+  /// - world: 6 (state-6 blank attributes to token 2 = world).
+  ///
+  /// State-4 blank attributes to token 1 (the delimiter); it
+  /// must NOT extend hello's range past frame 2. This is the
+  /// regression that bit the round-22 first attempt — naively
+  /// "carry the previously-emitted real word" would wrongly
+  /// extend hello through the inter-word blank, just as
+  /// over-extending word ends through the post-`|` blank-stay
+  /// region in the parity run.
+  #[test]
+  fn inter_word_blank_through_delimiter_does_not_extend_previous_word() {
+    let path = ViterbiPath {
+      // states: emit hello, blank2, emit delim, blank4, emit world, blank6
+      state_per_frame: alloc::vec![1, 2, 3, 4, 5, 6],
+      tokens: alloc::vec![10, 99, 20],
+    };
+    let log_probs = lp_const(6, 100, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0), None, Some(1)];
+    let original = alloc::vec![Cow::Borrowed("hello"), Cow::Borrowed("world")];
+    let speech_frames = alloc::vec![true; 6];
+
+    // n_samples = 1500, samples_per_frame = 1500 / 5 = 300.
+    let n_samples: u64 = 1_500;
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      n_samples,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert_eq!(result.words().len(), 2);
+    let w0 = result.words()[0].range();
+    let w1 = result.words()[1].range();
+    // hello: start_frame 0, end_frame 2 (extended through the
+    // post-hello blank at state 2). Raw end = 2 * 300 = 600.
+    assert_eq!(w0.start_pts(), 0);
+    assert_eq!(
+      w0.end_pts(),
+      600,
+      "hello must NOT extend through the inter-word delimiter blank; got {}",
+      w0.end_pts()
+    );
+    // world: start_frame 4, end_frame 6 (extended through the
+    // post-world blank at state 6). Raw end = 6 * 300 = 1800,
+    // clamped to chunk_end = 1500.
+    assert_eq!(w1.start_pts(), 4 * 300);
+    assert_eq!(w1.end_pts(), 1_500);
   }
 
   #[test]
@@ -1198,12 +1497,71 @@ mod tests {
       &speech_frames,
       0,
       320,
-      u64::MAX,
+      log_probs.t as u64 * 320,
       fake_samples_to_output_range,
       DEFAULT_MIN_SPEECH_COVERAGE,
       DEFAULT_MAX_INTRA_SILENT_RUN,
     );
     let s = result.words()[0].score();
     assert!((0.0..=1.0).contains(&s));
+  }
+
+  /// Regression: emitted Word ranges must use the
+  /// effective `n_samples / (T - 1)` samples-per-frame
+  /// ratio (matching WhisperX's `alignment.py`), not the
+  /// nominal `hop_samples`. With wav2vec2-base on 30 s of
+  /// audio (480 000 samples → T = 1499 + 1 conceptual,
+  /// here exercised as T = 1500 to confirm the formula),
+  /// the per-frame difference is ~0.21 samples; over 1500
+  /// frames this accumulates to the ~40 ms drift that
+  /// previously misaligned every word vs WhisperX.
+  #[test]
+  fn compose_words_uses_effective_samples_per_frame_not_nominal_hop() {
+    // 1500 frames; word 0's token (state 1) emits at frame
+    // 100 only. All other frames are blank (state 0).
+    let mut state_per_frame = alloc::vec![0_usize; 1500];
+    state_per_frame[100] = 1;
+    let path = ViterbiPath {
+      state_per_frame,
+      tokens: alloc::vec![10],
+    };
+    let log_probs = lp_const(1500, 30, -1.0);
+    let word_idx_per_token = alloc::vec![Some(0)];
+    let original = alloc::vec![Cow::Borrowed("ratio")];
+    let speech_frames = alloc::vec![true; 1500];
+
+    // n_samples = 480 000 → samples_per_frame =
+    // 480 000 / (1500 - 1) = 480 000 / 1499 ≈ 320.2135.
+    // Frame 100 maps to ≈ 32021 samples (NOT 32 000 as
+    // nominal `100 * 320` would give).
+    let result = compose_words(
+      &path,
+      &log_probs,
+      &word_idx_per_token,
+      &original,
+      &speech_frames,
+      0,
+      320,
+      480_000,
+      fake_samples_to_output_range,
+      DEFAULT_MIN_SPEECH_COVERAGE,
+      DEFAULT_MAX_INTRA_SILENT_RUN,
+    );
+    assert_eq!(result.words().len(), 1);
+    let r = result.words()[0].range();
+    let start = r.start_pts();
+    let expected = 32_021_i64; // round(100 * 480000/1499)
+    let nominal = 32_000_i64; // what the buggy code returned
+    assert!(
+      (start - expected).abs() <= 1,
+      "expected start within 1 sample of {expected} (effective ratio); \
+       got {start}. Nominal `hop * frame` would have been {nominal}, \
+       which is the regression this test guards against.",
+    );
+    assert_ne!(
+      start, nominal,
+      "compose must NOT use nominal hop_samples * frame; got {start} \
+       (would mean we re-introduced the ~40 ms drift)",
+    );
   }
 }
