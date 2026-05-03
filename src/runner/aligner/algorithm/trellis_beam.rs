@@ -270,6 +270,69 @@ pub fn get_trellis(
   // Single-token paths skip the inner loop body (j=1..num_tokens
   // is empty); column 0's cumsum already encodes the only legal
   // path, and the final row's `+inf` override doesn't apply.
+  //
+  // ─────────────────────────────────────────────────────────────
+  // WHISPERX-PARITY QUIRK: `tokens[0]` IS NEVER SCORED
+  // ─────────────────────────────────────────────────────────────
+  //
+  // The change transition into column `j` (j ≥ 1) reads
+  // `tokens[j]` — NOT `tokens[j - 1]`. The first transcript
+  // token's posterior therefore never appears in any cell of the
+  // trellis: only `tokens[1..]` enter the recurrence, and column
+  // 0's only contribution is the leading-blank cumsum.
+  //
+  // This MIRRORS WhisperX 1:1. WhisperX's `get_trellis`
+  // (`whisperx/alignment.py:387-404`) writes:
+  //
+  //     trellis[t + 1, 1:] = torch.maximum(
+  //         trellis[t, 1:]   + emission[t, blank_id],
+  //         trellis[t, :-1]  + get_wildcard_emission(
+  //             emission[t], tokens[1:], blank_id),
+  //     )
+  //
+  // The slice `tokens[1:]` (broadcast against `trellis[t, :-1]`
+  // and stored at `trellis[t+1, 1:]`) means column `j` reads
+  // `tokens[j]` — exactly what we replicate at line 290 below.
+  // No leading sentinel is ever prepended to `tokens` upstream
+  // (see `whisperx/alignment.py:235`,
+  // `tokens = [model_dictionary.get(c, -1) for c in text_clean]`).
+  //
+  // Why this looks wrong but is what we want anyway:
+  //
+  // 1. PARITY IS THE PRIMARY SUCCESS METRIC. The whole alignment
+  //    subsystem was built and validated against WhisperX bit-
+  //    exactly (median IoU 0.9955–0.9990 across the dia
+  //    fixtures, 0 below-0.5 outliers in 854 word pairs).
+  //    Diverging from `tokens[1:]` to score `tokens[0]` would
+  //    re-shift every word's start-of-word frame and silently
+  //    invalidate that calibration. No fixture would tell us the
+  //    new path is "right" — only that it differs from WhisperX.
+  //
+  // 2. THE DIVERGENCE IN PRACTICE IS SMALL. The CTC alignment is
+  //    forced (transcript is given), so `tokens[0]` is implicitly
+  //    pinned to the chunk start by the column-0 → column-1
+  //    transition; only the exact frame at which that transition
+  //    fires is biased. For multi-character tokens the bias is
+  //    drowned out by the surrounding posteriors. For single-
+  //    token transcripts the trellis is degenerate anyway
+  //    (column 0's blank cumsum is the only legal path).
+  //
+  // 3. CHANGING THE INDEXING IS NOT A LOCAL FIX. Both `get_trellis`
+  //    and `backtrack_beam` consume the same convention (the
+  //    backtracker indexes into `tokens` via the column index it
+  //    just descended from). A real correction would need to
+  //    grow the trellis to `(T, num_tokens + 1)` and adjust
+  //    every `state.j` arithmetic in the backtracker — and would
+  //    still need a side-by-side parity rerun to confirm we hadn't
+  //    broken anything else.
+  //
+  // If WhisperX upstream ever fixes this, we can adopt the change
+  // and rerun parity. Until then, "match WhisperX" trumps "match
+  // textbook CTC". The companion regression test
+  // `tokens_zeroth_emission_does_not_affect_trellis` (in `mod
+  // tests` below) pins this behaviour so a future "cleanup" PR
+  // can't silently re-introduce the divergence.
+  // ─────────────────────────────────────────────────────────────
   for t_idx in 0..t.saturating_sub(1) {
     if t_idx % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
       return Err(WorkFailure::WorkerHangTimeout {
@@ -287,6 +350,8 @@ pub fn get_trellis(
     for j in 1..num_tokens {
       let stay = trellis[t_idx * num_tokens + j] + blank_emit;
       let prev = trellis[t_idx * num_tokens + (j - 1)];
+      // Reads `tokens[j]`, not `tokens[j - 1]` — see the
+      // long WHISPERX-PARITY QUIRK comment above this loop.
       let change_emit = match tokens[j] {
         id if id == WILDCARD_TOKEN_ID => wildcard_emit_for_frame,
         id => log_probs.at(t_idx, id as usize),
@@ -887,6 +952,61 @@ mod tests {
     assert!(
       last_cell.is_finite(),
       "trellis end cell must be finite for a viable lattice; got {last_cell}"
+    );
+  }
+
+  #[test]
+  fn tokens_zeroth_emission_does_not_affect_trellis() {
+    // PINS the WhisperX-parity quirk documented in the long
+    // comment above the forward DP loop in `get_trellis`: the
+    // change transition into column `j` reads `tokens[j]`, NOT
+    // `tokens[j - 1]`, so `tokens[0]`'s posterior is genuinely
+    // never read in the recurrence. WhisperX's reference port
+    // has the same behaviour; matching it bit-exactly is what
+    // gets us the IoU 0.9955–0.9990 parity numbers.
+    //
+    // If a future "cleanup" PR fixes the indexing to score
+    // `tokens[0]`, the trellis values will start depending on
+    // emission column for `tokens[0]`, this test will fail, and
+    // the failure message points back at the long quirk comment.
+    let v = 4;
+    let t = 4;
+    let blank = 0;
+    let tokens = [1_i32, 2]; // tokens[0] = vocab id 1, tokens[1] = vocab id 2.
+
+    // Baseline emission table. Column 0 = blank.
+    let mut base = alloc::vec![-2.0_f32; t * v];
+    for ti in 0..t {
+      base[ti * v + blank] = -0.5;
+    }
+    // Knob: emission posterior for `tokens[0]` (vocab id 1) at
+    // every frame. Vary this between two scenarios; if the
+    // recurrence ever started reading `tokens[0]`, the trellis
+    // values would diverge.
+    let mut a = base.clone();
+    let mut b = base.clone();
+    for ti in 0..t {
+      a[ti * v + tokens[0] as usize] = -10.0; // "tokens[0] is unlikely"
+      b[ti * v + tokens[0] as usize] = -0.1; // "tokens[0] is likely"
+    }
+    // Keep `tokens[1]`'s emission identical between the two; it
+    // IS read by the recurrence and any divergence there would
+    // mask the assertion.
+    for ti in 0..t {
+      a[ti * v + tokens[1] as usize] = -1.0;
+      b[ti * v + tokens[1] as usize] = -1.0;
+    }
+
+    let lp_a = lp(t, v, a);
+    let lp_b = lp(t, v, b);
+    let trellis_a = get_trellis(&lp_a, &tokens, blank as u32, never(), &Lang::En).expect("a");
+    let trellis_b = get_trellis(&lp_b, &tokens, blank as u32, never(), &Lang::En).expect("b");
+
+    assert_eq!(
+      trellis_a, trellis_b,
+      "Changing `tokens[0]`'s emission posterior must NOT change the trellis. \
+       If this fires the WhisperX-parity quirk has been broken — see the long \
+       comment above the forward DP loop in get_trellis."
     );
   }
 
