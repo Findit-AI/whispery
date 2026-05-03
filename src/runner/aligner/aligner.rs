@@ -565,10 +565,7 @@ impl Aligner {
         if let Ok(mut f) = std::fs::File::create(&tok_path) {
           use std::io::Write;
           // Hand-format JSON to avoid the serde_json prod dep.
-          let mut payload = alloc::format!(
-            "{{\"blank_id\":{},\"tokens\":[",
-            self.blank_token_id
-          );
+          let mut payload = alloc::format!("{{\"blank_id\":{},\"tokens\":[", self.blank_token_id);
           for (i, t) in tokenized.token_ids.iter().enumerate() {
             if i > 0 {
               payload.push(',');
@@ -663,8 +660,7 @@ impl Aligner {
             use std::io::Write;
             let _ = f.write_all(&(log_probs.t as u32).to_le_bytes());
             let _ = f.write_all(&(tokenized.token_ids.len() as u32).to_le_bytes());
-            let mut buf: alloc::vec::Vec<u8> =
-              alloc::vec::Vec::with_capacity(trellis.len() * 4);
+            let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(trellis.len() * 4);
             for v in &trellis {
               buf.extend_from_slice(&v.to_le_bytes());
             }
