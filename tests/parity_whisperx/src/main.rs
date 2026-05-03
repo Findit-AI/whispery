@@ -366,9 +366,16 @@ fn all_words_len(payload: &serde_json::Value) -> usize {
 }
 
 /// Inject mode: skip whisper.cpp + ManagedTranscriber entirely. Read
-/// the WhisperX JSON, glue its `words[].text` into one transcript,
-/// drive `Aligner::align_chunk` directly. The whole clip is one
-/// chunk; sub-segments cover the full audio (no VAD gaps).
+/// the WhisperX JSON and mirror WhisperX's **per-segment** alignment
+/// flow — for each `segments[]` entry, slice the audio to that
+/// segment's `[start_s, end_s)` window and drive `Aligner::align_chunk`
+/// on just that slice with just that segment's text.
+///
+/// This matches `alignment.py:237-289` (`f1 = int(t1 * SAMPLE_RATE);
+/// f2 = int(t2 * SAMPLE_RATE); waveform_segment = audio[:, f1:f2]`).
+/// The previous whole-clip approach gave CTC too many ambiguous paths
+/// on long clips and the alignment drifted (median IoU 0.000 on
+/// `03_dual_speaker` at 60 s).
 ///
 /// Output schema is identical to the non-inject path so `score.py`
 /// is mode-agnostic.
@@ -391,28 +398,136 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
     w2v_tokenizer.display()
   );
 
-  // Load the WhisperX JSON. We only need `words[].text` here;
-  // start/end/score are WhisperX's own and not relevant to driving
-  // whispery's aligner.
+  // Load the WhisperX JSON. We need `segments[]` (with `start_s`,
+  // `end_s`, `text`, and per-segment `words[]`) for the per-segment
+  // alignment flow; if it's missing, fall back to a synthesised
+  // single segment over the entire `words[]` for back-compat with
+  // older WhisperX outputs.
   let injected: serde_json::Value = {
     let bytes = fs::read(&inject_path)
       .with_context(|| format!("read whisperX JSON {}", inject_path.display()))?;
     serde_json::from_slice(&bytes)
       .with_context(|| format!("parse whisperX JSON {}", inject_path.display()))?
   };
-  let injected_words = injected
+  let injected_words_total = injected
     .get("words")
     .and_then(|v| v.as_array())
-    .ok_or_else(|| anyhow::anyhow!("whisperX JSON missing `words` array"))?;
-  let text: String = injected_words
-    .iter()
-    .filter_map(|w| w.get("text").and_then(|t| t.as_str()))
-    .collect::<Vec<_>>()
-    .join(" ");
+    .map(|a| a.len())
+    .unwrap_or(0);
+
+  // Audio first — needed before we slice per-segment.
+  let samples = read_wav_16k_mono_f32(&args.wav_path)?;
+  let total_samples = samples.len();
+  let duration_s = total_samples as f64 / 16_000.0;
+  let clip_sha256 = sha256_file(&args.wav_path)?;
+
+  // Build the segments list. Prefer `segments[]` (the per-segment
+  // path WhisperX itself uses); fall back to one synthetic segment
+  // over the full clip if absent.
+  struct InjectedSegment {
+    start_s: f64,
+    end_s: f64,
+    text: String,
+  }
+
+  // The parity runner's default mode is per-sentence
+  // `segments[]` — that's what WhisperX itself ends up with
+  // after `align()` plus its `PunktSentenceTokenizer` break-up.
+  //
+  // The `WHISPERY_PARITY_USE_RAW_SEGMENTS=1` env var switches
+  // to `raw_asr_segments[]` (the un-broken ASR segments
+  // WhisperX feeds to `align()`). Useful for diagnosing
+  // hallucinated-repetition cases where the per-sentence
+  // breakdown is a downstream derivation; on those clips the
+  // raw mode produces a more apples-to-apples comparison
+  // (both implementations align the same audio + text). On
+  // clips without hallucination, per-sentence is closer to
+  // what WhisperX's downstream consumers see.
+  let use_raw_segments = std::env::var("WHISPERY_PARITY_USE_RAW_SEGMENTS")
+    .map(|v| v != "0" && !v.is_empty())
+    .unwrap_or(false);
+  let segments: Vec<InjectedSegment> = if use_raw_segments
+    && let Some(segs) = injected.get("raw_asr_segments").and_then(|v| v.as_array())
+  {
+    eprintln!(
+      "[whispery-parity:inject] using raw_asr_segments ({} entries)",
+      segs.len()
+    );
+    segs
+      .iter()
+      .filter_map(|s| {
+        let start_s = s.get("start_s").and_then(|v| v.as_f64())?;
+        let end_s = s.get("end_s").and_then(|v| v.as_f64())?;
+        let text = s
+          .get("text")
+          .and_then(|v| v.as_str())
+          .map(|s| s.trim().to_string())
+          .unwrap_or_default();
+        Some(InjectedSegment {
+          start_s,
+          end_s,
+          text,
+        })
+      })
+      .collect()
+  } else if let Some(segs) = injected.get("segments").and_then(|v| v.as_array())
+  {
+    segs
+      .iter()
+      .filter_map(|s| {
+        let start_s = s.get("start_s").and_then(|v| v.as_f64())?;
+        let end_s = s.get("end_s").and_then(|v| v.as_f64())?;
+        // Segment text: prefer the verbatim `text` field WhisperX
+        // emits; if missing or empty, glue per-segment word texts.
+        let text = s
+          .get("text")
+          .and_then(|v| v.as_str())
+          .map(|s| s.trim().to_string())
+          .filter(|t| !t.is_empty())
+          .or_else(|| {
+            s.get("words").and_then(|v| v.as_array()).map(|ws| {
+              ws.iter()
+                .filter_map(|w| w.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ")
+            })
+          })
+          .unwrap_or_default();
+        Some(InjectedSegment {
+          start_s,
+          end_s,
+          text,
+        })
+      })
+      .collect()
+  } else {
+    // Backwards-compat: no `segments[]`, fall back to a single
+    // pseudo-segment containing all words over the whole clip.
+    eprintln!(
+      "[whispery-parity:inject] WARN: no `segments[]` in inject JSON; \
+       falling back to single whole-clip segment (drift expected on >30s clips)"
+    );
+    let words = injected.get("words").and_then(|v| v.as_array());
+    let text = words
+      .map(|ws| {
+        ws.iter()
+          .filter_map(|w| w.get("text").and_then(|t| t.as_str()))
+          .collect::<Vec<_>>()
+          .join(" ")
+      })
+      .unwrap_or_default();
+    vec![InjectedSegment {
+      start_s: 0.0,
+      end_s: duration_s,
+      text,
+    }]
+  };
+
   eprintln!(
-    "[whispery-parity:inject] injected text: {} words, {} chars",
-    injected_words.len(),
-    text.len()
+    "[whispery-parity:inject] {} segments, {} total injected words across {:.2}s",
+    segments.len(),
+    injected_words_total,
+    duration_s
   );
 
   // Build the aligner directly — no Transcriber, no
@@ -425,21 +540,9 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
   )
   .context("build wav2vec2 Aligner")?;
 
-  let samples = read_wav_16k_mono_f32(&args.wav_path)?;
-  let total_samples = samples.len() as u64;
-  let duration_s = total_samples as f64 / 16_000.0;
-  let clip_sha256 = sha256_file(&args.wav_path)?;
-
-  // VAD-style sub-segment covering the whole clip in chunk-local 16
-  // kHz coordinates. The aligner reads `start_pts() / end_pts()`
-  // directly as sample indices when the segment timebase is
-  // 1/16 kHz; see `aligner::align`'s Step 0 silence-mask loop.
+  // VAD-style sub-segments are computed per-segment below (each
+  // covers its own slice in chunk-local 16 kHz coordinates).
   let analysis_tb = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-  let sub_segments = vec![TimeRange::new(
-    0,
-    samples.len() as i64,
-    analysis_tb,
-  )];
 
   // Caller's output timebase = 1/1000 (millisecond ticks). Chosen to
   // match WhisperX's seconds-as-floats with one decimal place's
@@ -448,45 +551,113 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
   // 1/48000) avoids tick-quantisation rounding when we display
   // boundaries to 3 decimal places.
   let ms_tb = Timebase::new(1, NonZeroU32::new(1_000).unwrap());
-  let sams_to_out = move |start: u64, end: u64| -> TimeRange {
-    // 16 kHz samples → ms ticks: floor(sample * 1000 / 16000).
-    // `start / end` are in stream-sample coordinates, but for a
-    // single-chunk inject with `chunk_first_sample_in_stream = 0`
-    // they ARE chunk-local samples too — same arithmetic either
-    // way.
-    TimeRange::new(
-      (start as i64) * 1_000 / 16_000,
-      (end as i64) * 1_000 / 16_000,
-      ms_tb,
-    )
-  };
 
-  let result = aligner
-    .align_chunk(
-      &samples,
-      &sub_segments,
-      &text,
-      0, // single-chunk: chunk_first_sample_in_stream = 0
-      sams_to_out,
-    )
-    .context("Aligner::align_chunk")?;
-
-  // Words come out in the ms timebase set above; divide ticks by
-  // 1000.0 to surface seconds in the JSON. `range()` is half-open
-  // and already clamped to chunk audio bounds inside
-  // `compose_words`.
   let mut all_words: Vec<serde_json::Value> = Vec::new();
-  for w in result.words() {
-    let r = w.range();
-    let start_s = r.start_pts() as f64 / 1_000.0;
-    let end_s = r.end_pts() as f64 / 1_000.0;
-    all_words.push(json!({
-      "text": w.text(),
-      "start_s": start_s,
-      "end_s": end_s,
-      "score": w.score(),
-    }));
+  let mut segments_aligned = 0usize;
+  let mut segments_skipped_empty = 0usize;
+  let mut segments_failed = 0usize;
+
+  for (idx, seg) in segments.iter().enumerate() {
+    if seg.text.trim().is_empty() {
+      segments_skipped_empty += 1;
+      continue;
+    }
+
+    // Mirror WhisperX: f1/f2 are 16 kHz sample indices over the
+    // segment's `[t1, t2)` window. Clamp to the audio length
+    // defensively (segment metadata can occasionally over-shoot the
+    // clip end by a few samples on the very last segment).
+    let f1 = (seg.start_s * 16_000.0).max(0.0) as usize;
+    let f2_raw = (seg.end_s * 16_000.0).max(0.0) as usize;
+    let f2 = f2_raw.min(total_samples);
+    if f1 >= f2 {
+      // Empty / pathological segment (start >= end after clamping,
+      // or completely past the clip). Skip without erroring.
+      segments_skipped_empty += 1;
+      continue;
+    }
+    let segment_samples = &samples[f1..f2];
+
+    // Single sub-segment covering the segment's full slice in
+    // chunk-local 16 kHz coordinates. Same trick the previous
+    // whole-clip path used; the aligner needs at least one VAD-style
+    // sub-segment to drive its silence mask.
+    let sub_segments = vec![TimeRange::new(
+      0,
+      segment_samples.len() as i64,
+      analysis_tb,
+    )];
+
+    // `chunk_first_sample_in_stream = f1` so the
+    // `samples_to_output_range` closure sees stream-coordinate
+    // sample indices when the aligner converts wav2vec2 frame
+    // indices back. This is exactly WhisperX's `t1` anchor:
+    // `word.start_seconds = char_seg.start * (duration / (T-1)) + t1`.
+    let sams_to_out = move |start: u64, end: u64| -> TimeRange {
+      // 16 kHz samples → ms ticks: floor(sample * 1000 / 16000).
+      TimeRange::new(
+        (start as i64) * 1_000 / 16_000,
+        (end as i64) * 1_000 / 16_000,
+        ms_tb,
+      )
+    };
+
+    let result = match aligner.align_chunk(
+      segment_samples,
+      &sub_segments,
+      &seg.text,
+      f1 as u64,
+      sams_to_out,
+    ) {
+      Ok(r) => r,
+      Err(e) => {
+        // A segment whose alignment fails (e.g. all-OOV text →
+        // empty AlignmentResult, or the silence-mask wipes
+        // everything). Skip its words, keep going.
+        eprintln!(
+          "[whispery-parity:inject] segment {idx} ({:.3}-{:.3}s, \
+           {} chars) failed: {e:?}; skipping",
+          seg.start_s,
+          seg.end_s,
+          seg.text.len()
+        );
+        segments_failed += 1;
+        continue;
+      }
+    };
+
+    let mut seg_word_count = 0usize;
+    for w in result.words() {
+      let r = w.range();
+      let start_s = r.start_pts() as f64 / 1_000.0;
+      let end_s = r.end_pts() as f64 / 1_000.0;
+      all_words.push(json!({
+        "text": w.text(),
+        "start_s": start_s,
+        "end_s": end_s,
+        "score": w.score(),
+      }));
+      seg_word_count += 1;
+    }
+    if seg_word_count == 0 {
+      // Aligner returned successfully but produced zero words
+      // (e.g. text was all-OOV or fully filtered by the silence
+      // mask). Treat the same as a failure for diagnostic
+      // bookkeeping; doesn't crash.
+      segments_failed += 1;
+    } else {
+      segments_aligned += 1;
+    }
   }
+
+  eprintln!(
+    "[whispery-parity:inject] aligned {} segments ({} skipped-empty, \
+     {} failed) → {} output words",
+    segments_aligned,
+    segments_skipped_empty,
+    segments_failed,
+    all_words.len()
+  );
 
   let payload = json!({
     "runner": "whispery",
@@ -494,8 +665,12 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
     "clip_path": args.wav_path.display().to_string(),
     "clip_sha256": clip_sha256,
     "duration_s": duration_s,
-    "transcript_count": 1usize,
-    "injected_word_count": injected_words.len(),
+    "transcript_count": segments_aligned,
+    "injected_word_count": injected_words_total,
+    "segments_total": segments.len(),
+    "segments_aligned": segments_aligned,
+    "segments_skipped_empty": segments_skipped_empty,
+    "segments_failed": segments_failed,
     "words": all_words,
   });
 
@@ -509,7 +684,7 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
       eprintln!(
         "[whispery-parity:inject] wrote {} aligned words ({} input) to {}",
         all_words.len(),
-        injected_words.len(),
+        injected_words_total,
         path.display()
       );
     }

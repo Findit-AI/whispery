@@ -150,22 +150,78 @@ def main() -> int:
     # `{ "word", "start", "end", "score" }`. Some words may lack
     # `start`/`end` if alignment failed for that span; we drop those
     # so downstream IoU only sees fully-aligned words.
+    #
+    # We emit BOTH a per-segment `segments[]` array (so the Rust
+    # runner can mirror WhisperX's per-segment alignment flow — each
+    # segment is a separate `align_chunk` call with `t1 = seg.start_s`
+    # as the audio anchor) AND a flat `words[]` (which `score.py`
+    # consumes; kept for backwards compat).
     out_words = []
+    out_segments = []
     for seg in aligned["segments"]:
+        seg_words = []
         for w in seg.get("words", []):
             if "start" not in w or "end" not in w:
                 continue
-            out_words.append(
-                {
-                    "text": w["word"],
-                    "start_s": float(w["start"]),
-                    "end_s": float(w["end"]),
-                    # WhisperX's `score` is the wav2vec2 CTC
-                    # alignment score; same semantics as
-                    # whispery's `Word::score`.
-                    "score": float(w.get("score", 0.0)),
-                }
-            )
+            entry = {
+                "text": w["word"],
+                "start_s": float(w["start"]),
+                "end_s": float(w["end"]),
+                # WhisperX's `score` is the wav2vec2 CTC
+                # alignment score; same semantics as
+                # whispery's `Word::score`.
+                "score": float(w.get("score", 0.0)),
+            }
+            seg_words.append(entry)
+            out_words.append(entry)
+
+        # Segment text: prefer the `text` field WhisperX threads
+        # through alignment (it carries the original Whisper
+        # transcription verbatim). Fall back to joining word texts
+        # when the field is absent — diagnostic-only, alignment is
+        # driven by the per-segment word list.
+        seg_text = seg.get("text", " ".join(w["text"] for w in seg_words))
+        # WhisperX retains segment-level start/end after alignment
+        # (alignment.py keeps `aligned_seg["start"] / ["end"]`).
+        # Fall back to bracketing word ranges if missing.
+        if "start" in seg and "end" in seg:
+            seg_start = float(seg["start"])
+            seg_end = float(seg["end"])
+        elif seg_words:
+            seg_start = min(w["start_s"] for w in seg_words)
+            seg_end = max(w["end_s"] for w in seg_words)
+        else:
+            # Empty segment with no times either — skip; the Rust
+            # runner is told to skip these too.
+            continue
+
+        out_segments.append(
+            {
+                "start_s": seg_start,
+                "end_s": seg_end,
+                "text": seg_text.strip() if isinstance(seg_text, str) else "",
+                "words": seg_words,
+            }
+        )
+
+    # Raw ASR segments — exactly what `result["segments"]` carries
+    # before alignment. Whispery's parity runner consumes these
+    # to match WhisperX's GLOBAL alignment behaviour: each raw
+    # segment carries the full ASR text (potentially with
+    # hallucinated repetitions on long silences) and the audio
+    # span the ASR claimed for it. Aligning per-raw-segment is
+    # what WhisperX itself does (`whisperx.align(result["segments"], ...)`).
+    # The per-sentence breakdown WhisperX adds afterwards is a
+    # consumer-side derivation, not the alignment unit.
+    raw_asr_segments = []
+    for seg in result["segments"]:
+        if "start" not in seg or "end" not in seg or "text" not in seg:
+            continue
+        raw_asr_segments.append({
+            "start_s": float(seg["start"]),
+            "end_s": float(seg["end"]),
+            "text": str(seg["text"]).strip(),
+        })
 
     payload = {
         "runner": "whisperx",
@@ -173,6 +229,8 @@ def main() -> int:
         "clip_sha256": clip_sha256,
         "duration_s": duration_s,
         "transcript_count": len(aligned["segments"]),
+        "segments": out_segments,
+        "raw_asr_segments": raw_asr_segments,
         "words": out_words,
     }
 
