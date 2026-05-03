@@ -121,7 +121,10 @@ The script:
    `tests/parity_whisperx/out/whisperx_<fixture>.json`.
 4. Runs `score.py` over the two JSON files, prints a human-readable
    summary on stderr, writes `out/score_<fixture>.json`, and exits
-   with the score's exit code (0 iff median IoU ≥ 0.7).
+   with the score's exit code. Pass criteria: `median IoU ≥ 0.95
+   AND mean IoU ≥ 0.95 AND below_0.5 == 0`. The achievable baseline
+   on the 5-fixture set is **median 0.995–0.999, mean 0.983–0.998,
+   below_0.5 = 0** across 854 word pairs.
 
 A direct WAV path also works:
 
@@ -169,14 +172,16 @@ Both runners emit JSON in this shape:
   "dropped_by_whisperx": 4,
   "iou": {
     "count": 71,
-    "mean": 0.86,
-    "median": 0.92,
-    "p10": 0.65,
-    "p90": 0.97,
-    "below_0.5": 3
+    "mean": 0.983,
+    "median": 0.997,
+    "p10": 0.951,
+    "p90": 1.000,
+    "below_0.5": 0
   },
   "worst_5": [...],
-  "threshold_median_iou": 0.7,
+  "threshold_median_iou": 0.95,
+  "threshold_mean_iou": 0.95,
+  "threshold_max_below_0_5": 0,
   "passed": true
 }
 ```
@@ -193,9 +198,39 @@ Both runners emit JSON in this shape:
   whispery aligns one whisper.cpp chunk at a time. IoU on individual
   words is unaffected (alignment is per-word) but transcript-level
   counts will diverge.
-- The 0.7 median-IoU threshold is a "functionally equivalent" bar,
-  not a "bit-exact" one. Tighten it (e.g. `--threshold 0.85`) once
-  whispery's alignment is stable on a wider corpus.
+
+## Segment-iteration mode (`raw_asr_segments` vs `segments`)
+
+Per-fixture parity above (median 0.995+) is contingent on the
+parity runner feeding whispery the **un-broken ASR segments
+WhisperX itself feeds to its own `align()`** — emitted as
+`raw_asr_segments[]` in the inject JSON. This is the runner's
+default. The hard guard at `tests/parity_whisperx/src/main.rs`
+errors out if the inject JSON is missing `raw_asr_segments[]`,
+so a future change to `whisperx_runner.py` that drops them
+fails loud.
+
+The legacy mode (per-sentence WhisperX `segments[]`, the
+post-alignment broken-up view) is **not equivalent** for parity
+purposes: WhisperX has already done its own forced alignment
+and split the segments at word/phrase boundaries; asking
+whispery to re-align each sub-chunk independently exercises
+the wav2vec2 encoder on inputs WhisperX never inferenced on
+and amplifies inherent ORT-vs-PyTorch numerical drift into
+per-word 60–250 ms shifts. On 03_dual_speaker that mode lands
+at median **0.196 / 70 below-0.5** (vs 0.995 / 0 in default
+mode).
+
+To reproduce the diagnostic per-sentence mode:
+
+```bash
+WHISPERY_PARITY_USE_PER_SENTENCE_SEGMENTS=1 \
+  ./tests/parity_whisperx/run.sh /path/to/fixture
+```
+
+Don't enable this for production parity — it measures
+whispery against a downstream WhisperX derivation rather than
+WhisperX's own forced-alignment reference.
 
 ## Encoder export trade-off (advanced)
 
