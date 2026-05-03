@@ -616,7 +616,21 @@ where
   let mut i1 = 0_usize;
   let mut i2 = 0_usize;
   while i1 < n {
-    let at_boundary = i2 >= n || is_separator(char_segments[i2].token_index);
+    // A "word boundary" fires when:
+    //   1. We've walked off the end of the segments.
+    //   2. The token at i2 is a separator (`|` for English).
+    //   3. The word index for the char at i2 differs from the
+    //      word index for the char at i1 (CJK case: no
+    //      separator tokens, but each glyph carries its own
+    //      `word_idx`). Only checked once we've consumed at
+    //      least one char (`i2 > i1`); i1 == i2 means we just
+    //      stepped past a separator and have no in-progress
+    //      word to compare against.
+    let at_boundary = i2 >= n
+      || is_separator(char_segments[i2].token_index)
+      || (i2 > i1
+        && word_idx_for_token(char_segments[i2].token_index)
+          != word_idx_for_token(char_segments[i1].token_index));
     if at_boundary {
       if i1 != i2 {
         // Slice [i1..i2) is the word's chars. WhisperX's
@@ -652,8 +666,20 @@ where
           });
         }
       }
-      i1 = i2 + 1;
-      i2 = i1;
+      // Advance the cursor:
+      // - If we landed on a separator (or fell off the end),
+      //   skip it: i1 = i2 + 1, i2 = i1.
+      // - If we hit a word-idx change at a non-separator char,
+      //   that char is the START of the next word — keep it:
+      //   i1 = i2 (and don't increment i2 yet).
+      if i2 < n && !is_separator(char_segments[i2].token_index) {
+        // Word-index change at a non-separator char: don't
+        // skip, that char belongs to the next word group.
+        i1 = i2;
+      } else {
+        i1 = i2 + 1;
+        i2 = i1;
+      }
     } else {
       i2 += 1;
     }
@@ -978,6 +1004,144 @@ mod tests {
       "duration-weighted score wrong: {}",
       words[0].score
     );
+  }
+
+  /// CJK case: per-glyph word indices with NO separator tokens.
+  /// Each char has its own `word_idx`, so `merge_words` must
+  /// emit one `WordSegment` per glyph by detecting the word-idx
+  /// transition between adjacent chars.
+  #[test]
+  fn merge_words_no_separator_splits_by_word_idx() {
+    let segs = alloc::vec![
+      CharSegment {
+        token_index: 0,
+        start_frame: 0,
+        end_frame: 2,
+        score: 0.5,
+      },
+      CharSegment {
+        token_index: 1,
+        start_frame: 2,
+        end_frame: 4,
+        score: 0.5,
+      },
+      CharSegment {
+        token_index: 2,
+        start_frame: 4,
+        end_frame: 6,
+        score: 0.5,
+      },
+    ];
+    let is_sep = |_| false;
+    let word_idx = |t: usize| -> Option<usize> {
+      match t {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        _ => None,
+      }
+    };
+    let words = merge_words(&segs, is_sep, word_idx);
+    assert_eq!(words.len(), 3, "each glyph must become its own word");
+    assert_eq!(words[0].word_index, 0);
+    assert_eq!(words[0].start_frame, 0);
+    assert_eq!(words[0].end_frame, 2);
+    assert_eq!(words[1].word_index, 1);
+    assert_eq!(words[1].start_frame, 2);
+    assert_eq!(words[1].end_frame, 4);
+    assert_eq!(words[2].word_index, 2);
+    assert_eq!(words[2].start_frame, 4);
+    assert_eq!(words[2].end_frame, 6);
+  }
+
+  /// Hypothetical case: no separator and adjacent chars share a
+  /// word index. The first two chars belong to word 0 and the
+  /// third to word 1. Two `WordSegment`s expected.
+  #[test]
+  fn merge_words_no_separator_groups_same_word_idx_across_chars() {
+    let segs = alloc::vec![
+      CharSegment {
+        token_index: 0,
+        start_frame: 0,
+        end_frame: 2,
+        score: 0.5,
+      },
+      CharSegment {
+        token_index: 1,
+        start_frame: 2,
+        end_frame: 4,
+        score: 0.5,
+      },
+      CharSegment {
+        token_index: 2,
+        start_frame: 4,
+        end_frame: 6,
+        score: 0.5,
+      },
+    ];
+    let is_sep = |_| false;
+    let word_idx = |t: usize| -> Option<usize> {
+      match t {
+        0 => Some(0),
+        1 => Some(0),
+        2 => Some(1),
+        _ => None,
+      }
+    };
+    let words = merge_words(&segs, is_sep, word_idx);
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[0].word_index, 0);
+    assert_eq!(words[0].start_frame, 0);
+    assert_eq!(words[0].end_frame, 4); // covers chars 0-1
+    assert_eq!(words[1].word_index, 1);
+    assert_eq!(words[1].start_frame, 4);
+    assert_eq!(words[1].end_frame, 6); // covers char 2
+  }
+
+  /// English-style separator path still works after the new
+  /// word-idx-change condition: token 1 is a separator, so the
+  /// new condition's `i2 > i1` guard prevents firing on the
+  /// separator boundary itself (the separator branch handles it
+  /// first via `is_separator`).
+  #[test]
+  fn merge_words_separator_still_works() {
+    let segs = alloc::vec![
+      CharSegment {
+        token_index: 0,
+        start_frame: 0,
+        end_frame: 2,
+        score: 0.5,
+      },
+      CharSegment {
+        token_index: 1, // separator
+        start_frame: 2,
+        end_frame: 3,
+        score: 0.5,
+      },
+      CharSegment {
+        token_index: 2,
+        start_frame: 3,
+        end_frame: 5,
+        score: 0.5,
+      },
+    ];
+    let is_sep = |t: usize| t == 1;
+    let word_idx = |t: usize| -> Option<usize> {
+      match t {
+        0 => Some(0),
+        1 => None,
+        2 => Some(1),
+        _ => None,
+      }
+    };
+    let words = merge_words(&segs, is_sep, word_idx);
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[0].word_index, 0);
+    assert_eq!(words[0].start_frame, 0);
+    assert_eq!(words[0].end_frame, 2);
+    assert_eq!(words[1].word_index, 1);
+    assert_eq!(words[1].start_frame, 3);
+    assert_eq!(words[1].end_frame, 5);
   }
 
   #[test]

@@ -9,7 +9,7 @@
 //! Bench inputs target the production envelope: 30 s of 16 kHz
 //! mono audio (480 000 samples) for the per-utterance normaliser
 //! and the wav2vec2-base-960h output dimensions (T = 1500 frames,
-//! V = 32 vocab) for `ctc_viterbi`.
+//! V = 32 vocab) for the trellis/beam stage.
 //!
 //! Run with:
 //!
@@ -24,7 +24,7 @@ use whispery::__bench::neon;
 #[cfg(target_arch = "x86_64")]
 use whispery::__bench::{x86_avx2, x86_avx512, x86_sse41};
 use whispery::{
-  __bench::{LogProbsTV, ctc_viterbi, scalar, zero_mean_unit_var_normalize},
+  __bench::{LogProbsTV, get_trellis, scalar, zero_mean_unit_var_normalize},
   Lang,
 };
 
@@ -144,18 +144,30 @@ fn bench_ctc_viterbi(c: &mut Criterion) {
   // Tokens for 30 s of speech: roughly 100-300 chars depending on
   // language and density. Bench at the lower end (100, distinct
   // ids cycling through V-1 to keep adjacent-equal rare).
+  //
+  // `get_trellis` is the trellis-build half of the round-25
+  // bit-exact port (formerly `ctc_viterbi`'s DP fill). It owns the
+  // `(T+1, num_tokens)` tensor walk that's the hottest scalar
+  // routine in the alignment pipeline, so it's the natural target
+  // for SIMD restructuring once we have the bit-exact baseline.
+  // We don't follow the full `align_to_word_segments` path here
+  // because it requires per-token word indices — synthetic tokens
+  // would need a fake mapping that adds setup noise without
+  // changing what we're measuring.
   const T_FRAMES: usize = 1500;
   const VOCAB: usize = 32;
   const TOKENS_LEN: usize = 100;
 
   let log_probs = synth_log_probs(T_FRAMES, VOCAB);
-  let tokens: Vec<u32> = (0..TOKENS_LEN as u32)
-    .map(|i| 1 + i % (VOCAB as u32 - 1))
+  // `get_trellis` takes `&[i32]` (wildcard sentinel `-1` is
+  // allowed). Tokens here are real vocab ids in `[1, V-1]`.
+  let tokens: Vec<i32> = (0..TOKENS_LEN as i32)
+    .map(|i| 1 + i % (VOCAB as i32 - 1))
     .collect();
 
   let mut group = c.benchmark_group("ctc_viterbi");
   // Throughput: report as "frames per second" via the `Elements`
-  // dimension so we can compare future SIMD-restructured Viterbi
+  // dimension so we can compare future SIMD-restructured trellis
   // attempts directly.
   group.throughput(Throughput::Elements(T_FRAMES as u64));
   group.bench_function(
@@ -167,7 +179,7 @@ fn bench_ctc_viterbi(c: &mut Criterion) {
         // Discard through `black_box` so the optimiser can't
         // elide the call — we don't care about the result, just
         // that the DP runs.
-        let _ = black_box(ctc_viterbi(
+        let _ = black_box(get_trellis(
           black_box(&log_probs),
           black_box(&tokens),
           /* blank_id: */ 0,
