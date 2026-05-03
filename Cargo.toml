@@ -89,6 +89,14 @@ bench-internals = ["alignment"]
 # to whichever vocab item happens to win the frame. Off by default;
 # opt in only if downstream consumers expect WhisperX-1:1 behaviour.
 whisperx-strict-tokenizer = ["alignment"]
+# Diagnostic-only: write `wy_seg<N>.{emission,trellis}.bin` and a
+# `wy_seg<N>.tokens.json` companion to the directory pointed to by
+# `WHISPERY_PARITY_DUMP_TRELLIS` whenever set on a process running
+# `Aligner::align_chunk`. The dump uses hand-formatted JSON for the
+# tokens companion (no serde_json runtime dep) and `std::fs::File`
+# directly. Do NOT enable in shipping builds — the env hook + dump
+# bytes never check failures.
+parity-dump-emission = ["alignment"]
 
 [lib]
 name = "whispery"

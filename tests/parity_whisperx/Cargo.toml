@@ -11,7 +11,7 @@ description = "Manual parity harness: dump whispery alignment output to JSON for
 # `whispery` carries the `runner` + `alignment` features that this binary
 # exercises. Pinned by path because this is in-tree tooling, not a
 # downstream consumer.
-whispery     = { path = "../..", default-features = false, features = ["runner", "alignment"] }
+whispery     = { path = "../..", default-features = false, features = ["runner", "alignment", "bench-internals", "parity-dump-emission"] }
 whisper-rs   = { version = "0.13", default-features = false }
 hound        = "3"
 serde_json   = "1"
@@ -22,3 +22,7 @@ anyhow       = "1"
 [[bin]]
 name = "whispery-parity-runner"
 path = "src/main.rs"
+
+[[bin]]
+name = "whispery-trellis-diff"
+path = "src/bin/trellis_diff.rs"

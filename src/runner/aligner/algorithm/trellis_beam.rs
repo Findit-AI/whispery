@@ -61,7 +61,9 @@ pub const WILDCARD_TOKEN_ID: i32 = -1;
 /// observably better alignments on the wav2vec2 family
 /// according to the reference implementation; we mirror the
 /// upstream choice.
-pub(crate) const ALIGN_BEAM_WIDTH: usize = 2;
+///
+/// `pub` for the `feature = "bench-internals"` re-export.
+pub const ALIGN_BEAM_WIDTH: usize = 2;
 
 /// Cap on `T * num_tokens` cells in the forward trellis. Same
 /// reasoning as the legacy Viterbi guard: a hallucinated long
@@ -136,7 +138,9 @@ pub struct WordSegment {
 ///     trellis[t, :-1] + wildcard_emission(emission[t], tokens[1:]),
 /// )
 /// ```
-pub(crate) fn get_trellis(
+///
+/// `pub` for the `feature = "bench-internals"` re-export.
+pub fn get_trellis(
   log_probs: &LogProbsTV,
   tokens: &[i32],
   blank_id: u32,
@@ -347,7 +351,9 @@ struct BeamState {
 /// best path of length `T` (one `PathPoint` per frame) on
 /// success, or a typed `WorkFailure` if the beam empties before
 /// we reach token 0.
-pub(crate) fn backtrack_beam(
+///
+/// `pub` for the `feature = "bench-internals"` re-export.
+pub fn backtrack_beam(
   trellis: &[f32],
   log_probs: &LogProbsTV,
   tokens: &[i32],
@@ -533,10 +539,15 @@ pub(crate) fn backtrack_beam(
 
 /// Public-facing path point. Same shape as the internal
 /// `PathPoint` but escapes `BeamState`'s lifetime.
+///
+/// `pub` for the `feature = "bench-internals"` re-export.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PathPointPublic {
+pub struct PathPointPublic {
+  /// Index into `tokens` / `text_clean`.
   pub token_index: usize,
+  /// Frame index this point covers.
   pub time_index: usize,
+  /// Linear-space probability emitted at this frame.
   pub score: f32,
 }
 

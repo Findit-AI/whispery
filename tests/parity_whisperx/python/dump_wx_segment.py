@@ -39,6 +39,15 @@ def main() -> int:
     parser.add_argument("wav_path", type=Path)
     parser.add_argument("seg_index", type=int)
     parser.add_argument("--whisperx-json", type=Path, default=None)
+    parser.add_argument(
+        "--segments-key",
+        default="raw_asr_segments",
+        choices=("raw_asr_segments", "segments"),
+        help="Which segments[] field of the WhisperX JSON to index "
+        "into. Default raw_asr_segments matches what the parity "
+        "harness feeds whispery; pass `segments` to address the "
+        "per-sentence breakdown WhisperX exposes downstream.",
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--align-model",
@@ -56,9 +65,9 @@ def main() -> int:
     else:
         wxj = args.whisperx_json
     payload = json.loads(wxj.read_text())
-    raw = payload["raw_asr_segments"]
+    raw = payload[args.segments_key]
     if args.seg_index < 0 or args.seg_index >= len(raw):
-        print(f"seg index out of range: {args.seg_index} vs len {len(raw)}")
+        print(f"seg index out of range: {args.seg_index} vs len {len(raw)} ({args.segments_key})")
         return 2
     seg = raw[args.seg_index]
     t1 = float(seg["start_s"])
@@ -224,6 +233,27 @@ def main() -> int:
     }
     args.out.write_text(json.dumps(out, indent=2))
     print(f"wrote {args.out}")
+
+    # Side-car: full trellis as raw binary (T u32 LE, NTOK u32 LE,
+    # then T*NTOK f32 LE in row-major order). Used by
+    # `compare_trellis.py` to diff against whispery's dump.
+    trellis_bin_path = args.out.with_suffix(".trellis.bin")
+    with open(trellis_bin_path, "wb") as f:
+        f.write(int(T).to_bytes(4, "little"))
+        f.write(int(NTOK).to_bytes(4, "little"))
+        f.write(tr.astype(np.float32).tobytes(order="C"))
+    print(f"wrote {trellis_bin_path}")
+
+    # Side-car: full emission tensor as raw binary (T u32 LE, V u32 LE,
+    # then T*V f32 LE row-major). Lets us re-run whispery's algorithms
+    # against PyTorch's emissions to isolate forward-DP vs. beam
+    # divergences.
+    emission_bin_path = args.out.with_suffix(".emission.bin")
+    with open(emission_bin_path, "wb") as f:
+        f.write(int(T).to_bytes(4, "little"))
+        f.write(int(V).to_bytes(4, "little"))
+        f.write(em.astype(np.float32).tobytes(order="C"))
+    print(f"wrote {emission_bin_path}")
     return 0
 
 

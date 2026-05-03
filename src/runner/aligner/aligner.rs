@@ -524,6 +524,68 @@ impl Aligner {
       &self.language,
     )?;
 
+    // Diagnostic: when the parity harness sets
+    // `WHISPERY_PARITY_DUMP_TRELLIS` to a directory, write a
+    // per-segment `wy_seg<N>.emission.bin` and (after the trellis
+    // step below) `wy_seg<N>.trellis.bin` plus a
+    // `wy_seg<N>.tokens.json` companion. The `<N>` counter is a
+    // monotonic integer drawn from a process-global atomic so each
+    // alignment call against the harness gets a unique slot. The
+    // hot path bails out cheaply when the env var isn't set; this
+    // adds a single env lookup per `align_chunk` and is gated on
+    // an opt-in env var, so production runs are unaffected.
+    //
+    // Lives behind the `parity-dump-emission` feature so the env
+    // hook + `serde_json` formatter don't compile into the prod
+    // `Aligner` for downstream consumers.
+    #[cfg(feature = "parity-dump-emission")]
+    {
+      use core::sync::atomic::AtomicUsize;
+      static SEG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+      if let Ok(dir) = std::env::var("WHISPERY_PARITY_DUMP_TRELLIS") {
+        let n = SEG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir_path = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir_path);
+        let em_path = dir_path.join(alloc::format!("wy_seg{n}.emission.bin"));
+        if let Ok(mut f) = std::fs::File::create(&em_path) {
+          use std::io::Write;
+          let _ = f.write_all(&(log_probs.t as u32).to_le_bytes());
+          let _ = f.write_all(&(log_probs.v as u32).to_le_bytes());
+          // Write as f32 LE one cell at a time. The dump path is
+          // diagnostic-only; the per-cell `to_le_bytes` is acceptable
+          // overhead for the few-K-cells * once-per-segment frequency.
+          let mut buf: alloc::vec::Vec<u8> =
+            alloc::vec::Vec::with_capacity(log_probs.data.len() * 4);
+          for v in &log_probs.data {
+            buf.extend_from_slice(&v.to_le_bytes());
+          }
+          let _ = f.write_all(&buf);
+        }
+        let tok_path = dir_path.join(alloc::format!("wy_seg{n}.tokens.json"));
+        if let Ok(mut f) = std::fs::File::create(&tok_path) {
+          use std::io::Write;
+          // Hand-format JSON to avoid the serde_json prod dep.
+          let mut payload = alloc::format!(
+            "{{\"blank_id\":{},\"tokens\":[",
+            self.blank_token_id
+          );
+          for (i, t) in tokenized.token_ids.iter().enumerate() {
+            if i > 0 {
+              payload.push(',');
+            }
+            payload.push_str(&alloc::format!("{}", t));
+          }
+          payload.push_str(&alloc::format!(
+            "],\"n_samples\":{},\"T\":{},\"V\":{}}}",
+            padded_samples.len(),
+            log_probs.t,
+            log_probs.v
+          ));
+          let _ = f.write_all(payload.as_bytes());
+        }
+      }
+    }
+
     // Two-sided stride check: the encoded time `T * hop_samples`
     // must lie within `samples.len() ± 2*hop_samples`. Catches
     // both stride-too-small (T*hop overshoots — `compose_words`
@@ -575,6 +637,42 @@ impl Aligner {
       abort_flag,
       &self.language,
     )?;
+
+    // Companion to the emission dump above: rebuild the trellis
+    // diagnostically and dump it. We don't capture it from
+    // `align_to_word_segments` to avoid leaking the trellis allocation
+    // into a prod-facing return type. Recomputation is O(T*N) and
+    // only fires when the env var is set on a parity harness run.
+    #[cfg(feature = "parity-dump-emission")]
+    {
+      use core::sync::atomic::AtomicUsize;
+      static TRELLIS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+      if let Ok(dir) = std::env::var("WHISPERY_PARITY_DUMP_TRELLIS") {
+        let n = TRELLIS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir_path = std::path::PathBuf::from(dir);
+        let trellis = crate::runner::aligner::algorithm::trellis_beam::get_trellis(
+          &log_probs,
+          &tokenized.token_ids,
+          self.blank_token_id,
+          abort_flag,
+          &self.language,
+        );
+        if let Ok(trellis) = trellis {
+          let path = dir_path.join(alloc::format!("wy_seg{n}.trellis.bin"));
+          if let Ok(mut f) = std::fs::File::create(&path) {
+            use std::io::Write;
+            let _ = f.write_all(&(log_probs.t as u32).to_le_bytes());
+            let _ = f.write_all(&(tokenized.token_ids.len() as u32).to_le_bytes());
+            let mut buf: alloc::vec::Vec<u8> =
+              alloc::vec::Vec::with_capacity(trellis.len() * 4);
+            for v in &trellis {
+              buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let _ = f.write_all(&buf);
+          }
+        }
+      }
+    }
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());

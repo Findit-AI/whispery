@@ -89,7 +89,10 @@ pub mod __bench {
     encode::LogProbsTV,
     normalize::{scalar, zero_mean_unit_var_normalize},
     tokenize::{TokenizedText, tokenize_with_word_map},
-    trellis_beam::{WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments},
+    trellis_beam::{
+      ALIGN_BEAM_WIDTH, PathPointPublic, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments,
+      backtrack_beam, get_trellis,
+    },
   };
 
   #[cfg(target_arch = "aarch64")]
