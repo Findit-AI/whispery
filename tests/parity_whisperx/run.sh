@@ -5,8 +5,11 @@
 # - `target/whispery-test-fixtures/{ggml-tiny.en.bin, wav2vec2-base-960h.onnx,
 #   wav2vec2-base-960h-tokenizer.json}` (run `WHISPERY_FETCH_MODEL=1
 #   WHISPERY_FETCH_W2V=1 cargo test --features alignment` once to populate)
-# - `ORT_DYLIB_PATH` pointing at libonnxruntime (load-dynamic mode)
 # - `uv` on PATH (https://docs.astral.sh/uv/)
+#
+# `ORT_DYLIB_PATH` (load-dynamic mode) is auto-detected from the venv's
+# `onnxruntime` package below — bring up the venv first if it's missing.
+# An externally-set `ORT_DYLIB_PATH` overrides the auto-detect.
 #
 # Usage:
 #   ./tests/parity_whisperx/run.sh <fixture-dir-or-wav>
@@ -86,6 +89,25 @@ uv run python whisperx_runner.py "$ABS_CLIP" --out "$WHISPERX_OUT"
 
 # 3) Rust runner in inject mode. Reads WhisperX's transcript and
 # feeds it into whispery's aligner directly — no whisper.cpp.
+#
+# Auto-detect `ORT_DYLIB_PATH` from the venv's bundled
+# `libonnxruntime.<ver>.dylib`. ORT 2.0.0-rc.12 in load-dynamic mode
+# silently hangs in `Session::commit_from_file` when the path is
+# unset (instead of erroring), so an unset env var here is a sharp
+# foot-gun. An explicitly-set `ORT_DYLIB_PATH` wins.
+if [ -z "${ORT_DYLIB_PATH:-}" ]; then
+  ORT_DYLIB_PATH=$(find "$SCRIPT_DIR/python/.venv" \
+    -name 'libonnxruntime*.dylib' -o \
+    -name 'libonnxruntime*.so' 2>/dev/null | head -1)
+  if [ -z "$ORT_DYLIB_PATH" ]; then
+    echo "[run.sh] could not locate libonnxruntime under $SCRIPT_DIR/python/.venv/" >&2
+    echo "[run.sh] (the venv must be created by step 1 above before the Rust runner can dlopen ORT)" >&2
+    exit 70
+  fi
+  export ORT_DYLIB_PATH
+  echo "[run.sh] ORT_DYLIB_PATH=$ORT_DYLIB_PATH"
+fi
+
 cd "$ROOT"
 echo "[run.sh] running whispery-parity-runner (--inject-from) ..."
 cargo run \
