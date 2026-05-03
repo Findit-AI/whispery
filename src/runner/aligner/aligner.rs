@@ -476,15 +476,27 @@ impl Aligner {
     // race-window cases (terminate fired, run already returning
     // success).
     //
-    // The samples we hand to ORT have already gone through the
-    // silence-aware normaliser above — `encode_log_softmax`
-    // expects pre-normalised input. A pre-fix internal-normalise
-    // inside `encode_log_softmax` broke the silence mask.
-    let normalized_samples =
-      crate::runner::aligner::algorithm::normalize::normalize_with_silence_mask(
-        samples,
-        &speech_mask,
-      );
+    // **WhisperX parity:** WhisperX's `alignment.py` feeds the
+    // **raw** waveform to `Wav2Vec2ForCTC.forward` (line 255 — the
+    // HF processor's mean/var normalisation step is skipped). The
+    // wav2vec2-base architecture has GroupNorm on the first conv
+    // layer so it tolerates unnormalised audio in `[-1, 1]`, but
+    // the resulting emissions differ materially from the
+    // processor-normalised path: per-frame argmax disagrees on
+    // ~14 % of frames over a 24 s segment, and individual blank
+    // log-probabilities differ by up to 5+ nats. To match the
+    // de facto reference's frame-level timing decisions we drop
+    // the pre-encode mean/var normalisation and feed the silence-
+    // masked but otherwise raw audio buffer to ORT. The model's
+    // GroupNorm absorbs the global scale; the silence-mask
+    // contract — `false` positions → exactly `0.0_f32` going
+    // into the encoder — is preserved by zeroing non-speech
+    // samples before handoff.
+    let normalized_samples: alloc::vec::Vec<f32> = samples
+      .iter()
+      .zip(speech_mask.iter())
+      .map(|(&s, &is_speech)| if is_speech { s } else { 0.0_f32 })
+      .collect();
 
     // wav2vec2's CNN front-end has a minimum input length (the
     // receptive field of the first stride-conv) of 400 samples
