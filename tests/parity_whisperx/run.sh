@@ -92,6 +92,7 @@ cargo run \
   --release \
   --manifest-path tests/parity_whisperx/Cargo.toml \
   -p whispery-parity-runner \
+  --bin whispery-parity-runner \
   -- "$ABS_CLIP" \
   --inject-from "$WHISPERX_OUT" \
   --out "$WHISPERY_OUT"

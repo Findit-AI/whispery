@@ -60,6 +60,20 @@ for release-time validation, the same status as `dia/tests/parity/`.
 3. **`uv`.** `brew install uv` or `pip install uv`. Used to manage the
    WhisperX venv at `tests/parity_whisperx/python/.venv`.
 
+4. **System FFmpeg libraries.** The Rust runner links `ffmpeg-next`
+   (its audio loader mirrors WhisperX's `load_audio` exactly, so the
+   parity check sees byte-identical audio on both sides). On macOS:
+   `brew install ffmpeg`. On Debian/Ubuntu:
+   `apt-get install libavformat-dev libavcodec-dev libavutil-dev libswresample-dev pkg-config`.
+
+   The `ffmpeg-next` major version is pinned to match the system
+   FFmpeg ABI; see the comment block in
+   `tests/parity_whisperx/Cargo.toml`. The harness currently targets
+   FFmpeg 8 (the only major still maintained as of 2026); FFmpeg 7's
+   header file `libavcodec/avfft.h` is referenced by `ffmpeg-next 7`'s
+   bindgen pass and was dropped in FFmpeg 8, so mixing the two does
+   not build.
+
 GPU is **not required**. The Python runner pins device=`cpu` and
 compute_type=`int8` for determinism — CTranslate2 GPU paths have
 non-deterministic floating-point ordering that would add noise without
@@ -123,6 +137,12 @@ Both runners emit JSON in this shape:
 {
   "runner": "whispery" | "whisperx",
   "clip_path": "/abs/path/to/clip.wav",
+  // SHA-256 of the f32 byte buffer that the model actually
+  // consumes — NOT the file bytes. Both runners load via
+  // ffmpeg → s16le → f32/32768, so the two hashes match iff
+  // both pipelines decoded the audio identically. A mismatch
+  // is a fast diagnostic that the audio-loader paths have
+  // diverged again.
   "clip_sha256": "...",
   "duration_s": 30.0,
   "transcript_count": 1,
@@ -193,35 +213,36 @@ the 01_dialogue/seg-3 hallucination is **2.44e-3 nats** (mean 2.10e-4,
 no encoder gap to close.
 
 The community export and the re-export produce **identical IoU
-scores** on the 5-fixture suite (confirmed 2026-05). Both yield:
+scores** on the 5-fixture suite. After the audio-loader switch to
+`ffmpeg-next` (2026-05) the harness yields:
 
 | Fixture                | Median IoU | below 0.5 |
 |------------------------|------------|-----------|
-| `01_dialogue/`         | 0.996      | 19        |
+| `01_dialogue/`         | 0.997      | 0         |
 | `02_pyannote_sample/`  | 0.997      | 0         |
 | `03_dual_speaker/`     | 0.995      | 0         |
 | `04_three_speaker/`    | 0.999      | 0         |
 | `05_four_speaker/`     | 0.996      | 0         |
 
-The 19 below-0.5 outliers in `01_dialogue` correspond to a Whisper
-hallucination ("no, no, no..." × 112) where whispery's per-word
-alignments line up one-token offset against WhisperX's. The
-score function pairs words by sequence position, so each off-by-one
-pair scores IoU=0; the underlying timings differ by ~80 ms (one CTC
-token width). This is a scoring-methodology artifact, not an encoder
-divergence.
+The 19 below-0.5 outliers in `01_dialogue` previously corresponded
+to a Whisper hallucination ("no, no, no..." × 112) where whispery's
+per-word alignments lined up one-token offset against WhisperX's.
+Replacing the harness's `hound`-based loader with one that mirrors
+WhisperX's `load_audio` byte-for-byte (`ffmpeg → s16le → /32768.0`)
+removed the loader-driven divergence and the off-by-one outliers
+disappeared.
 
 The previously-published "1.45 nat encoder divergence on seg 20" was
 in fact an **audio-loader divergence**, not an encoder divergence.
 WhisperX's `load_audio` runs ffmpeg → s16le → `np.float32 / 32768.0`,
 which is a lossy round-trip for f32-encoded WAV files (this corpus is
-all f32-encoded). whispery's `hound`-based loader reads f32 samples
-directly. The ~30-PPM input mismatch propagates through 12 transformer
-layers and produces ~1.45 nat divergence on numerically sensitive
-frames. When the WhisperX side dumps emissions with the same float
-audio whispery sees, the encoder agrees to ~2.4e-3 nats. The trellis
-is robust enough on this corpus that the audio-loader divergence
-rarely flips path decisions, so the IoU score is unchanged.
+all f32-encoded). whispery's old `hound`-based loader read f32 samples
+directly. The ~30-PPM input mismatch propagated through 12 transformer
+layers and produced ~1.45 nat divergence on numerically sensitive
+frames. The harness now uses `ffmpeg-next` with the same
+`s16 → /32768.0` quantization on whispery's side, so both sides see
+byte-identical f32 buffers — the harness emits matching `clip_sha256`
+fields on both runners' JSON whenever it does.
 
 If you need bit-near parity with PyTorch eager on the encoder
 (e.g. for a custom corpus where path-flip behaviour differs), use

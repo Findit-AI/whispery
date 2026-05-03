@@ -13,7 +13,24 @@ description = "Manual parity harness: dump whispery alignment output to JSON for
 # downstream consumer.
 whispery     = { path = "../..", default-features = false, features = ["runner", "alignment", "bench-internals", "parity-dump-emission"] }
 whisper-rs   = { version = "0.13", default-features = false }
-hound        = "3"
+# `ffmpeg-next` is used in the parity runner's audio loader so that:
+#   1. The harness mirrors production callers of whispery, which feed
+#      samples through `ffmpeg-next` (whispery itself is Sans-I/O and
+#      does not depend on ffmpeg directly — see the `audio_service`
+#      processor in the indexer).
+#   2. The audio bytes whispery sees match WhisperX's reference path
+#      exactly (`load_audio`: `ffmpeg → s16le → np.float32 / 32768.0`).
+#      The previous `hound` loader read f32 WAVs at full f32 fidelity,
+#      diverging ~30 PPM from WhisperX on the dia f32 fixtures and
+#      propagating to ~1.45 nat emission divergence on numerically
+#      sensitive frames (the `01_dialogue` Whisper-hallucinated
+#      "no, no, no..." × 112 segment).
+#
+# Pinned to `8` because the local toolchain ships system FFmpeg 8.x
+# (Homebrew `ffmpeg 8.1`) which dropped `libavcodec/avfft.h`; the
+# `ffmpeg-next 7.x` series still references that header in its
+# bindgen pass and therefore fails to build against system FFmpeg 8.
+ffmpeg-next  = "8"
 serde_json   = "1"
 clap         = { version = "4", features = ["derive"] }
 sha2         = "0.10"

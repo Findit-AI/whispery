@@ -33,6 +33,25 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def sha256_f32_buffer(audio) -> str:
+    """SHA-256 of an `np.float32` array's little-endian byte
+    representation. We use this (rather than `sha256_file`) so the
+    hash matches whispery-parity-runner's `clip_sha256`, which is
+    computed over the f32 buffer the model actually consumes. Both
+    runners load via ffmpeg (WhisperX's `load_audio` shells out;
+    whispery's runner uses `ffmpeg-next` bindings) and therefore
+    produce byte-identical f32 buffers — the matching hash is what
+    proves the audio-loader divergence the README documented at
+    parity-runner v1 is closed.
+    """
+    # `audio.tobytes()` walks the array in C-order; for a 1-D
+    # `np.float32` buffer that's the same byte layout whispery
+    # writes when it casts its `Vec<f32>` to `&[u8]`.
+    h = hashlib.sha256()
+    h.update(audio.tobytes(order="C"))
+    return h.hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run WhisperX alignment on a WAV; emit whispery-parity JSON."
@@ -89,8 +108,6 @@ def main() -> int:
         return 2
     duration_s = float(len(audio_data)) / sample_rate
 
-    clip_sha256 = sha256_file(wav_path)
-
     print(
         f"[whisperx-parity] wav={wav_path} dur={duration_s:.2f}s "
         f"model={args.whisper_model} device={args.device}",
@@ -121,6 +138,13 @@ def main() -> int:
         vad_method="silero",
     )
     audio = whisperx.load_audio(str(wav_path))
+
+    # SHA-256 over the actual float32 buffer the model consumes.
+    # See `sha256_f32_buffer` docstring for the rationale; this is
+    # the byte-identity check that lets the harness verify both
+    # runners decoded the audio the same way.
+    clip_sha256 = sha256_f32_buffer(audio)
+
     result = asr_model.transcribe(audio, batch_size=args.batch_size)
     t_asr = time.monotonic()
 

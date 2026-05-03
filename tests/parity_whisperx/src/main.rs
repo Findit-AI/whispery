@@ -21,15 +21,16 @@
 
 use std::{
   fs,
-  io::{Read, Write},
+  io::Write,
   num::NonZeroU32,
   path::{Path, PathBuf},
+  sync::Once,
   time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use hound::SampleFormat;
+use ffmpeg_next as ffmpeg;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 // `mediatime` is reachable through whispery's re-exports, so we don't
@@ -136,51 +137,290 @@ fn resolve_model(
   );
 }
 
-fn read_wav_16k_mono_f32(path: &Path) -> Result<Vec<f32>> {
-  let mut reader = hound::WavReader::open(path)
-    .with_context(|| format!("open WAV at {}", path.display()))?;
-  let spec = reader.spec();
-  if spec.sample_rate != 16_000 {
-    bail!(
-      "{}: expected 16 kHz, got {} Hz",
-      path.display(),
-      spec.sample_rate
-    );
+/// Idempotent guard for `ffmpeg::init()`. The runner has two `main`
+/// entry-paths (regular + `--inject-from`) that both load audio; this
+/// keeps each safe to call independently.
+fn ffmpeg_init() -> Result<()> {
+  static INIT: Once = Once::new();
+  let mut init_err: Option<ffmpeg::Error> = None;
+  INIT.call_once(|| {
+    if let Err(e) = ffmpeg::init() {
+      init_err = Some(e);
+    }
+  });
+  if let Some(e) = init_err {
+    Err(anyhow::anyhow!("ffmpeg::init failed: {e}"))
+  } else {
+    Ok(())
   }
-  if spec.channels != 1 {
-    bail!(
-      "{}: expected mono, got {} channels",
-      path.display(),
-      spec.channels
-    );
-  }
-  Ok(match (spec.sample_format, spec.bits_per_sample) {
-    (SampleFormat::Int, 16) => reader
-      .samples::<i16>()
-      .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-      .collect::<Result<Vec<_>, _>>()?,
-    (SampleFormat::Float, 32) => reader.samples::<f32>().collect::<Result<Vec<_>, _>>()?,
-    other => bail!(
-      "{}: unsupported WAV sample format {:?} ({}-bit)",
-      path.display(),
-      other.0,
-      other.1
-    ),
-  })
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-  let mut f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-  let mut hasher = Sha256::new();
-  let mut buf = [0u8; 64 * 1024];
-  loop {
-    let n = f.read(&mut buf)?;
+/// Load an audio file as 16 kHz mono f32 via ffmpeg-next, mirroring
+/// WhisperX's `load_audio` byte-for-byte: decode → resample to 16 kHz
+/// mono `s16` (signed 16-bit, packed) → cast each sample to `f32` and
+/// divide by exactly `32768.0`.
+///
+/// WhisperX's reference (`whisperx/audio.py:44-65`) shells out to:
+///   `ffmpeg -nostdin -threads 0 -i FILE -f s16le -ac 1 -acodec pcm_s16le -ar 16000 -`
+/// then runs `np.frombuffer(out, np.int16).astype(np.float32) / 32768.0`.
+///
+/// We use the `ffmpeg-next` bindings (libswresample under the hood)
+/// rather than shelling out to keep the harness dependency-free at the
+/// process level and to surface decoder/resampler errors as typed
+/// errors instead of stderr text.
+///
+/// Returns `(samples, duration_s, sha256)` where `sha256` is computed
+/// over the **little-endian f32 byte representation of the returned
+/// samples**, i.e. the exact bytes whispery (and any production
+/// caller) feeds into the model. Comparing this hash against the
+/// WhisperX runner's own `clip_sha256` (computed by
+/// `whisperx_runner.py` over the same float buffer) lets the harness
+/// verify both runners saw byte-identical inputs.
+fn read_audio_16k_mono_f32(path: &Path) -> Result<(Vec<f32>, f64, String)> {
+  use ffmpeg::format::sample::{Sample, Type as SampleType};
+  use ffmpeg::software::resampling::Context as Resampler;
+  use ffmpeg::{ChannelLayout, codec::context::Context as CodecContext, frame, media};
+
+  ffmpeg_init()?;
+
+  let mut ictx = ffmpeg::format::input(path)
+    .with_context(|| format!("open audio container at {}", path.display()))?;
+  let stream = ictx
+    .streams()
+    .best(media::Type::Audio)
+    .ok_or_else(|| anyhow::anyhow!("{}: no audio stream", path.display()))?;
+  let stream_index = stream.index();
+
+  // Build the decoder from the container's stream parameters.
+  let codec_ctx = CodecContext::from_parameters(stream.parameters())
+    .with_context(|| format!("decoder context for {}", path.display()))?;
+  let mut decoder = codec_ctx
+    .decoder()
+    .audio()
+    .with_context(|| format!("audio decoder for {}", path.display()))?;
+  decoder
+    .set_parameters(stream.parameters())
+    .with_context(|| format!("decoder set_parameters for {}", path.display()))?;
+
+  // WhisperX's exact ffmpeg invocation outputs `pcm_s16le` (signed
+  // 16-bit little-endian, packed mono) at 16 kHz. ffmpeg-next's
+  // `Sample::I16(Type::Packed)` is `AV_SAMPLE_FMT_S16` which is
+  // little-endian on every platform we run on.
+  const TARGET_RATE: u32 = 16_000;
+  let target_format = Sample::I16(SampleType::Packed);
+  let target_layout = ChannelLayout::MONO;
+
+  // Resolve a non-empty source channel layout. PCM/WAV decoders
+  // commonly emit frames with `ch_layout.order = UNSPEC` (only the
+  // channel count is set); libswresample's `swr_alloc_set_opts2`
+  // rejects that in FFuf 7+. Fall back to
+  // `ChannelLayout::default(channels)` — exactly the recovery path
+  // the indexer's `audio_service` runs when it hits
+  // `Error::InputChanged`.
+  let resolve_src_layout =
+    |layout: ChannelLayout, channels: i32| -> ChannelLayout {
+      if layout.is_empty() {
+        ChannelLayout::default(channels)
+      } else {
+        layout
+      }
+    };
+
+  let mut src_format = decoder.format();
+  let mut src_rate = decoder.rate();
+  let mut src_layout = resolve_src_layout(decoder.channel_layout(), decoder.channels() as i32);
+
+  let build_resampler = |src_format,
+                         src_layout,
+                         src_rate|
+   -> Result<Resampler> {
+    Resampler::get(
+      src_format,
+      src_layout,
+      src_rate,
+      target_format,
+      target_layout,
+      TARGET_RATE,
+    )
+    .with_context(|| format!("init libswresample for {}", path.display()))
+  };
+
+  let mut resampler = build_resampler(src_format, src_layout, src_rate)?;
+
+  let mut samples_f32: Vec<f32> = Vec::new();
+  let mut decoded = frame::Audio::empty();
+
+  // Push i16 samples from a packed-mono frame into `samples_f32`,
+  // dividing by the literal `32768.0` exactly as WhisperX does.
+  // `frame.plane::<i16>(0)` is only valid for packed-mono i16
+  // (which is what we requested above), and exposes the first
+  // `frame.samples()` interleaved samples.
+  let push_resampled = |frame: &frame::Audio, dst: &mut Vec<f32>| {
+    let n = frame.samples();
     if n == 0 {
-      break;
+      return;
     }
-    hasher.update(&buf[..n]);
+    let plane: &[i16] = frame.plane::<i16>(0);
+    debug_assert!(plane.len() >= n);
+    dst.reserve(n);
+    for &s in &plane[..n] {
+      dst.push(s as f32 / 32768.0_f32);
+    }
+  };
+
+  // Run a decoded frame through the resampler. Handles
+  // `InputChanged` / `OutputChanged` by rebuilding the resampler
+  // against the new source params (mirrors `audio_service`'s
+  // recovery path) — this is what makes the loader robust to
+  // PCM/WAV decoders that set `ch_layout` only after the first
+  // frame, instead of in `set_parameters`.
+  //
+  // We don't `flush()` between frames: that's reserved for
+  // EOF, and the rate ratios libswresample picks for 16 kHz →
+  // 16 kHz mono → mono are 1:1, so there's nothing buffered
+  // between calls anyway. (Calling `flush` mid-stream returns
+  // `Error::OutputChanged` because libswresample treats a
+  // post-flush `run` as a stream restart.)
+  let run_resample = |decoded: &frame::Audio,
+                      resampler: &mut Resampler,
+                      samples_f32: &mut Vec<f32>,
+                      src_format: &mut Sample,
+                      src_layout: &mut ChannelLayout,
+                      src_rate: &mut u32|
+   -> Result<()> {
+    let mut resampled = frame::Audio::empty();
+    match resampler.run(decoded, &mut resampled) {
+      Ok(_) => {
+        push_resampled(&resampled, samples_f32);
+      }
+      Err(ffmpeg::Error::InputChanged | ffmpeg::Error::OutputChanged) => {
+        // Decoder gave us a frame whose params don't match what
+        // the resampler was opened with. Re-derive params from
+        // the actual frame, rebuild the resampler, retry once.
+        *src_format = decoded.format();
+        *src_layout = resolve_src_layout(
+          decoded.channel_layout(),
+          decoded.channels() as i32,
+        );
+        *src_rate = decoded.rate();
+        *resampler = build_resampler(*src_format, *src_layout, *src_rate)?;
+        let mut retried = frame::Audio::empty();
+        resampler
+          .run(decoded, &mut retried)
+          .context("libswresample::run after rebuild")?;
+        push_resampled(&retried, samples_f32);
+      }
+      Err(e) => return Err(anyhow::anyhow!("libswresample::run: {e}")),
+    }
+    Ok(())
+  };
+
+  // Helper: PCM/WAV decoders frequently emit frames with
+  // `ch_layout.order = UNSPEC` even when the codec parameters (and
+  // therefore the resampler we just opened) carry a concrete
+  // layout. libswresample then trips `Error::InputChanged` on the
+  // first frame because it sees a layout mismatch. Patch the
+  // frame's layout to match what the resampler expects (the
+  // resolved `src_layout` we computed above) before each `run`
+  // call. This is an idempotent no-op for decoders that DO set
+  // the layout explicitly.
+  let fixup_frame_layout = |frame: &mut frame::Audio, src_layout: ChannelLayout| {
+    if frame.channel_layout().is_empty() {
+      frame.set_channel_layout(src_layout);
+    }
+  };
+
+  // Pull packets from the input, send them to the decoder, then
+  // drain any newly-available frames. Mirrors the standard
+  // `transcode-audio` example pattern in `ffmpeg-next/examples/`.
+  for (s, packet) in ictx.packets() {
+    if s.index() != stream_index {
+      continue;
+    }
+    decoder.send_packet(&packet).context("decoder.send_packet")?;
+    while decoder.receive_frame(&mut decoded).is_ok() {
+      fixup_frame_layout(&mut decoded, src_layout);
+      run_resample(
+        &decoded,
+        &mut resampler,
+        &mut samples_f32,
+        &mut src_format,
+        &mut src_layout,
+        &mut src_rate,
+      )?;
+    }
   }
-  Ok(format!("{:x}", hasher.finalize()))
+  decoder.send_eof().context("decoder.send_eof")?;
+  while decoder.receive_frame(&mut decoded).is_ok() {
+    fixup_frame_layout(&mut decoded, src_layout);
+    run_resample(
+      &decoded,
+      &mut resampler,
+      &mut samples_f32,
+      &mut src_format,
+      &mut src_layout,
+      &mut src_rate,
+    )?;
+  }
+
+  // Final flush of libswresample after the decoder is fully
+  // drained. At 16 kHz → 16 kHz there's no resampling buffer to
+  // empty, but for fixtures whose source rate ≠ 16 kHz (which we
+  // resample down to 16 kHz) libswresample may have queued tail
+  // samples that haven't been emitted yet.
+  //
+  // `Error::OutputChanged` here means "no buffered samples; the
+  // implicit flush already happened", which is the common case
+  // for the rate-1:1 PCM fixtures the harness uses today. We
+  // treat it as a successful no-op rather than a hard error so
+  // those fixtures load cleanly.
+  loop {
+    let mut tail = frame::Audio::empty();
+    match resampler.flush(&mut tail) {
+      Ok(_) => {
+        if tail.samples() == 0 {
+          break;
+        }
+        push_resampled(&tail, &mut samples_f32);
+      }
+      Err(ffmpeg::Error::OutputChanged) => break,
+      Err(e) => {
+        return Err(anyhow::anyhow!("libswresample::flush at EOF: {e}"));
+      }
+    }
+  }
+
+  if samples_f32.is_empty() {
+    bail!(
+      "{}: ffmpeg-next decoded zero samples; corrupt or empty audio?",
+      path.display()
+    );
+  }
+
+  let duration_s = samples_f32.len() as f64 / TARGET_RATE as f64;
+
+  // Hash the f32 bytes (LE) the model will see. This is what makes
+  // the parity check meaningful: WhisperX's runner emits the same
+  // hash if and only if both pipelines decoded to byte-identical
+  // float buffers. Comparing file-byte hashes (the previous
+  // behaviour) couldn't catch loader-quantization divergences like
+  // the `hound` f32-direct vs ffmpeg s16-quantized one this commit
+  // closes.
+  let mut hasher = Sha256::new();
+  // Safety: `f32` is `Copy + 'static`, layout is well-defined as
+  // 4 little-endian bytes per sample on every target this harness
+  // ships to (macOS / Linux x86_64+aarch64). `bytemuck` would be
+  // tidier but pulling in a dep for one cast isn't worth it here.
+  let bytes = unsafe {
+    std::slice::from_raw_parts(
+      samples_f32.as_ptr() as *const u8,
+      samples_f32.len() * std::mem::size_of::<f32>(),
+    )
+  };
+  hasher.update(bytes);
+  let sha = format!("{:x}", hasher.finalize());
+
+  Ok((samples_f32, duration_s, sha))
 }
 
 fn main() -> Result<()> {
@@ -257,12 +497,14 @@ fn main() -> Result<()> {
     .build()
     .context("build runner")?;
 
-  // Load + measure the audio. `clip_sha256` keys outputs to the
-  // exact bytes scored, so a fixture change can't go undetected.
-  let samples = read_wav_16k_mono_f32(&args.wav_path)?;
+  // Load + measure the audio. `clip_sha256` is computed over the
+  // f32 bytes whispery hands to the model — comparing it to
+  // `whisperx_runner.py`'s own clip_sha256 (computed over the same
+  // float buffer) verifies both runners decoded the audio
+  // byte-identically, which is what closes the audio-loader
+  // divergence the README documented at parity-runner v1.
+  let (samples, duration_s, clip_sha256) = read_audio_16k_mono_f32(&args.wav_path)?;
   let total_samples = samples.len() as u64;
-  let duration_s = total_samples as f64 / 16_000.0;
-  let clip_sha256 = sha256_file(&args.wav_path)?;
 
   // Caller's output timebase = mediatime's microsecond default
   // (1/48000 s tick). We use it consistently when emitting Word
@@ -415,11 +657,10 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
     .map(|a| a.len())
     .unwrap_or(0);
 
-  // Audio first — needed before we slice per-segment.
-  let samples = read_wav_16k_mono_f32(&args.wav_path)?;
+  // Audio first — needed before we slice per-segment. SHA-256 is
+  // over the f32 byte buffer (see `read_audio_16k_mono_f32` doc).
+  let (samples, duration_s, clip_sha256) = read_audio_16k_mono_f32(&args.wav_path)?;
   let total_samples = samples.len();
-  let duration_s = total_samples as f64 / 16_000.0;
-  let clip_sha256 = sha256_file(&args.wav_path)?;
 
   // Build the segments list. Prefer `segments[]` (the per-segment
   // path WhisperX itself uses); fall back to one synthetic segment
