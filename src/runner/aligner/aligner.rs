@@ -11,6 +11,7 @@ use tokenizers::Tokenizer;
 use crate::{
   core::AlignmentResult,
   runner::{RunnerError, aligner::normalizer::DynTextNormalizer},
+  time::SAMPLE_RATE_HZ,
   types::{Lang, WorkFailure},
 };
 
@@ -319,8 +320,18 @@ impl Aligner {
   ///
   /// Inputs:
   /// - `samples`: the chunk's 16 kHz f32 mono audio.
-  /// - `sub_segments`: VAD sub-segments inside the chunk, in the
-  ///   caller's output timebase. Used by the silence mask in step 0.
+  /// - `sub_segments`: VAD sub-segments **in chunk-local 1/16000
+  ///   timebase**, so `start_pts()` / `end_pts()` are chunk-local
+  ///   16 kHz sample indices in `[0, samples.len()]`. The silence
+  ///   mask in step 0 (and `build_speech_frames` in step 7) reads
+  ///   the PTS values directly as sample offsets — they are NOT
+  ///   in any output / wall-clock timebase. Out-of-range PTS get
+  ///   clamped to `[0, samples.len()]`. The internal worker dispatch
+  ///   path (`managed_transcriber.rs`) converts output-timebase
+  ///   sub-segments to this form before calling. External callers
+  ///   that drive `align_chunk` (parity / benchmarking tooling)
+  ///   must respect the same contract; a non-1/16000 timebase
+  ///   trips a `debug_assert`.
   /// - `text`: Whisper's transcribed text.
   /// - `chunk_first_sample_in_stream`: the chunk's first 16 kHz
   ///   sample index in stream coordinates (used to convert
@@ -376,28 +387,19 @@ impl Aligner {
 
     // Step 0: silence-aware preprocessing.
     //
-    // The chunk-local sub_segments come in as `TimeRange`s in a
-    // 1/16 kHz timebase, so `start_pts()` / `end_pts()` are
-    // chunk-local sample indices. Build a per-sample boolean
-    // speech mask for the silence-aware normaliser; once that
-    // returns the buffer it's already been (1) normalised over
-    // speech samples only and (2) zeroed at non-speech
-    // positions, so the silence-mask invariant survives all the
-    // way to ORT. A previous two-step approach
+    // `sub_segments` are in chunk-local 1/16000 timebase per the
+    // method-level contract — `start_pts()` / `end_pts()` are
+    // chunk-local sample indices, NOT output-timebase ticks.
+    // Build a per-sample boolean speech mask for the silence-aware
+    // normaliser; once that returns the buffer it's already been
+    // (1) normalised over speech samples only and (2) zeroed at
+    // non-speech positions, so the silence-mask invariant survives
+    // all the way to ORT. A previous two-step approach
     // (`build_masked_samples` then a non-mask-aware normalise
     // inside `encode_log_softmax`) had the intermediate zeros
     // mean-shifted by the normaliser, so masked regions became
     // `(0 - mean) / std` ≠ 0 by the time they reached the model.
-    let mut speech_mask = alloc::vec![false; samples.len()];
-    for &seg in sub_segments {
-      let start = (seg.start_pts() as u64 as usize).min(samples.len());
-      let end = (seg.end_pts() as u64 as usize).min(samples.len());
-      if end > start {
-        for slot in &mut speech_mask[start..end] {
-          *slot = true;
-        }
-      }
-    }
+    let speech_mask = build_speech_mask(samples.len(), sub_segments);
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
@@ -699,6 +701,47 @@ impl Aligner {
   }
 }
 
+/// Build a per-sample boolean speech mask for `Aligner::align`'s
+/// step 0. `sub_segments` are in chunk-local 1/16000 timebase per
+/// the `align` contract; `start_pts` / `end_pts` are sample indices
+/// that get clamped to `[0, n_samples]` via i64 saturation.
+///
+/// Two contract details worth highlighting:
+///
+/// 1. A non-1/16000 timebase trips a `debug_assert` (release builds
+///    still proceed with the cast). Internal callers always wrap
+///    in 1/16000 (`managed_transcriber.rs`), and external callers
+///    of `align_chunk` are documented to do the same.
+/// 2. `i64 → usize` is via `.clamp(0, n_samples_i64) as usize`, NOT
+///    `as u64 as usize`. The old cast wrapped negative `start_pts`
+///    to a huge u64, which then got clamped to `n_samples` and the
+///    `if end > start` guard dropped the sub-segment entirely.
+///    Negative-overlap ranges (sub-segment whose head extends past
+///    the chunk start) now get their head trimmed and their tail
+///    masked, matching `compose::build_speech_frames`'s `.max(0)`.
+fn build_speech_mask(n_samples: usize, sub_segments: &[TimeRange]) -> alloc::vec::Vec<bool> {
+  let mut mask = alloc::vec![false; n_samples];
+  let n_samples_i64 = n_samples as i64;
+  for &seg in sub_segments {
+    debug_assert!(
+      seg.timebase().num() == 1 && seg.timebase().den().get() == SAMPLE_RATE_HZ,
+      "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
+       got {}/{}",
+      SAMPLE_RATE_HZ,
+      seg.timebase().num(),
+      seg.timebase().den().get(),
+    );
+    let start = seg.start_pts().clamp(0, n_samples_i64) as usize;
+    let end = seg.end_pts().clamp(0, n_samples_i64) as usize;
+    if end > start {
+      for slot in &mut mask[start..end] {
+        *slot = true;
+      }
+    }
+  }
+  mask
+}
+
 /// Read the CTC blank-token id from a HuggingFace tokenizer.
 fn detect_blank_token_id(tok: &Tokenizer) -> Option<u32> {
   // Standard wav2vec2 convention: pad token == CTC blank.
@@ -989,6 +1032,98 @@ mod tests {
     // inter-word delimiters in the CTC graph.
     let tok = tokenizer_without_pipe_delimiter();
     assert!(validate_word_delimiter_present(&tok, false).is_ok());
+  }
+
+  // --- build_speech_mask: silence-mask coordinate contract ---
+
+  fn analysis_tb() -> mediatime::Timebase {
+    mediatime::Timebase::new(1, core::num::NonZeroU32::new(SAMPLE_RATE_HZ).unwrap())
+  }
+
+  #[test]
+  fn build_speech_mask_marks_inrange_segments() {
+    // Plain in-range segment: bits set exactly inside [start, end).
+    let segs = [TimeRange::new(2, 5, analysis_tb())];
+    let mask = build_speech_mask(8, &segs);
+    assert_eq!(mask, vec![false, false, true, true, true, false, false, false]);
+  }
+
+  #[test]
+  fn build_speech_mask_clamps_negative_overlap_to_zero() {
+    // Regression: pre-fix, `as u64 as usize` wrapped negative
+    // start_pts to a huge value, then `.min(samples.len())`
+    // clamped to len, and `if end > start` dropped the segment
+    // entirely. Now the head trims to 0 and the tail (within
+    // the chunk) gets masked.
+    let segs = [TimeRange::new(-3, 4, analysis_tb())];
+    let mask = build_speech_mask(8, &segs);
+    assert_eq!(mask, vec![true, true, true, true, false, false, false, false]);
+  }
+
+  #[test]
+  fn build_speech_mask_clamps_overshoot_to_buffer_end() {
+    // end_pts past `n_samples` clamps to len; start in range.
+    let segs = [TimeRange::new(5, 100, analysis_tb())];
+    let mask = build_speech_mask(8, &segs);
+    assert_eq!(mask, vec![false, false, false, false, false, true, true, true]);
+  }
+
+  #[test]
+  fn build_speech_mask_drops_fully_negative_range() {
+    // Both bounds negative: clamps to [0, 0), no bits set.
+    let segs = [TimeRange::new(-10, -3, analysis_tb())];
+    let mask = build_speech_mask(8, &segs);
+    assert_eq!(mask, vec![false; 8]);
+  }
+
+  #[test]
+  fn build_speech_mask_drops_fully_overshoot_range() {
+    // Both bounds past len: clamps to [len, len), no bits set.
+    let segs = [TimeRange::new(20, 30, analysis_tb())];
+    let mask = build_speech_mask(8, &segs);
+    assert_eq!(mask, vec![false; 8]);
+  }
+
+  #[test]
+  fn build_speech_mask_zero_width_range_is_dropped() {
+    // start == end: `if end > start` skips, no bits set.
+    // (`TimeRange::new` panics on `end < start`, so a literal
+    // inverted-range case can't be constructed via the public
+    // API and isn't reachable through the silence-mask path.)
+    let segs = [TimeRange::new(5, 5, analysis_tb())];
+    let mask = build_speech_mask(8, &segs);
+    assert_eq!(mask, vec![false; 8]);
+  }
+
+  #[test]
+  fn build_speech_mask_unions_overlapping_segments() {
+    // Mask is a per-sample OR of all segments; overlap is fine.
+    let segs = [
+      TimeRange::new(1, 4, analysis_tb()),
+      TimeRange::new(3, 6, analysis_tb()),
+    ];
+    let mask = build_speech_mask(8, &segs);
+    assert_eq!(mask, vec![false, true, true, true, true, true, false, false]);
+  }
+
+  #[test]
+  fn build_speech_mask_empty_buffer_returns_empty_mask() {
+    let segs = [TimeRange::new(0, 0, analysis_tb())];
+    let mask = build_speech_mask(0, &segs);
+    assert!(mask.is_empty());
+  }
+
+  #[test]
+  #[should_panic(expected = "Aligner::align expects sub_segments")]
+  #[cfg(debug_assertions)]
+  fn build_speech_mask_panics_in_debug_on_non_analysis_timebase() {
+    // Pass a 1/1000 (millisecond) timebase. The runtime would
+    // misinterpret the PTS as 16 kHz sample indices — a
+    // documented contract violation. Debug builds trip the
+    // assert; release builds proceed (matches prior behaviour).
+    let ms_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
+    let segs = [TimeRange::new(0, 100, ms_tb)];
+    let _ = build_speech_mask(16_000, &segs);
   }
 
   #[test]
