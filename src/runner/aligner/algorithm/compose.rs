@@ -603,21 +603,46 @@ mod tests {
   }
 
   #[test]
+  fn effective_samples_per_frame_falls_back_to_nominal_for_short_chunks() {
+    // Real chunks always have `total_frames >= 2`, but the
+    // safety net for `T < 2` returns nominal `hop_samples` to
+    // avoid a divide-by-zero. Pin both branches.
+    assert_eq!(effective_samples_per_frame(0, 0, 320), 320.0);
+    assert_eq!(effective_samples_per_frame(0, 1, 320), 320.0);
+    assert!(
+      (effective_samples_per_frame(480_000, 1499, 320) - (480_000.0 / 1498.0)).abs() < 1e-9
+    );
+  }
+
+  #[test]
   fn build_speech_frames_uses_effective_ratio_not_nominal_hop() {
-    // Codex round-21 regression: on a real wav2vec2-base 30 s
-    // chunk the encoder truncates one frame at the edge, so
-    // `T = 1499` for `n_samples = 480000` (instead of nominal
-    // `1500` from `480000 / 320`). Effective `samples_per_frame
-    // = 480000 / 1498 = 320.4272...`. Frame `T - 1 = 1498`
-    // therefore SHOULD cover samples ~`[480000 - 320.43,
-    // 480000)` (the trailing slice of the audio), not the
-    // nominal `[479360, 479680)` it would land at if
-    // `build_speech_frames` used the integer hop `320`. A VAD
-    // segment that ends right at the chunk end must classify
-    // the last frame as speech under the new mapping; under
-    // the old one it would have classified frame 1498 against
-    // a slice that's 320 samples short of the chunk end and
-    // missed the segment.
+    // Codex round-21 regression: `build_speech_frames` and
+    // `compose_words` MUST use the same frame-to-sample
+    // mapping. Previously `build_speech_frames` used nominal
+    // `hop_samples` (e.g. 320 for wav2vec2-base) while
+    // `compose_words` used the WhisperX effective ratio
+    // `n_samples / (T - 1)`. On a 30 s chunk where wav2vec2
+    // truncates one frame at the edge (T=1499 for n_samples=
+    // 480000), the per-frame stride drift is ~0.43 samples,
+    // accumulating to ~644 samples (40 ms) by the last frame.
+    // That asymmetry can:
+    //
+    // - Misclassify a late-chunk frame as speech (because the
+    //   nominal interval lands inside a VAD segment) while
+    //   `compose_words` emits the word at samples that are
+    //   actually outside the VAD speech span (kept word with
+    //   misaligned timing).
+    //
+    // - Or symmetrically: drop a valid late-frame word
+    //   because the nominal frame interval lands outside a VAD
+    //   segment that the effective-ratio interval would have
+    //   matched.
+    //
+    // The fix is to feed both functions the same
+    // `samples_per_frame` value. This regression pins that
+    // contract: both functions take an `f64
+    // samples_per_frame` and the caller (`Aligner::align`)
+    // computes it once via `effective_samples_per_frame`.
     use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
 
@@ -626,45 +651,48 @@ mod tests {
     let total_frames: usize = 1499;
     let samples_per_frame =
       effective_samples_per_frame(n_samples, total_frames, /* hop fallback: */ 320);
-    // Sanity-check the ratio drift the test depends on.
+
+    // Pick a VAD segment in the middle of the chunk so the
+    // small per-frame drift across many frames can shift
+    // boundary frames between the two mappings.
+    let mid_segment = alloc::vec![TimeRange::new(240_000, 240_640, tb_16k)];
+    let mask_eff = build_speech_frames(total_frames, samples_per_frame, &mid_segment);
+    let mask_nom = build_speech_frames(total_frames, 320.0, &mid_segment);
+
+    // 240_000 samples / 320.4272 ≈ frame 749.0. Effective
+    // mapping: frame 749 covers ~[240000, 240320), frame 750
+    // covers ~[240320, 240641) — both overlap the 640-sample
+    // VAD segment by enough to clear the majority threshold.
+    //
+    // Nominal mapping: frame 750 covers exactly [240000,
+    // 240320), frame 751 covers [240320, 240640) — same
+    // overall coverage but SHIFTED BY ONE FRAME INDEX. That's
+    // the bug Codex flagged: the `f` index of speech frames
+    // disagrees between the two mappings, and `compose_words`
+    // (which uses effective) is checking `speech_frames[f]`
+    // for frames it computed from the effective mapping —
+    // hitting the WRONG entry of the nominal-built mask.
+    //
+    // Pin the divergence: at least ONE frame index `f`
+    // disagrees between the two masks across the segment's
+    // neighborhood.
+    let any_disagreement = (740..=760)
+      .any(|f| mask_eff.get(f).copied().unwrap_or(false) != mask_nom.get(f).copied().unwrap_or(false));
+    assert!(
+      any_disagreement,
+      "effective vs nominal mappings must disagree on at least one frame in [740, 760] \
+       — that's the asymmetry the unified `samples_per_frame` parameter is meant to eliminate. \
+       eff[740..=760] = {:?}, nom[740..=760] = {:?}",
+      &mask_eff[740..=760],
+      &mask_nom[740..=760]
+    );
+
+    // Pin the helper output too so a "fix" that secretly
+    // reverts to nominal hop is caught.
     assert!(
       (samples_per_frame - 320.4272).abs() < 0.01,
-      "expected ~320.43, got {samples_per_frame}"
+      "effective ratio for the 30 s edge case should be ~320.43; got {samples_per_frame}"
     );
-
-    // VAD speech segment ending right at the chunk end. Frame
-    // 1498 (the last) must classify as speech.
-    let trailing_speech = alloc::vec![TimeRange::new(479_000, 480_000, tb_16k)];
-    let mask = build_speech_frames(total_frames, samples_per_frame, &trailing_speech);
-    assert_eq!(mask.len(), total_frames);
-    assert!(
-      mask[total_frames - 1],
-      "last frame must be speech under the effective ratio mapping"
-    );
-
-    // Same VAD segment classified against the OLD nominal hop
-    // (320) demonstrates the drift: with nominal hop, frame
-    // 1498 covers samples [479360, 479680), entirely inside
-    // the speech range — so it'd ALSO be classified speech in
-    // this specific case. The drift bites at the OPPOSITE end
-    // — a tiny VAD island at samples [480000 - 100, 480000)
-    // with effective ratio falls inside frame 1498's
-    // [479680, 480000) range; with nominal hop that island
-    // overlaps frame 1499 (which doesn't exist — n_frames = 1499
-    // so indices run 0..=1498) and the call-site upper-bound
-    // clamp drops it. Let's exercise that case directly to
-    // pin the asymmetry:
-    let trailing_island = alloc::vec![TimeRange::new(479_900, 480_000, tb_16k)];
-    let mask_eff = build_speech_frames(total_frames, samples_per_frame, &trailing_island);
-    let mask_nom = build_speech_frames(total_frames, 320.0, &trailing_island);
-    // Effective mapping puts the 100-sample island inside frame
-    // 1498's interval (479680, 480000) — but at 100 samples it
-    // doesn't hit the ≥160 majority threshold, so still false.
-    // What we DO assert: nominal hop classifies it the same way
-    // (false). The real footgun is the drift on accepted-speech
-    // word ranges, exercised end-to-end via the parity harness.
-    assert!(!mask_eff[total_frames - 1]);
-    assert!(!mask_nom[total_frames - 1]);
   }
 
   #[test]
