@@ -222,17 +222,35 @@ impl Aligner {
     self.min_speech_coverage
   }
 
-  /// Set [`Self::min_speech_coverage`]. Values outside `[0.0,
-  /// 1.0]` are stored verbatim — out-of-range values
-  /// effectively disable the coverage check (`< 0.0` always
-  /// passes; `> 1.0` always fails).
+  /// Set [`Self::min_speech_coverage`].
+  ///
+  /// `value` is coerced to a valid threshold rather than rejected:
+  ///
+  /// - finite values in `[0.0, 1.0]` are stored as-is
+  /// - values above `1.0` (incl. `+∞`) clamp to `1.0`
+  /// - values below `0.0` (incl. `-∞`) clamp to `0.0`
+  /// - `NaN` resets to
+  ///   [`DEFAULT_MIN_SPEECH_COVERAGE`](crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE)
+  ///   (`0.5`)
+  ///
+  /// Codex round-29 flagged the prior permissive behaviour
+  /// ("values are stored verbatim — out-of-range values
+  /// effectively disable the coverage check") as a footgun: a
+  /// config typo of `1.5` instead of `0.5` would silently drop
+  /// every word, since the post-pass discards any word with
+  /// `coverage < min_speech_coverage` and no word can exceed
+  /// `1.0`. Clamping makes those configurations land on the
+  /// nearest valid threshold instead.
   pub const fn set_min_speech_coverage(&mut self, value: f32) {
-    self.min_speech_coverage = value;
+    self.min_speech_coverage = coerce_speech_coverage(value);
   }
 
   /// Builder-style override for [`Self::min_speech_coverage`].
+  ///
+  /// Coerces `value` into a valid threshold; see
+  /// [`Self::set_min_speech_coverage`] for the rules.
   pub const fn with_min_speech_coverage(mut self, value: f32) -> Self {
-    self.min_speech_coverage = value;
+    self.min_speech_coverage = coerce_speech_coverage(value);
     self
   }
 
@@ -843,6 +861,28 @@ fn validate_word_delimiter_present(
   })
 }
 
+/// Coerce a user-supplied speech-coverage threshold into the
+/// valid `[0.0, 1.0]` range. NaN resets to the default. Used by
+/// [`Aligner::set_min_speech_coverage`] and
+/// [`Aligner::with_min_speech_coverage`]. Extracted as a free
+/// function so it can be tested without standing up an ORT
+/// session + tokenizer fixture.
+const fn coerce_speech_coverage(value: f32) -> f32 {
+  // Order matters: `value < 0.0` and `value > 1.0` are both
+  // false when `value` is NaN, so the NaN branch must come
+  // first. `const fn` permits `is_nan()` and the comparison
+  // operators on f32.
+  if value.is_nan() {
+    crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE
+  } else if value < 0.0 {
+    0.0
+  } else if value > 1.0 {
+    1.0
+  } else {
+    value
+  }
+}
+
 /// Load a HuggingFace tokenizer.json with `tokenizers 0.20`
 /// compatibility shimming.
 ///
@@ -894,44 +934,207 @@ fn load_tokenizer_with_compat(path: &Path) -> Result<Tokenizer, RunnerError> {
 /// the file already has a `type:` (no patch needed) or if we
 /// can't find the `"model": {` boundary (different schema —
 /// don't guess).
+///
+/// Implemented with a hand-rolled quote-aware JSON scanner rather
+/// than a full `serde_json::Value` round-trip, because whispery
+/// avoids the `serde_json` runtime dep on the alignment feature
+/// (the bundled vocab is parsed at build time; parity-dump JSON
+/// is hand-formatted). Codex round-29 flagged that the previous
+/// implementation used naive substring searches (`s.find(...)`,
+/// `s[..].contains(...)`) without quote-awareness, so a tokenizer
+/// JSON whose string values happened to contain `"model"` or
+/// `"type"` substrings could be misdetected and patched at the
+/// wrong byte range. The scanner below tracks `in_string` /
+/// `escape` state so quoted content is invisible to key matching.
 fn inject_wordlevel_model_type(bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-  let s = core::str::from_utf8(bytes).ok()?;
-  // Find `"model"`'s opening brace. Robust to whitespace.
-  let model_idx = s.find("\"model\"")?;
-  let after_model = &s[model_idx..];
-  let brace_offset = after_model.find('{')?;
-  let brace_pos = model_idx + brace_offset;
+  // Validate UTF-8 once; thereafter operate on raw bytes.
+  let _ = core::str::from_utf8(bytes).ok()?;
 
-  // Already patched / already typed: leave it alone.
-  let model_body = &s[brace_pos..];
-  // Find the matching closing brace, conservatively by depth.
+  // Find `{` that opens the top-level value of `"model"`.
+  let model_open = find_top_level_object_value_open(bytes, b"model")?;
+
+  // Find the matching close brace.
+  let model_close = find_matching_close_brace(bytes, model_open)?;
+
+  // Already discriminated (has a top-level `"type"` key inside
+  // model's body)? Leave it alone.
+  if has_top_level_key(bytes, model_open + 1, model_close, b"type") {
+    return None;
+  }
+
+  // Inject the discriminator fields right after `{`.
+  let injection = b"\n        \"type\": \"WordLevel\",\n        \"unk_token\": \"<unk>\",";
+  let mut out: alloc::vec::Vec<u8> =
+    alloc::vec::Vec::with_capacity(bytes.len() + injection.len());
+  out.extend_from_slice(&bytes[..=model_open]);
+  out.extend_from_slice(injection);
+  out.extend_from_slice(&bytes[model_open + 1..]);
+  Some(out)
+}
+
+/// Quote-aware scan to find the `{` byte index that opens the
+/// VALUE of the named top-level (depth-1) JSON key. Returns
+/// `None` if the key isn't found at depth-1 or its value isn't
+/// a JSON object.
+///
+/// "Top-level" means depth-1 relative to the root JSON value
+/// (which is an object — `{...}` outermost). Depth tracking
+/// ignores `"..."`-quoted regions, so a string value containing
+/// `"model"` substring or `{` braces won't trip the scanner.
+fn find_top_level_object_value_open(bytes: &[u8], key: &[u8]) -> Option<usize> {
+  let mut in_string = false;
+  let mut escape = false;
   let mut depth = 0_i32;
-  let mut close_pos = None;
-  for (i, c) in model_body.char_indices() {
+  let mut i = 0;
+  while i < bytes.len() {
+    let c = bytes[i];
+    if escape {
+      escape = false;
+      i += 1;
+      continue;
+    }
+    if in_string {
+      match c {
+        b'\\' => escape = true,
+        b'"' => in_string = false,
+        _ => {}
+      }
+      i += 1;
+      continue;
+    }
     match c {
-      '{' => depth += 1,
-      '}' => {
+      b'"' => {
+        // Potential start of a string. If we're at depth-1 and
+        // this string equals `key`, AND it's a key (followed by
+        // `:`), this is our hit.
+        let key_end = i + 1 + key.len();
+        if depth == 1
+          && key_end < bytes.len()
+          && &bytes[i + 1..key_end] == key
+          && bytes[key_end] == b'"'
+        {
+          // Skip whitespace, expect `:`, then skip whitespace,
+          // then expect `{`.
+          let mut j = key_end + 1;
+          while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+            j += 1;
+          }
+          if j >= bytes.len() || bytes[j] != b':' {
+            return None;
+          }
+          j += 1;
+          while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+            j += 1;
+          }
+          if j < bytes.len() && bytes[j] == b'{' {
+            return Some(j);
+          }
+          return None;
+        }
+        in_string = true;
+      }
+      b'{' | b'[' => depth += 1,
+      b'}' | b']' => depth -= 1,
+      _ => {}
+    }
+    i += 1;
+  }
+  None
+}
+
+/// Walk forward from `open` (which must point at a `{`) and
+/// return the byte index of the matching `}`. Quote/escape-aware.
+fn find_matching_close_brace(bytes: &[u8], open: usize) -> Option<usize> {
+  if bytes.get(open) != Some(&b'{') {
+    return None;
+  }
+  let mut in_string = false;
+  let mut escape = false;
+  let mut depth = 1_i32;
+  let mut i = open + 1;
+  while i < bytes.len() {
+    let c = bytes[i];
+    if escape {
+      escape = false;
+      i += 1;
+      continue;
+    }
+    if in_string {
+      match c {
+        b'\\' => escape = true,
+        b'"' => in_string = false,
+        _ => {}
+      }
+      i += 1;
+      continue;
+    }
+    match c {
+      b'"' => in_string = true,
+      b'{' => depth += 1,
+      b'}' => {
         depth -= 1;
         if depth == 0 {
-          close_pos = Some(brace_pos + i);
-          break;
+          return Some(i);
         }
       }
       _ => {}
     }
+    i += 1;
   }
-  let close_pos = close_pos?;
-  if s[brace_pos..close_pos].contains("\"type\"") {
-    return None; // already discriminated
-  }
+  None
+}
 
-  // Inject the discriminator fields right after `{`.
-  let injection = "\n        \"type\": \"WordLevel\",\n        \"unk_token\": \"<unk>\",";
-  let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(bytes.len() + injection.len());
-  out.extend_from_slice(s[..=brace_pos].as_bytes());
-  out.extend_from_slice(injection.as_bytes());
-  out.extend_from_slice(s[brace_pos + 1..].as_bytes());
-  Some(out)
+/// Quote-aware scan over `bytes[start..end]` (the interior of a
+/// JSON object, excluding the outer braces) for the named key at
+/// depth-0 of that interior. Returns `true` iff the key is
+/// present as a JSON key (string immediately followed by `:`) at
+/// the top level of this object.
+fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool {
+  let mut in_string = false;
+  let mut escape = false;
+  let mut depth = 0_i32;
+  let mut i = start;
+  while i < end {
+    let c = bytes[i];
+    if escape {
+      escape = false;
+      i += 1;
+      continue;
+    }
+    if in_string {
+      match c {
+        b'\\' => escape = true,
+        b'"' => in_string = false,
+        _ => {}
+      }
+      i += 1;
+      continue;
+    }
+    match c {
+      b'"' => {
+        let key_end = i + 1 + key.len();
+        if depth == 0
+          && key_end < end
+          && &bytes[i + 1..key_end] == key
+          && bytes[key_end] == b'"'
+        {
+          let mut j = key_end + 1;
+          while j < end && (bytes[j] as char).is_ascii_whitespace() {
+            j += 1;
+          }
+          if j < end && bytes[j] == b':' {
+            return true;
+          }
+        }
+        in_string = true;
+      }
+      b'{' | b'[' => depth += 1,
+      b'}' | b']' => depth -= 1,
+      _ => {}
+    }
+    i += 1;
+  }
+  false
 }
 
 #[cfg(test)]
@@ -1007,6 +1210,156 @@ mod tests {
       }
     }"#;
     assert!(inject_wordlevel_model_type(already_typed).is_none());
+  }
+
+  /// Codex round-29 finding 2: the patcher used naive substring
+  /// search (`s.find("\"model\"")`) which would match a `"model"`
+  /// substring inside any string value before it reached the
+  /// real top-level `"model"` key. The quote-aware scanner must
+  /// skip `"model"` text appearing inside strings and inject at
+  /// the actual top-level key.
+  ///
+  /// Test strategy: byte-level — we don't go through the
+  /// `Tokenizer::from_bytes` schema validator because the
+  /// upstream tokenizers crate rejects unknown top-level fields,
+  /// which would force us to embed the decoy inside a known
+  /// field's regex/pattern (clouds the test). Instead we verify
+  /// directly: the injection's byte offset MUST land after the
+  /// real `"model": {` boundary, not inside the decoy field's
+  /// string value.
+  #[test]
+  fn inject_wordlevel_model_type_ignores_model_substring_inside_strings() {
+    // Decoy: a string value containing the escape-quoted text
+    // `\"model\"`. A naive `s.find("\"model\"")` would land here.
+    // The real `"model": {` key sits AFTER the decoy.
+    let raw = br#"{
+      "decoy": "this string mentions \"model\" with escape-quoted braces",
+      "model": {
+        "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "A": 3}
+      }
+    }"#;
+    let patched = inject_wordlevel_model_type(raw)
+      .expect("patcher must locate the real top-level model key, not the decoy substring");
+    let s = core::str::from_utf8(&patched).expect("UTF-8");
+    let inj = s
+      .find("\"type\": \"WordLevel\"")
+      .expect("patched output must contain injected discriminator");
+    let real_model_key = s
+      .find("\n      \"model\": {")
+      .expect("real model key must remain in output");
+    assert!(
+      inj > real_model_key,
+      "injection at offset {inj} must come AFTER real model key at offset {real_model_key}; \
+       the decoy substring would have placed it earlier"
+    );
+  }
+
+  /// Codex round-29 finding 2: brace counting was naive and
+  /// counted braces even inside string values. A description
+  /// like `"value with {curly} braces"` would skew the depth
+  /// tracker and the scanner would lose the model body's
+  /// matching close brace. The quote-aware close-brace finder
+  /// must skip braces inside strings.
+  ///
+  /// Test strategy: verify the injection successfully completes
+  /// without a `None` bail, AND the patched output contains the
+  /// discriminator. With the previous brace-counting scanner,
+  /// stray braces inside the decoy string would cause the
+  /// `find_matching_close_brace` walker to either (a) return a
+  /// premature `}` belonging to a nested object reached too
+  /// early, OR (b) walk past the real close brace — both produce
+  /// a wrong byte range, and the early-skip check
+  /// (`s[brace_pos..close_pos].contains("\"type\"")`) would then
+  /// scan the wrong slice. The new quote-aware walker isolates
+  /// it.
+  #[test]
+  fn inject_wordlevel_model_type_ignores_braces_inside_strings() {
+    let raw = br#"{
+      "decoy": "value with { braces } and more { } inside",
+      "model": {
+        "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "B": 3}
+      }
+    }"#;
+    let patched = inject_wordlevel_model_type(raw)
+      .expect("patcher must skip braces inside string values when finding model body close");
+    let s = core::str::from_utf8(&patched).expect("UTF-8");
+    assert!(
+      s.contains("\"type\": \"WordLevel\""),
+      "patched output must contain injected discriminator"
+    );
+    // The decoy must remain intact (we didn't touch it).
+    assert!(
+      s.contains("\"decoy\": \"value with { braces } and more { } inside\""),
+      "decoy field must remain byte-identical"
+    );
+  }
+
+  /// Codex round-29 finding 2: the discriminator pre-check was a
+  /// substring search that would treat `"type"` *anywhere* inside
+  /// the model body — including string values like
+  /// `"_note": "the type of ..."` — as evidence that the
+  /// discriminator was already present, and skip patching. The
+  /// quote-aware key check must only match `"type"` when it's a
+  /// JSON key (followed by `:`) at the top level of the model
+  /// object.
+  #[test]
+  fn inject_wordlevel_model_type_does_not_treat_quoted_type_as_discriminator() {
+    let raw = br#"{
+      "model": {
+        "_note": "the type of model is wav2vec2",
+        "vocab": {"<pad>": 0, "<unk>": 1, "|": 2, "C": 3}
+      }
+    }"#;
+    let patched = inject_wordlevel_model_type(raw).expect(
+      "patcher must NOT short-circuit on a quoted `type` substring inside a string value; \
+       it must inject the real discriminator key",
+    );
+    let s = core::str::from_utf8(&patched).expect("UTF-8");
+    assert!(
+      s.contains("\"type\": \"WordLevel\""),
+      "patched output must contain the injected discriminator key"
+    );
+  }
+
+  // --- Coverage coercion (Codex round-29 finding 1) ---
+  //
+  // Per user direction: don't panic on bad inputs — coerce them
+  // toward a valid threshold so misconfigured callers still
+  // produce useful output.
+
+  #[test]
+  fn coerce_speech_coverage_passes_through_valid_values() {
+    assert_eq!(coerce_speech_coverage(0.0), 0.0);
+    assert_eq!(coerce_speech_coverage(0.25), 0.25);
+    assert_eq!(coerce_speech_coverage(0.5), 0.5);
+    assert_eq!(coerce_speech_coverage(0.99), 0.99);
+    assert_eq!(coerce_speech_coverage(1.0), 1.0);
+  }
+
+  #[test]
+  fn coerce_speech_coverage_clamps_above_one() {
+    assert_eq!(coerce_speech_coverage(1.5), 1.0);
+    assert_eq!(coerce_speech_coverage(100.0), 1.0);
+    assert_eq!(coerce_speech_coverage(f32::INFINITY), 1.0);
+  }
+
+  #[test]
+  fn coerce_speech_coverage_clamps_below_zero() {
+    assert_eq!(coerce_speech_coverage(-0.1), 0.0);
+    assert_eq!(coerce_speech_coverage(-100.0), 0.0);
+    assert_eq!(coerce_speech_coverage(f32::NEG_INFINITY), 0.0);
+  }
+
+  #[test]
+  fn coerce_speech_coverage_treats_nan_as_default() {
+    // NaN compares false to every comparison operator, so a
+    // permissive setter would store it verbatim and silently
+    // drop every word (since `coverage < NaN` is always false).
+    // Reset to the documented sane default instead.
+    assert_eq!(
+      coerce_speech_coverage(f32::NAN),
+      crate::runner::aligner::algorithm::compose::DEFAULT_MIN_SPEECH_COVERAGE,
+    );
   }
 
   // --- Word-delimiter validation ---
