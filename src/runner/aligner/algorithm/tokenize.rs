@@ -647,7 +647,9 @@ mod tests {
       "suffix wildcard must land at the END"
     );
     assert!(
-      result.token_ids[..5].iter().all(|&id| id != WILDCARD_TOKEN_ID),
+      result.token_ids[..5]
+        .iter()
+        .all(|&id| id != WILDCARD_TOKEN_ID),
       "no leading wildcards expected when prefix=0; got tokens {:?}",
       result.token_ids
     );
@@ -679,13 +681,14 @@ mod tests {
     .expect("ok");
     assert_eq!(result.token_ids.len(), 6);
     assert_eq!(
-      result.token_ids[0],
-      WILDCARD_TOKEN_ID,
+      result.token_ids[0], WILDCARD_TOKEN_ID,
       "prefix wildcard must land at the START; got tokens {:?}",
       result.token_ids
     );
     assert!(
-      result.token_ids[1..].iter().all(|&id| id != WILDCARD_TOKEN_ID),
+      result.token_ids[1..]
+        .iter()
+        .all(|&id| id != WILDCARD_TOKEN_ID),
       "no trailing wildcards expected when suffix=0; got tokens {:?}",
       result.token_ids
     );
@@ -714,7 +717,9 @@ mod tests {
     assert_eq!(result.token_ids[0], WILDCARD_TOKEN_ID, "prefix at start");
     assert_eq!(result.token_ids[6], WILDCARD_TOKEN_ID, "suffix at end");
     assert!(
-      result.token_ids[1..6].iter().all(|&id| id != WILDCARD_TOKEN_ID),
+      result.token_ids[1..6]
+        .iter()
+        .all(|&id| id != WILDCARD_TOKEN_ID),
       "interior must be encoded chars only; got {:?}",
       result.token_ids
     );

@@ -157,8 +157,7 @@ impl TextNormalizer for EnglishNormalizer {
       // total-count behaviour for that subset).
       let trimmed_left = word.trim_start_matches(is_word_punct);
       let prefix_stripped: u32 = (word.chars().count() - trimmed_left.chars().count()) as u32;
-      let suffix_stripped: u32 =
-        (trimmed_left.chars().count() - stripped.chars().count()) as u32;
+      let suffix_stripped: u32 = (trimmed_left.chars().count() - stripped.chars().count()) as u32;
 
       // Split on internal separators (`Hello-World` →
       // `["Hello", "World"]`). Each piece is a real word the
