@@ -1060,7 +1060,7 @@ mod tests {
   fn build_speech_mask_marks_inrange_segments() {
     // Plain in-range segment: bits set exactly inside [start, end).
     let segs = [TimeRange::new(2, 5, analysis_tb())];
-    let mask = build_speech_mask(8, &segs);
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
     assert_eq!(
       mask,
       vec![false, false, true, true, true, false, false, false]
@@ -1075,7 +1075,7 @@ mod tests {
     // entirely. Now the head trims to 0 and the tail (within
     // the chunk) gets masked.
     let segs = [TimeRange::new(-3, 4, analysis_tb())];
-    let mask = build_speech_mask(8, &segs);
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
     assert_eq!(
       mask,
       vec![true, true, true, true, false, false, false, false]
@@ -1086,7 +1086,7 @@ mod tests {
   fn build_speech_mask_clamps_overshoot_to_buffer_end() {
     // end_pts past `n_samples` clamps to len; start in range.
     let segs = [TimeRange::new(5, 100, analysis_tb())];
-    let mask = build_speech_mask(8, &segs);
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
     assert_eq!(
       mask,
       vec![false, false, false, false, false, true, true, true]
@@ -1097,7 +1097,7 @@ mod tests {
   fn build_speech_mask_drops_fully_negative_range() {
     // Both bounds negative: clamps to [0, 0), no bits set.
     let segs = [TimeRange::new(-10, -3, analysis_tb())];
-    let mask = build_speech_mask(8, &segs);
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
     assert_eq!(mask, vec![false; 8]);
   }
 
@@ -1105,7 +1105,7 @@ mod tests {
   fn build_speech_mask_drops_fully_overshoot_range() {
     // Both bounds past len: clamps to [len, len), no bits set.
     let segs = [TimeRange::new(20, 30, analysis_tb())];
-    let mask = build_speech_mask(8, &segs);
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
     assert_eq!(mask, vec![false; 8]);
   }
 
@@ -1116,7 +1116,7 @@ mod tests {
     // inverted-range case can't be constructed via the public
     // API and isn't reachable through the silence-mask path.)
     let segs = [TimeRange::new(5, 5, analysis_tb())];
-    let mask = build_speech_mask(8, &segs);
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
     assert_eq!(mask, vec![false; 8]);
   }
 
@@ -1127,7 +1127,7 @@ mod tests {
       TimeRange::new(1, 4, analysis_tb()),
       TimeRange::new(3, 6, analysis_tb()),
     ];
-    let mask = build_speech_mask(8, &segs);
+    let mask = build_speech_mask(8, &segs, &Lang::En).expect("ok");
     assert_eq!(
       mask,
       vec![false, true, true, true, true, true, false, false]
@@ -1137,21 +1137,52 @@ mod tests {
   #[test]
   fn build_speech_mask_empty_buffer_returns_empty_mask() {
     let segs = [TimeRange::new(0, 0, analysis_tb())];
-    let mask = build_speech_mask(0, &segs);
+    let mask = build_speech_mask(0, &segs, &Lang::En).expect("ok");
     assert!(mask.is_empty());
   }
 
   #[test]
-  #[should_panic(expected = "Aligner::align expects sub_segments")]
-  #[cfg(debug_assertions)]
-  fn build_speech_mask_panics_in_debug_on_non_analysis_timebase() {
-    // Pass a 1/1000 (millisecond) timebase. The runtime would
-    // misinterpret the PTS as 16 kHz sample indices — a
-    // documented contract violation. Debug builds trip the
-    // assert; release builds proceed (matches prior behaviour).
+  fn build_speech_mask_errors_on_non_analysis_timebase() {
+    // Promoted from the previous `debug_assert!`-only check: a
+    // non-1/16000 timebase now fails the chunk in BOTH debug and
+    // release. Codex round-20 round-tripped this as a
+    // medium-severity finding because release builds silently
+    // misinterpreted (e.g.) a millisecond-timebase PTS as a
+    // 16 kHz sample index, masking the wrong samples and
+    // producing plausible-but-wrong word alignments.
     let ms_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(1000).unwrap());
     let segs = [TimeRange::new(0, 100, ms_tb)];
-    let _ = build_speech_mask(16_000, &segs);
+    let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
+    match err {
+      WorkFailure::AlignmentFailed { kind, message, .. } => {
+        assert_eq!(
+          kind,
+          crate::types::AlignmentFailureKind::ModelInferenceFailed
+        );
+        assert!(
+          message.contains("chunk-local 1/16000 timebase"),
+          "error message must cite the contract; got: {message}"
+        );
+        assert!(
+          message.contains("1/1000"),
+          "error message must cite the offending timebase; got: {message}"
+        );
+      }
+      other => panic!("expected AlignmentFailed, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn build_speech_mask_errors_on_output_timebase() {
+    // Codex's example was milliseconds (1/1000); a 1/48000
+    // (output-rate) PTS is the more realistic foot-gun: a
+    // production caller passing the output-timebase ranges they
+    // were going to emit, instead of converting back to
+    // chunk-local 1/16000. Same fail-loud behaviour required.
+    let out_tb = mediatime::Timebase::new(1, core::num::NonZeroU32::new(48_000).unwrap());
+    let segs = [TimeRange::new(0, 1000, out_tb)];
+    let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
+    assert!(matches!(err, WorkFailure::AlignmentFailed { .. }));
   }
 
   #[test]
