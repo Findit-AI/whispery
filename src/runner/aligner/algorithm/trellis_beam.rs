@@ -604,11 +604,7 @@ pub fn backtrack_beam(
     // `f32` doesn't impl Ord; sort by total_cmp() reversed for
     // descending. This matches Python's stable
     // `sorted(..., reverse=True)`.
-    next_active.sort_by(|&a, &b| {
-      arena[b as usize]
-        .score
-        .total_cmp(&arena[a as usize].score)
-    });
+    next_active.sort_by(|&a, &b| arena[b as usize].score.total_cmp(&arena[a as usize].score));
     if next_active.len() > beam_width {
       next_active.truncate(beam_width);
     }
