@@ -399,7 +399,7 @@ impl Aligner {
     // inside `encode_log_softmax`) had the intermediate zeros
     // mean-shifted by the normaliser, so masked regions became
     // `(0 - mean) / std` ≠ 0 by the time they reached the model.
-    let speech_mask = build_speech_mask(samples.len(), sub_segments);
+    let speech_mask = build_speech_mask(samples.len(), sub_segments, &self.language)?;
 
     if abort_flag.load(Ordering::Relaxed) {
       return Err(timed_out());
@@ -708,10 +708,15 @@ impl Aligner {
 ///
 /// Two contract details worth highlighting:
 ///
-/// 1. A non-1/16000 timebase trips a `debug_assert` (release builds
-///    still proceed with the cast). Internal callers always wrap
-///    in 1/16000 (`managed_transcriber.rs`), and external callers
-///    of `align_chunk` are documented to do the same.
+/// 1. A non-1/16000 timebase fails the chunk in BOTH debug and
+///    release with a `WorkFailure::AlignmentFailed`. Previously
+///    the check was a `debug_assert!` only, so release builds
+///    silently misinterpreted (e.g.) a millisecond-timebase PTS
+///    as a sample index, masking the wrong samples and producing
+///    plausible-but-wrong word alignments. Internal callers
+///    always wrap in 1/16000 (`managed_transcriber.rs`); external
+///    callers of `align_chunk` are documented to do the same and
+///    now hit a clear runtime error if they don't.
 /// 2. `i64 → usize` is via `.clamp(0, n_samples_i64) as usize`, NOT
 ///    `as u64 as usize`. The old cast wrapped negative `start_pts`
 ///    to a huge u64, which then got clamped to `n_samples` and the
@@ -719,18 +724,29 @@ impl Aligner {
 ///    Negative-overlap ranges (sub-segment whose head extends past
 ///    the chunk start) now get their head trimmed and their tail
 ///    masked, matching `compose::build_speech_frames`'s `.max(0)`.
-fn build_speech_mask(n_samples: usize, sub_segments: &[TimeRange]) -> alloc::vec::Vec<bool> {
+fn build_speech_mask(
+  n_samples: usize,
+  sub_segments: &[TimeRange],
+  language: &Lang,
+) -> Result<alloc::vec::Vec<bool>, WorkFailure> {
+  use crate::types::AlignmentFailureKind;
   let mut mask = alloc::vec![false; n_samples];
   let n_samples_i64 = n_samples as i64;
   for &seg in sub_segments {
-    debug_assert!(
-      seg.timebase().num() == 1 && seg.timebase().den().get() == SAMPLE_RATE_HZ,
-      "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
-       got {}/{}",
-      SAMPLE_RATE_HZ,
-      seg.timebase().num(),
-      seg.timebase().den().get(),
-    );
+    if seg.timebase().num() != 1 || seg.timebase().den().get() != SAMPLE_RATE_HZ {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: AlignmentFailureKind::ModelInferenceFailed,
+        message: alloc::format!(
+          "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
+           got {}/{}; caller passed sub_segments in the wrong timebase \
+           (samples will not match audio if we proceed).",
+          SAMPLE_RATE_HZ,
+          seg.timebase().num(),
+          seg.timebase().den().get(),
+        ),
+        language: language.clone(),
+      });
+    }
     let start = seg.start_pts().clamp(0, n_samples_i64) as usize;
     let end = seg.end_pts().clamp(0, n_samples_i64) as usize;
     if end > start {
@@ -739,7 +755,7 @@ fn build_speech_mask(n_samples: usize, sub_segments: &[TimeRange]) -> alloc::vec
       }
     }
   }
-  mask
+  Ok(mask)
 }
 
 /// Read the CTC blank-token id from a HuggingFace tokenizer.
@@ -1045,7 +1061,10 @@ mod tests {
     // Plain in-range segment: bits set exactly inside [start, end).
     let segs = [TimeRange::new(2, 5, analysis_tb())];
     let mask = build_speech_mask(8, &segs);
-    assert_eq!(mask, vec![false, false, true, true, true, false, false, false]);
+    assert_eq!(
+      mask,
+      vec![false, false, true, true, true, false, false, false]
+    );
   }
 
   #[test]
@@ -1057,7 +1076,10 @@ mod tests {
     // the chunk) gets masked.
     let segs = [TimeRange::new(-3, 4, analysis_tb())];
     let mask = build_speech_mask(8, &segs);
-    assert_eq!(mask, vec![true, true, true, true, false, false, false, false]);
+    assert_eq!(
+      mask,
+      vec![true, true, true, true, false, false, false, false]
+    );
   }
 
   #[test]
@@ -1065,7 +1087,10 @@ mod tests {
     // end_pts past `n_samples` clamps to len; start in range.
     let segs = [TimeRange::new(5, 100, analysis_tb())];
     let mask = build_speech_mask(8, &segs);
-    assert_eq!(mask, vec![false, false, false, false, false, true, true, true]);
+    assert_eq!(
+      mask,
+      vec![false, false, false, false, false, true, true, true]
+    );
   }
 
   #[test]
@@ -1103,7 +1128,10 @@ mod tests {
       TimeRange::new(3, 6, analysis_tb()),
     ];
     let mask = build_speech_mask(8, &segs);
-    assert_eq!(mask, vec![false, true, true, true, true, true, false, false]);
+    assert_eq!(
+      mask,
+      vec![false, true, true, true, true, true, false, false]
+    );
   }
 
   #[test]
