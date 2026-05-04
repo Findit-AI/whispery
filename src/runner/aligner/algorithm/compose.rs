@@ -159,7 +159,12 @@ pub(crate) fn build_speech_frames(
   // overlap.
   let mut clamped_segs: alloc::vec::Vec<(i64, i64)> = sub_segments
     .iter()
-    .map(|s| (s.start_pts().clamp(0, n_samples_i64), s.end_pts().clamp(0, n_samples_i64)))
+    .map(|s| {
+      (
+        s.start_pts().clamp(0, n_samples_i64),
+        s.end_pts().clamp(0, n_samples_i64),
+      )
+    })
     .filter(|(s, e)| e > s)
     .collect();
   clamped_segs.sort_by_key(|&(s, _)| s);
@@ -719,7 +724,12 @@ mod tests {
       TimeRange::new(0, 100, tb_16k),
       TimeRange::new(50, 150, tb_16k),
     ];
-    let mask = build_speech_frames(/* n_frames: */ 1, 320.0, /* n_samples: */ 320, &overlapping);
+    let mask = build_speech_frames(
+      /* n_frames: */ 1,
+      320.0,
+      /* n_samples: */ 320,
+      &overlapping,
+    );
     assert_eq!(
       mask,
       alloc::vec![false],
