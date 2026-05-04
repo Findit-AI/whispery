@@ -385,6 +385,31 @@ impl Aligner {
       return Err(timed_out());
     }
 
+    // Sub-400-sample early-out. wav2vec2's first conv layer has
+    // a 400-sample receptive field, so for shorter inputs the
+    // encode path pads to 400 below before invoking ORT. The
+    // encoder then emits `T` frames whose stride is governed by
+    // the PADDED length, not the original `samples.len()`.
+    // Downstream `samples_per_frame = samples.len() / (T-1)`
+    // (the WhisperX effective ratio) uses the original length,
+    // so padded-tensor frames get projected onto the original
+    // audio at the wrong stride — `compose_words` emits word
+    // ranges shrunk by `samples.len() / padded.len()` and
+    // `build_speech_frames` classifies frames against intervals
+    // that don't match the encoder's own view. Codex round-25
+    // flagged this; the simplest safe response is to refuse
+    // alignment for chunks that can't satisfy the receptive
+    // field directly. At 25 ms or less, a chunk cannot realistically
+    // contain a meaningful CTC path through any non-trivial
+    // transcript anyway. Match the empty-text / empty-tokens
+    // short-circuits below by returning an empty
+    // `AlignmentResult` rather than `Err` — alignment becoming
+    // a no-op on degenerate input, not a data-loss path.
+    const WAV2VEC2_MIN_SAMPLES: usize = 400;
+    if samples.len() < WAV2VEC2_MIN_SAMPLES {
+      return Ok(AlignmentResult::new(alloc::vec::Vec::new()));
+    }
+
     // Step 0: silence-aware preprocessing.
     //
     // `sub_segments` are in chunk-local 1/16000 timebase per the
@@ -1284,6 +1309,73 @@ mod tests {
     assert!(
       result.words().is_empty(),
       "empty normalisation must yield zero words; got {:?}",
+      result.words()
+    );
+  }
+
+  /// Codex round-25 regression: a chunk shorter than wav2vec2's
+  /// 400-sample receptive field must NOT enter the encode path,
+  /// because the encoder would pad to 400 and emit `T` frames
+  /// whose stride is governed by the padded length, while
+  /// `samples_per_frame` downstream would use the original
+  /// `samples.len()`. The two views disagree by exactly the
+  /// padding ratio. Skipping these chunks (returning empty
+  /// `AlignmentResult`) is the simplest safe response — at
+  /// 25 ms or less, the chunk cannot contain a meaningful
+  /// CTC path through any non-trivial transcript.
+  #[test]
+  fn sub_400_sample_chunk_short_circuits_to_empty_result() {
+    use core::sync::atomic::AtomicBool;
+
+    use mediatime::{TimeRange, Timebase};
+
+    use crate::runner::aligner::normalizers::EnglishNormalizer;
+
+    let model_path = match option_env!("WHISPERY_W2V_MODEL") {
+      Some(p) => p,
+      None => return,
+    };
+    let tokenizer_path = match option_env!("WHISPERY_W2V_TOKENIZER") {
+      Some(p) => p,
+      None => return,
+    };
+
+    let mut aligner = Aligner::from_paths(
+      Lang::En,
+      Path::new(model_path),
+      Path::new(tokenizer_path),
+      alloc::boxed::Box::new(EnglishNormalizer::new()),
+    )
+    .expect("Aligner::from_paths");
+
+    // 200 samples at 16 kHz = 12.5 ms. wav2vec2 needs ≥400.
+    let samples = alloc::vec![0.0_f32; 200];
+    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let abort = AtomicBool::new(false);
+    let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
+
+    // Realistic transcript text — would normalise + tokenise
+    // fine, but the sub-400-sample guard fires before encode.
+    let result = aligner
+      .align(
+        &samples,
+        &sub_segments,
+        /* text: */ "hello world",
+        /* chunk_first_sample_in_stream: */ 0,
+        |start, end| {
+          TimeRange::new(
+            start as i64,
+            end as i64,
+            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+          )
+        },
+        &abort,
+        &run_options,
+      )
+      .expect("sub-400-sample chunks must Ok(empty), not propagate as AlignmentFailed");
+    assert!(
+      result.words().is_empty(),
+      "sub-400-sample chunk must yield zero words; got {:?}",
       result.words()
     );
   }
