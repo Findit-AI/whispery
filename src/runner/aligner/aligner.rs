@@ -681,7 +681,24 @@ impl Aligner {
     // silence-mask step zeroed, so words whose CTC-forced
     // assignment lands entirely inside masked silence drop from
     // the result rather than emit fabricated timings.
-    let speech_frames = build_speech_frames(log_probs.t, self.hop_samples, sub_segments);
+    //
+    // `samples_per_frame` is computed once and passed to both
+    // `build_speech_frames` (which uses it to map encoder frames
+    // back to sample ranges for VAD overlap classification) and
+    // `compose_words` (which uses the same mapping to emit word
+    // timestamps). Codex round-21 flagged the previous mismatch
+    // — `build_speech_frames` used nominal `hop_samples` while
+    // `compose_words` used the WhisperX effective ratio
+    // `n_samples / (T - 1)`. On a 30 s chunk where wav2vec2
+    // truncates one frame (T=1499 vs nominal 1500), the drift
+    // hits ~40 ms by the chunk end, enough to misclassify
+    // boundary words.
+    let samples_per_frame = crate::runner::aligner::algorithm::compose::effective_samples_per_frame(
+      samples.len() as u64,
+      log_probs.t,
+      self.hop_samples,
+    );
+    let speech_frames = build_speech_frames(log_probs.t, samples_per_frame, sub_segments);
     Ok(compose_words(
       &word_segments,
       normalized.original_words(),

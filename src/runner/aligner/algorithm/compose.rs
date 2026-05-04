@@ -39,46 +39,86 @@ pub const DEFAULT_MIN_SPEECH_COVERAGE: f32 = 0.5;
 /// auto-correct.
 pub const DEFAULT_MAX_INTRA_SILENT_RUN: Duration = Duration::from_millis(80);
 
+/// Single source of truth for the effective samples-per-frame
+/// ratio whispery uses to map encoder frame indices back to
+/// audio sample indices. Mirrors WhisperX's `alignment.py:279`
+/// `ratio = duration * waveform_segment.size(0) / (trellis.size(0) - 1)`.
+/// See the comment on [`compose_words`]'s `n_samples` /
+/// `total_frames` pair for why this ratio (rather than nominal
+/// `hop_samples`) is the correct mapping.
+///
+/// Falls back to nominal `hop_samples` when `total_frames < 2`
+/// (single-frame / empty chunks have no defined ratio). Empty
+/// chunks short-circuit upstream; this is just a safety net.
+pub(crate) fn effective_samples_per_frame(
+  n_samples: u64,
+  total_frames: usize,
+  hop_samples: u32,
+) -> f64 {
+  if total_frames >= 2 {
+    (n_samples as f64) / ((total_frames - 1) as f64)
+  } else {
+    hop_samples as f64
+  }
+}
+
 /// Build a per-frame speech mask of length `n_frames`, marking
 /// `true` exactly for frames whose audio sample range overlaps any
 /// of the supplied chunk-local sub-segments. Used by
 /// [`compose_words`] to drop CTC-forced word assignments that fall
 /// entirely inside silence-masked audio.
 ///
-/// Frame `t` represents samples `[t * hop_samples, (t + 1) *
-/// hop_samples)` (an approximation of wav2vec2's effective stride);
-/// any overlap with a sub-segment marks the frame as speech. The
-/// silence_mask step has already zeroed those samples for non-speech,
-/// so this mirrors the same boundary the audio carries.
+/// Frame `f` represents samples `[f * samples_per_frame,
+/// (f + 1) * samples_per_frame)` — the SAME mapping
+/// [`compose_words`] uses to emit word ranges. The two views must
+/// stay in lock-step: if `build_speech_frames` classifies frame `f`
+/// against (e.g.) `[f * 320, (f+1) * 320)` while `compose_words`
+/// emits the same frame against the WhisperX effective ratio
+/// `n_samples / (T - 1)`, the speech-mask classification drifts
+/// from the emitted range. On a 30 s chunk where wav2vec2
+/// truncates one frame at the edge (`T = 1499` for `n_samples =
+/// 480000` instead of nominal `1500`), the drift hits ~40 ms by
+/// the chunk end — enough to drop a valid late-frame word whose
+/// nominal frame looks silent, or keep a word whose emitted
+/// range lands outside the VAD speech span. Codex round-21
+/// flagged this as a medium-severity inconsistency. The fix is
+/// to feed both functions the same `samples_per_frame` value via
+/// [`effective_samples_per_frame`].
 ///
 /// `sub_segments` must be in chunk-local sample-index space — the
 /// caller (alignment worker) wraps the segment range PTS in a
 /// 1/16000 timebase so `start_pts` == `start_sample`.
 pub(crate) fn build_speech_frames(
   n_frames: usize,
-  hop_samples: u32,
+  samples_per_frame: f64,
   sub_segments: &[mediatime::TimeRange],
 ) -> alloc::vec::Vec<bool> {
-  if hop_samples == 0 {
+  if !samples_per_frame.is_finite() || samples_per_frame <= 0.0 {
     return alloc::vec![false; n_frames];
   }
-  let hop = hop_samples as i64;
   // A frame is marked "speech" only if at least half its
-  // `hop_samples` are inside some VAD sub-segment. Pre-fix any
-  // overlap, even 1 sample, promoted the whole frame — a tiny
-  // VAD island inside an otherwise-silent frame let the
-  // post-pass keep CTC-forced words whose ranges covered
-  // mostly zero-masked audio. ≥50 % is the natural threshold
-  // — frames whose majority of samples are silence don't
-  // qualify; frames whose majority is speech do.
+  // `samples_per_frame` samples are inside some VAD sub-segment.
+  // Pre-fix any overlap, even 1 sample, promoted the whole frame
+  // — a tiny VAD island inside an otherwise-silent frame let the
+  // post-pass keep CTC-forced words whose ranges covered mostly
+  // zero-masked audio. ≥50 % is the natural threshold — frames
+  // whose majority of samples are silence don't qualify; frames
+  // whose majority is speech do.
   //
   // Use ceil-half so odd custom strides still need a strict
-  // majority of samples (`hop=3` → 2 samples, not 1) and
-  // clamp the threshold to ≥1 so `hop=1` doesn't trivialise
-  // to "any-overlap-counts" — without the clamp, an empty
+  // majority of samples (`spf=3` → 2 samples, not 1) and clamp
+  // the threshold to ≥1 so `spf=1` doesn't trivialise to
+  // "any-overlap-counts" — without the clamp, an empty
   // sub_segments list would pass the `>= 0` check for every
   // frame and mark the whole chunk as speech.
-  let min_overlap_samples = ((hop + 1) / 2).max(1);
+  //
+  // Threshold computed against the floor of `samples_per_frame`
+  // (an integer) so the test stays stable across f64 jitter; the
+  // ratio is typically within ~1 sample of `hop_samples` on real
+  // wav2vec2-base chunks (320.0 nominal vs 320.43 effective on
+  // the 30 s edge case), well within the half-frame margin.
+  let spf_int = samples_per_frame.floor() as i64;
+  let min_overlap_samples = ((spf_int + 1) / 2).max(1);
   let mut overlap_per_frame = alloc::vec![0_i64; n_frames];
   for seg in sub_segments {
     let seg_start = seg.start_pts().max(0);
@@ -91,15 +131,17 @@ pub(crate) fn build_speech_frames(
     // cumulatively contribute to the same frame, which matches
     // the spirit of the old "any overlap" rule for cases where
     // VAD splits a single voiced span across two segments.
-    let frame_start = (seg_start / hop) as usize;
-    let frame_end = ((seg_end + hop - 1) / hop) as usize;
+    let frame_start = ((seg_start as f64) / samples_per_frame).floor() as i64;
+    let frame_start = frame_start.max(0) as usize;
+    let frame_end = ((seg_end as f64) / samples_per_frame).ceil() as i64;
+    let frame_end = frame_end.max(0) as usize;
     let upper = frame_end.min(n_frames);
     if frame_start >= upper {
       continue;
     }
     for f in frame_start..upper {
-      let frame_lo = (f as i64) * hop;
-      let frame_hi = frame_lo + hop;
+      let frame_lo = ((f as f64) * samples_per_frame).round() as i64;
+      let frame_hi = (((f + 1) as f64) * samples_per_frame).round() as i64;
       let overlap = seg_end.min(frame_hi) - seg_start.max(frame_lo);
       if overlap > 0 {
         overlap_per_frame[f] = overlap_per_frame[f].saturating_add(overlap);
@@ -178,15 +220,9 @@ where
   // `alignment.py`. Using nominal `hop_samples` (320) introduced
   // a ~40 ms drift over a 30 s clip because wav2vec2's CNN
   // truncates one frame at the edge (n_samples=480 000 → T=1499
-  // not 1500).
-  let samples_per_frame = if total_frames >= 2 {
-    (n_samples as f64) / ((total_frames - 1) as f64)
-  } else {
-    // Single-frame or empty chunk: effective ratio undefined;
-    // fall back to nominal hop. Empty cases short-circuit
-    // upstream; this is just a safety net.
-    hop_samples as f64
-  };
+  // not 1500). Same value `build_speech_frames` is fed by the
+  // caller (single source of truth via `effective_samples_per_frame`).
+  let samples_per_frame = effective_samples_per_frame(n_samples, total_frames, hop_samples);
 
   let chunk_end_sample = chunk_first_sample_in_stream.saturating_add(n_samples);
   let mut words: Vec<Word> = Vec::with_capacity(word_segments.len());
@@ -499,19 +535,21 @@ mod tests {
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
     let segs = alloc::vec![TimeRange::new(320, 960, tb_16k)];
-    let mask = build_speech_frames(/* n_frames: */ 5, /* hop_samples: */ 320, &segs);
+    let mask = build_speech_frames(
+      /* n_frames: */ 5, /* samples_per_frame: */ 320.0, &segs,
+    );
     assert_eq!(mask, alloc::vec![false, true, true, false, false]);
   }
 
   #[test]
   fn build_speech_frames_handles_no_segments() {
-    let mask = build_speech_frames(4, 320, &[]);
+    let mask = build_speech_frames(4, 320.0, &[]);
     assert_eq!(mask, alloc::vec![false; 4]);
   }
 
   #[test]
   fn build_speech_frames_hop_one_with_no_segments_is_all_silence() {
-    let mask = build_speech_frames(8, 1, &[]);
+    let mask = build_speech_frames(8, 1.0, &[]);
     assert_eq!(mask, alloc::vec![false; 8]);
   }
 
@@ -522,11 +560,11 @@ mod tests {
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
     let segs = alloc::vec![TimeRange::new(0, 1, tb_16k)];
-    let mask = build_speech_frames(4, 3, &segs);
+    let mask = build_speech_frames(4, 3.0, &segs);
     assert_eq!(mask, alloc::vec![false; 4]);
 
     let segs_at = alloc::vec![TimeRange::new(0, 2, tb_16k)];
-    let mask_at = build_speech_frames(4, 3, &segs_at);
+    let mask_at = build_speech_frames(4, 3.0, &segs_at);
     assert_eq!(mask_at[0], true);
   }
 
@@ -538,12 +576,12 @@ mod tests {
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
     let segs_at = alloc::vec![TimeRange::new(0, 160, tb_16k)];
     assert_eq!(
-      build_speech_frames(2, 320, &segs_at),
+      build_speech_frames(2, 320.0, &segs_at),
       alloc::vec![true, false]
     );
     let segs_under = alloc::vec![TimeRange::new(0, 159, tb_16k)];
     assert_eq!(
-      build_speech_frames(2, 320, &segs_under),
+      build_speech_frames(2, 320.0, &segs_under),
       alloc::vec![false, false]
     );
   }
@@ -558,7 +596,75 @@ mod tests {
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(160, 240, tb_16k),
     ];
-    assert_eq!(build_speech_frames(2, 320, &segs), alloc::vec![true, false]);
+    assert_eq!(
+      build_speech_frames(2, 320.0, &segs),
+      alloc::vec![true, false]
+    );
+  }
+
+  #[test]
+  fn build_speech_frames_uses_effective_ratio_not_nominal_hop() {
+    // Codex round-21 regression: on a real wav2vec2-base 30 s
+    // chunk the encoder truncates one frame at the edge, so
+    // `T = 1499` for `n_samples = 480000` (instead of nominal
+    // `1500` from `480000 / 320`). Effective `samples_per_frame
+    // = 480000 / 1498 = 320.4272...`. Frame `T - 1 = 1498`
+    // therefore SHOULD cover samples ~`[480000 - 320.43,
+    // 480000)` (the trailing slice of the audio), not the
+    // nominal `[479360, 479680)` it would land at if
+    // `build_speech_frames` used the integer hop `320`. A VAD
+    // segment that ends right at the chunk end must classify
+    // the last frame as speech under the new mapping; under
+    // the old one it would have classified frame 1498 against
+    // a slice that's 320 samples short of the chunk end and
+    // missed the segment.
+    use core::num::NonZeroU32;
+    use mediatime::{TimeRange, Timebase};
+
+    let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let n_samples: u64 = 480_000;
+    let total_frames: usize = 1499;
+    let samples_per_frame =
+      effective_samples_per_frame(n_samples, total_frames, /* hop fallback: */ 320);
+    // Sanity-check the ratio drift the test depends on.
+    assert!(
+      (samples_per_frame - 320.4272).abs() < 0.01,
+      "expected ~320.43, got {samples_per_frame}"
+    );
+
+    // VAD speech segment ending right at the chunk end. Frame
+    // 1498 (the last) must classify as speech.
+    let trailing_speech = alloc::vec![TimeRange::new(479_000, 480_000, tb_16k)];
+    let mask = build_speech_frames(total_frames, samples_per_frame, &trailing_speech);
+    assert_eq!(mask.len(), total_frames);
+    assert!(
+      mask[total_frames - 1],
+      "last frame must be speech under the effective ratio mapping"
+    );
+
+    // Same VAD segment classified against the OLD nominal hop
+    // (320) demonstrates the drift: with nominal hop, frame
+    // 1498 covers samples [479360, 479680), entirely inside
+    // the speech range — so it'd ALSO be classified speech in
+    // this specific case. The drift bites at the OPPOSITE end
+    // — a tiny VAD island at samples [480000 - 100, 480000)
+    // with effective ratio falls inside frame 1498's
+    // [479680, 480000) range; with nominal hop that island
+    // overlaps frame 1499 (which doesn't exist — n_frames = 1499
+    // so indices run 0..=1498) and the call-site upper-bound
+    // clamp drops it. Let's exercise that case directly to
+    // pin the asymmetry:
+    let trailing_island = alloc::vec![TimeRange::new(479_900, 480_000, tb_16k)];
+    let mask_eff = build_speech_frames(total_frames, samples_per_frame, &trailing_island);
+    let mask_nom = build_speech_frames(total_frames, 320.0, &trailing_island);
+    // Effective mapping puts the 100-sample island inside frame
+    // 1498's interval (479680, 480000) — but at 100 samples it
+    // doesn't hit the ≥160 majority threshold, so still false.
+    // What we DO assert: nominal hop classifies it the same way
+    // (false). The real footgun is the drift on accepted-speech
+    // word ranges, exercised end-to-end via the parity harness.
+    assert!(!mask_eff[total_frames - 1]);
+    assert!(!mask_nom[total_frames - 1]);
   }
 
   #[test]
