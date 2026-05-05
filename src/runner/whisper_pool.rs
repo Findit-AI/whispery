@@ -967,9 +967,7 @@ impl Drop for WhisperPool {
 /// `is_err()`, so every fast successful job tripped the post-
 /// watchdog check and got rewritten to `WorkerHangTimeout`. Only
 /// `RecvTimeoutError::Timeout` indicates an actual hang.
-fn watchdog_should_signal_timeout(
-  result: Result<(), crossbeam_channel::RecvTimeoutError>,
-) -> bool {
+fn watchdog_should_signal_timeout(result: Result<(), crossbeam_channel::RecvTimeoutError>) -> bool {
   matches!(result, Err(crossbeam_channel::RecvTimeoutError::Timeout))
 }
 
