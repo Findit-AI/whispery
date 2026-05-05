@@ -14,10 +14,18 @@ use smol_str::SmolStr;
 /// enum-known code. This keeps structural `PartialEq`/`Hash` correct:
 /// `Lang::En != Lang::Other("en")` is fine because no API path
 /// constructs `Lang::Other("en")`.
+///
+/// **Serde wire format.** Lowercase ISO-639-1 strings: `"en"`,
+/// `"yue"`, etc. (Codex round-34: a previous `derive(Serialize,
+/// Deserialize)` produced Rust variant names like `"En"` and
+/// `{"Other":"xx"}`, which contradicted documented config shapes
+/// and made human-edited configs brittle. The custom impls
+/// below canonicalise through [`Lang::from_iso639_1`] /
+/// [`Lang::as_str`] so the in-memory representation stays as-is
+/// while the wire format matches the docs.)
 #[non_exhaustive]
 #[allow(missing_docs)] // variants are ISO 639-1 codes; self-documenting by name
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Lang {
   En,
   Zh,
@@ -355,6 +363,61 @@ impl core::fmt::Display for Lang {
   }
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for Lang {
+  /// Serialize as the lowercase ISO-639-1 (or whisper-supplied)
+  /// string code. Matches what [`Lang::as_str`] returns —
+  /// `Lang::En` → `"en"`, `Lang::Other(SmolStr::new("xx"))` →
+  /// `"xx"`. Codex round-34: the previous `derive(Serialize)`
+  /// produced Rust variant names like `"En"` and
+  /// `{"Other":"xx"}`, contradicting the config docs.
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    serializer.serialize_str(self.as_str())
+  }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Lang {
+  /// Deserialize from the lowercase ISO-639-1 string code.
+  /// Routes through [`Lang::from_iso639_1`] so input matching a
+  /// named variant canonicalises to that variant rather than
+  /// landing in `Other` (preserving the type's canonicalisation
+  /// invariant). Unknown codes pass through `Lang::Other` after
+  /// shape validation: the input must be lowercase ASCII letters
+  /// of length 1..=8 (matching the alignment-stage validation in
+  /// `runner/whisper_pool.rs`'s `validate_language_code`). This
+  /// bounds the heap that `Other` could pin and keeps
+  /// `intern_lang_str` from leaking adversarial high-cardinality
+  /// strings into the language-string intern table.
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    use serde::de::Error as _;
+
+    let raw = <alloc::borrow::Cow<'_, str> as serde::Deserialize>::deserialize(deserializer)?;
+    let s: &str = &raw;
+    if s.is_empty() {
+      return Err(D::Error::custom("Lang code is empty"));
+    }
+    if s.len() > 8 {
+      return Err(D::Error::custom(alloc::format!(
+        "Lang code longer than 8 bytes ({} bytes); whisper.cpp codes are 2–3 ASCII letters",
+        s.len()
+      )));
+    }
+    if !s.bytes().all(|b| b.is_ascii_lowercase()) {
+      return Err(D::Error::custom(
+        "Lang code must be lowercase ASCII letters [a-z] only",
+      ));
+    }
+    Ok(Lang::from_iso639_1(s))
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -494,5 +557,103 @@ mod tests {
     let r = Lang::Other(SmolStr::new("xx"));
     assert_eq!(r.as_str(), "xx");
     assert_eq!(Lang::from_iso639_1(r.as_str()), r);
+  }
+
+  // --- Codex round-34: custom serde wire format ---
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_named_variant_serializes_as_lowercase_iso() {
+    let json = serde_json::to_string(&Lang::En).expect("serialize");
+    assert_eq!(json, "\"en\"", "Lang::En must serialize as \"en\", not \"En\"");
+    let json = serde_json::to_string(&Lang::Yue).expect("serialize");
+    assert_eq!(json, "\"yue\"");
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_other_serializes_as_inner_string() {
+    let v = Lang::Other(SmolStr::new("xx"));
+    let json = serde_json::to_string(&v).expect("serialize");
+    assert_eq!(json, "\"xx\"", "Lang::Other(\"xx\") must serialize as \"xx\"");
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_named_variant_round_trips() {
+    let json = "\"en\"";
+    let lang: Lang = serde_json::from_str(json).expect("deserialize");
+    assert_eq!(lang, Lang::En);
+    // Re-serialize and verify identical wire form.
+    assert_eq!(serde_json::to_string(&lang).unwrap(), json);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_unknown_iso_code_round_trips_via_other() {
+    let json = "\"xx\"";
+    let lang: Lang = serde_json::from_str(json).expect("deserialize");
+    assert_eq!(lang, Lang::Other(SmolStr::new("xx")));
+    assert_eq!(serde_json::to_string(&lang).unwrap(), json);
+  }
+
+  /// Canonicalisation invariant must hold across serde:
+  /// deserializing a code that matches a named variant lands in
+  /// the named variant, not in `Other`.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_deserializes_known_codes_to_named_variants() {
+    let lang: Lang = serde_json::from_str("\"en\"").unwrap();
+    assert!(matches!(lang, Lang::En), "must canonicalise to Lang::En");
+    let lang: Lang = serde_json::from_str("\"yue\"").unwrap();
+    assert!(matches!(lang, Lang::Yue));
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_rejects_uppercase() {
+    let res: Result<Lang, _> = serde_json::from_str("\"En\"");
+    assert!(res.is_err(), "uppercase must be rejected; got {res:?}");
+    let err = res.err().unwrap().to_string();
+    assert!(err.contains("lowercase ASCII"), "got {err:?}");
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_rejects_empty_string() {
+    let res: Result<Lang, _> = serde_json::from_str("\"\"");
+    assert!(res.is_err());
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_rejects_overlong_code() {
+    let res: Result<Lang, _> = serde_json::from_str("\"abcdefghi\"");
+    assert!(res.is_err(), "9-byte code must be rejected");
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_rejects_non_ascii_letters() {
+    let res: Result<Lang, _> = serde_json::from_str("\"français\"");
+    assert!(res.is_err(), "non-ASCII must be rejected");
+    let res: Result<Lang, _> = serde_json::from_str("\"a-b\"");
+    assert!(res.is_err(), "dash must be rejected");
+    let res: Result<Lang, _> = serde_json::from_str("\"a1b\"");
+    assert!(res.is_err(), "digits must be rejected");
+  }
+
+  /// Old derive-shaped JSON (`"En"` or `{"Other":"xx"}`) must
+  /// fail with the new custom impl. Documents the breaking
+  /// wire-format change for migrators.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_rejects_legacy_derive_format() {
+    // Old: Rust variant name with capitalised first letter.
+    let res: Result<Lang, _> = serde_json::from_str("\"En\"");
+    assert!(res.is_err(), "legacy variant-name encoding must be rejected");
+    // Old: Other was an externally-tagged map.
+    let res: Result<Lang, _> = serde_json::from_str(r#"{"Other":"xx"}"#);
+    assert!(res.is_err(), "legacy Other-as-map encoding must be rejected");
   }
 }

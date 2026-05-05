@@ -161,7 +161,12 @@ const fn default_dispatch_idle_poll() -> Duration {
 }
 
 impl WhisperPoolOptions {
-  /// Construct a config with all defaults except `model_path`.
+  /// Construct a CPU-flavored config with the given model path.
+  ///
+  /// Defaults: `worker_count = max(1, physical_cores/2)`,
+  /// `timeout_streak_threshold = 1`, `use_gpu = false`. For
+  /// GPU-flavored defaults (single worker, looser timeout streak),
+  /// use [`Self::new_for_gpu`] instead.
   pub fn new(model_path: impl Into<PathBuf>) -> Self {
     let worker_count = default_worker_count();
     Self {
@@ -177,10 +182,38 @@ impl WhisperPoolOptions {
     }
   }
 
+  /// Construct a GPU-flavored config with the given model path.
+  ///
+  /// Defaults: `worker_count = 1` (whisper.cpp serialises on a
+  /// single GPU regardless of concurrent `WhisperState`s, so
+  /// extra workers oversubscribe rather than parallelise),
+  /// `timeout_streak_threshold = 3` (GPU launches have higher
+  /// per-call variance), `use_gpu = true`.
+  ///
+  /// Codex round-34: previously `WhisperPoolOptions::new` tried
+  /// to detect the GPU backend via private cargo features that
+  /// were never wired into `Cargo.toml`, so GPU users silently
+  /// received CPU defaults (oversubscribing one GPU with multiple
+  /// workers). Make the GPU intent explicit at construction
+  /// instead of guessing from compile-time cfg.
+  pub fn new_for_gpu(model_path: impl Into<PathBuf>) -> Self {
+    let worker_count = gpu_worker_count();
+    Self {
+      worker_count,
+      model_path: model_path.into(),
+      use_gpu: true,
+      gpu_device: 0,
+      flash_attn: false,
+      max_queued_chunks: worker_count + 4,
+      block_on_full_queue: true,
+      dispatch_idle_poll: Duration::from_millis(10),
+      timeout_streak_threshold: gpu_timeout_streak_threshold(),
+    }
+  }
+
   /// Worker thread count. Default
-  /// `max(1, num_cpus::get_physical() / 2)` on CPU backends, `1`
-  /// on GPU backends (cuda / metal / vulkan / hipblas / coreml
-  /// active).
+  /// `max(1, num_cpus::get_physical() / 2)` from
+  /// [`Self::new`]; `1` from [`Self::new_for_gpu`].
   pub const fn worker_count(&self) -> usize {
     self.worker_count
   }
@@ -360,45 +393,45 @@ impl WhisperPoolOptions {
   }
 }
 
-/// Detect the active backend via Cargo features. CPU-only builds get
-/// half the physical cores (min 1); GPU builds default to 1 worker
-/// because whisper.cpp serialises on a single GPU regardless of
-/// concurrent `WhisperState`s.
+/// CPU-flavored default worker count: half the physical cores
+/// (min 1). Used by [`WhisperPoolOptions::new`] and serde defaults.
+///
+/// Codex round-34: an earlier `cfg!(any(feature = "_whisper_cuda", ...))`
+/// branch was dead — the listed feature names never existed in this
+/// crate's `Cargo.toml`, and consumer-side feature unification of
+/// `whisper-rs`'s `cuda` / `metal` / etc. doesn't propagate through
+/// `cfg!(feature = "...")` here. The result was that GPU users
+/// silently got CPU defaults: half their physical cores worth of
+/// `WhisperState`s contending for one GPU, increasing
+/// timeout/resource-failure risk. The dead branch is gone; GPU
+/// users should construct via [`WhisperPoolOptions::new_for_gpu`]
+/// (which picks the single-worker / longer-streak defaults
+/// appropriate for serialised GPU inference) or set
+/// `worker_count` / `timeout_streak_threshold` explicitly.
 fn default_worker_count() -> usize {
-  if is_gpu_backend_active() {
-    1
-  } else {
-    let physical = num_cpus::get_physical();
-    core::cmp::max(1, physical / 2)
-  }
+  let physical = num_cpus::get_physical();
+  core::cmp::max(1, physical / 2)
 }
 
-/// Default threshold: 1 on CPU, 3 on GPU.
+/// CPU-flavored timeout-streak threshold: a single timeout
+/// recycles the worker state. GPU inference is more variance-
+/// tolerant; [`WhisperPoolOptions::new_for_gpu`] picks `3`.
 const fn default_timeout_streak_threshold() -> u32 {
-  if is_gpu_backend_active_const() { 3 } else { 1 }
+  1
 }
 
-/// `cfg!(...)` form that the `default_worker_count` runtime helper uses.
-fn is_gpu_backend_active() -> bool {
-  cfg!(any(
-    feature = "_whisper_cuda",
-    feature = "_whisper_metal",
-    feature = "_whisper_vulkan",
-    feature = "_whisper_hipblas",
-    feature = "_whisper_coreml",
-  ))
+/// GPU-flavored worker count. whisper.cpp serialises on a single
+/// GPU regardless of concurrent `WhisperState`s, so multiple
+/// workers oversubscribe instead of parallelising.
+const fn gpu_worker_count() -> usize {
+  1
 }
 
-/// `const fn` mirror for the threshold default. Each `feature = ".."`
-/// branch is independently `cfg!`-able.
-const fn is_gpu_backend_active_const() -> bool {
-  cfg!(any(
-    feature = "_whisper_cuda",
-    feature = "_whisper_metal",
-    feature = "_whisper_vulkan",
-    feature = "_whisper_hipblas",
-    feature = "_whisper_coreml",
-  ))
+/// GPU-flavored timeout-streak threshold. GPU launches have higher
+/// per-call variance (kernel queueing, driver warmup); a single
+/// slow chunk shouldn't recycle the state.
+const fn gpu_timeout_streak_threshold() -> u32 {
+  3
 }
 
 /// One unit of ASR work shipped to a worker thread. Crate-private.
@@ -490,6 +523,25 @@ pub(super) fn full_params_from(
         "initial_prompt of len {} contains an interior NUL byte; whisper-rs's set_initial_prompt \
          would panic. Reject before FFI.",
         prompt.as_str().len()
+      ),
+    });
+  }
+
+  // Codex round-34: defense-in-depth on n_threads. Setters and
+  // serde already enforce `>= 1`, but `AsrParams` is `pub` and a
+  // future code path that constructs one through a non-validated
+  // route would push the violation into whisper.cpp's
+  // `std::vector<std::thread>(n_threads - 1)` allocator. Reject
+  // here too as a chunk-level WorkFailure rather than letting it
+  // become a worker abort.
+  if params.n_threads() < 1 {
+    return Err(WorkFailure::AsrFailed {
+      kind: AsrFailureKind::BackendError,
+      message: alloc::format!(
+        "n_threads must be >= 1 (got {}); whisper.cpp's std::vector<std::thread>({} - 1) \
+         would underflow / abort. Reject before FFI.",
+        params.n_threads(),
+        params.n_threads(),
       ),
     });
   }
@@ -1064,6 +1116,29 @@ mod tests {
     assert!(cfg.worker_count() >= 1);
     assert_eq!(cfg.max_queued_chunks(), cfg.worker_count() + 4);
     assert!(cfg.timeout_streak_threshold() >= 1);
+    assert_eq!(cfg.model_path(), Path::new("/tmp/model.bin"));
+  }
+
+  /// Codex round-34: `new_for_gpu` MUST pick GPU-flavored
+  /// defaults — single worker (whisper.cpp serialises on one
+  /// GPU), longer timeout-streak threshold (GPU variance),
+  /// `use_gpu = true`. Pre-fix the only path to GPU-flavored
+  /// defaults was a dead `cfg!(...)` check.
+  #[test]
+  fn new_for_gpu_picks_gpu_defaults() {
+    let cfg = WhisperPoolOptions::new_for_gpu("/tmp/model.bin");
+    assert!(cfg.use_gpu(), "new_for_gpu must enable use_gpu");
+    assert_eq!(
+      cfg.worker_count(),
+      1,
+      "GPU default is 1 worker (single-GPU serialisation)"
+    );
+    assert_eq!(
+      cfg.timeout_streak_threshold(),
+      3,
+      "GPU default tolerates 3 consecutive timeouts before recycling"
+    );
+    assert_eq!(cfg.max_queued_chunks(), 5); // worker_count + 4
     assert_eq!(cfg.model_path(), Path::new("/tmp/model.bin"));
   }
 

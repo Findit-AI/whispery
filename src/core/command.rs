@@ -71,7 +71,13 @@ pub struct AsrParams {
     serde(default, skip_serializing_if = "Option::is_none")
   )]
   initial_prompt: Option<SmolStr>,
-  #[cfg_attr(feature = "serde", serde(default = "default_n_threads"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default = "default_n_threads",
+      deserialize_with = "deserialize_positive_n_threads"
+    )
+  )]
   n_threads: i32,
 }
 
@@ -129,6 +135,27 @@ const fn default_suppress_blank() -> bool {
 #[cfg(feature = "serde")]
 const fn default_n_threads() -> i32 {
   1
+}
+/// Validate `n_threads >= 1` at the serde boundary. The setters
+/// already panic on `<= 0`, but a deserialized config bypasses
+/// them. Codex round-34: whisper.cpp's decoder loop allocates
+/// `std::vector<std::thread>(n_threads - 1)` when not exactly 1,
+/// so `n_threads = 0` underflows to a huge allocation request and
+/// `n_threads < 0` aborts. Surface the violation as a typed
+/// deserialize error.
+#[cfg(feature = "serde")]
+fn deserialize_positive_n_threads<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  use serde::de::Error as _;
+  let v = i32::deserialize(deserializer)?;
+  if v < 1 {
+    return Err(D::Error::custom(alloc::format!(
+      "n_threads must be >= 1 (got {v}); whisper.cpp would underflow / abort otherwise"
+    )));
+  }
+  Ok(v)
 }
 
 impl AsrParams {
@@ -304,7 +331,19 @@ impl AsrParams {
   }
 
   /// Set [`Self::n_threads`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value < 1`. whisper.cpp's decoder loops allocate
+  /// `std::vector<std::thread>(n_threads - 1)` when `n_threads`
+  /// isn't exactly `1`, so `0` underflows to a huge allocation
+  /// request and any negative value aborts inside the worker.
+  /// Codex round-34 flagged this as a high-severity FFI footgun.
   pub const fn set_n_threads(&mut self, value: i32) {
+    assert!(
+      value >= 1,
+      "n_threads must be >= 1; whisper.cpp would underflow / abort otherwise"
+    );
     self.n_threads = value;
   }
 
@@ -392,7 +431,15 @@ impl AsrParams {
   }
 
   /// Builder-style override for [`Self::n_threads`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `value < 1`. See [`Self::set_n_threads`].
   pub const fn with_n_threads(mut self, value: i32) -> Self {
+    assert!(
+      value >= 1,
+      "n_threads must be >= 1; whisper.cpp would underflow / abort otherwise"
+    );
     self.n_threads = value;
     self
   }
@@ -783,6 +830,46 @@ mod tests {
   #[should_panic(expected = "max_attempts must be > 0")]
   fn with_max_attempts_zero_panics() {
     let _ = AsrParams::default().with_max_attempts(0);
+  }
+
+  // Codex round-34: n_threads validation.
+
+  #[test]
+  #[should_panic(expected = "n_threads must be >= 1")]
+  fn set_n_threads_zero_panics() {
+    let mut p = AsrParams::default();
+    p.set_n_threads(0);
+  }
+
+  #[test]
+  #[should_panic(expected = "n_threads must be >= 1")]
+  fn set_n_threads_negative_panics() {
+    let mut p = AsrParams::default();
+    p.set_n_threads(-3);
+  }
+
+  #[test]
+  #[should_panic(expected = "n_threads must be >= 1")]
+  fn with_n_threads_zero_panics() {
+    let _ = AsrParams::default().with_n_threads(0);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn deserialize_rejects_zero_n_threads() {
+    let json = r#"{"n_threads": 0}"#;
+    let res: Result<AsrParams, _> = serde_json::from_str(json);
+    assert!(res.is_err(), "n_threads=0 must be rejected");
+    let err = res.err().unwrap().to_string();
+    assert!(err.contains("n_threads must be >= 1"), "got {err:?}");
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn deserialize_rejects_negative_n_threads() {
+    let json = r#"{"n_threads": -2}"#;
+    let res: Result<AsrParams, _> = serde_json::from_str(json);
+    assert!(res.is_err(), "n_threads=-2 must be rejected");
   }
 
   /// Codex round-33: deserialized config must fail loudly on
