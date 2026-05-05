@@ -34,24 +34,6 @@ impl JapaneseNormalizer {
   }
 }
 
-fn is_japanese_segmenting_char(c: char) -> bool {
-  let code = c as u32;
-  matches!(
-      code,
-      // Kanji
-      0x4E00..=0x9FFF
-          | 0x3400..=0x4DBF
-          | 0x20000..=0x2A6DF
-          | 0xF900..=0xFAFF
-          // Hiragana
-          | 0x3040..=0x309F
-          // Katakana
-          | 0x30A0..=0x30FF
-          // Half-width katakana
-          | 0xFF66..=0xFF9D
-  )
-}
-
 fn is_jp_punct(c: char) -> bool {
   matches!(
     c,
@@ -88,62 +70,35 @@ impl TextNormalizer for JapaneseNormalizer {
     let mut normalized = String::with_capacity(text.len());
     let mut original_words: Vec<Cow<'a, str>> = Vec::new();
 
-    let mut latin_run_start: Option<usize> = None;
-
-    let flush_latin_run =
-      |start: usize, end: usize, normalized: &mut String, words: &mut Vec<Cow<'a, str>>| {
-        let raw = &text[start..end];
-        let stripped = raw
-          .trim_start_matches(is_jp_punct)
-          .trim_end_matches(is_jp_punct);
-        if stripped.is_empty() {
-          return;
-        }
-        let lower = stripped.to_lowercase();
-        if !normalized.is_empty() {
-          normalized.push(' ');
-        }
-        normalized.push_str(&lower);
-        let original = &text[start..end];
-        words.push(Cow::Borrowed(original));
-      };
-
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-      let c = match text[i..].chars().next() {
-        Some(c) => c,
-        None => break,
-      };
-      let len = c.len_utf8();
-
-      if c.is_whitespace() {
-        if let Some(start) = latin_run_start.take() {
-          flush_latin_run(start, i, &mut normalized, &mut original_words);
-        }
-      } else if is_japanese_segmenting_char(c) {
-        if let Some(start) = latin_run_start.take() {
-          flush_latin_run(start, i, &mut normalized, &mut original_words);
-        }
-        if !normalized.is_empty() {
-          normalized.push(' ');
-        }
-        let glyph = &text[i..i + len];
-        normalized.push_str(glyph);
-        original_words.push(Cow::Borrowed(glyph));
-      } else if is_jp_punct(c) {
-        if let Some(start) = latin_run_start.take() {
-          flush_latin_run(start, i, &mut normalized, &mut original_words);
-        }
-      } else {
-        if latin_run_start.is_none() {
-          latin_run_start = Some(i);
-        }
+    // WhisperX-matching per-character iteration. Every non-skipped
+    // char (kanji, hiragana, katakana, Latin, digit, ...) becomes
+    // its own word; whitespace and JP/ASCII punctuation are
+    // dropped. Latin chars get lowercased before emit so they
+    // hit the wav2vec2-large-xlsr-53-japanese vocab the same way
+    // whisperX's `char_.lower()` lookup does.
+    //
+    // The `is_japanese_segmenting_char` helper is no longer
+    // used inside the loop — kept for the docstring's intent
+    // (kanji/hiragana/katakana are the *expected* chars from
+    // whisper-ASR transcripts of Japanese audio) but we don't
+    // gate on it: any non-skipped char becomes a word, matching
+    // whisperX exactly.
+    for c in text.chars() {
+      if c.is_whitespace() || is_jp_punct(c) {
+        continue;
       }
-      i += len;
-    }
-    if let Some(start) = latin_run_start.take() {
-      flush_latin_run(start, bytes.len(), &mut normalized, &mut original_words);
+      let lowered: String = c.to_lowercase().collect();
+      if !normalized.is_empty() {
+        normalized.push(' ');
+      }
+      normalized.push_str(&lowered);
+      if c.is_ascii_alphabetic() {
+        original_words.push(Cow::Owned(lowered));
+      } else {
+        let mut buf = [0u8; 4];
+        let s: &str = c.encode_utf8(&mut buf);
+        original_words.push(Cow::Owned(String::from(s)));
+      }
     }
 
     if original_words.is_empty() {
@@ -188,11 +143,18 @@ mod tests {
   }
 
   #[test]
-  fn latin_run_stays_as_token() {
+  fn latin_chars_segment_per_character() {
     let n = JapaneseNormalizer::new();
     let nt = n.normalize("USA で勉強").unwrap();
-    // USA -> "usa" (lowercased latin run); で 勉 強 segment
-    assert_eq!(nt.normalized(), "usa で 勉 強");
+    // Per-character (matches whisperX's LANGUAGES_WITHOUT_SPACES
+    // for `ja`): each Latin letter is its own word, lowercased.
+    // で 勉 強 segment as before.
+    assert_eq!(nt.normalized(), "u s a で 勉 強");
+    assert_eq!(nt.original_words().len(), 6);
+    assert_eq!(nt.original_words()[0], "u");
+    assert_eq!(nt.original_words()[1], "s");
+    assert_eq!(nt.original_words()[2], "a");
+    assert_eq!(nt.original_words()[3], "で");
   }
 
   #[test]

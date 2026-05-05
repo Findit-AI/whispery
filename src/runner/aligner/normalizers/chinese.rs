@@ -1,29 +1,37 @@
-//! Chinese text normaliser (character-level).
+//! Chinese text normaliser (character-level, WhisperX-compatible).
 
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use crate::runner::aligner::normalizer::{NormalizationError, NormalizedText, TextNormalizer};
 
-/// Chinese normaliser: per-character segmentation + strip CJK
-/// + ASCII punctuation.
+/// Chinese normaliser: every character becomes its own word.
 ///
-/// **Why character-level?** Chinese (and Japanese kanji) have no
-/// inter-word whitespace; the wav2vec2 ZH model in v1 is trained
-/// on character-level CTC over Han glyphs, so each normalised
-/// "word" is one glyph. Latin-letter runs inside Chinese text
-/// (e.g., loanwords `"USA"` or punctuation `"www"`) are kept as
-/// whitespace-separated tokens; the v1 contract is "Han chars
-/// segment one-by-one, ASCII runs segment whitespace-style".
+/// **Per-character segmentation, including Latin.** Mirrors
+/// WhisperX's `LANGUAGES_WITHOUT_SPACES` contract for `zh`:
+/// `whisperx/alignment.py` iterates the source text character
+/// by character and treats EACH char as its own alignment
+/// unit (`word_idx += 1` after every char), regardless of
+/// script. So a Latin loanword `"Python"` in Chinese text
+/// emits 6 separate alignment entries (`p`, `y`, `t`, `h`, `o`,
+/// `n`) — same as whisperX. This guarantees per-word IoU
+/// parity in the testaudioset suite when both runners share
+/// the same wav2vec2 ZH ONNX.
 ///
-/// **Punctuation:** strips both ASCII punctuation (`. , ! ? …`)
-/// and the corresponding CJK full-width forms (`。 ， ！ ？ …`).
-/// Han glyphs themselves are never stripped.
+/// **Lowercase ASCII letters** before emitting, because the
+/// jonatasgrosman ZH vocab is uppercase-only (whisperX does
+/// `char_.lower()` then dictionary lookup; the lowercase form
+/// is what ends up in tokens).
 ///
-/// **Surface form preservation:** like the English normaliser,
-/// `original_words` carries each emitted glyph as-is so step 9
-/// of the alignment algorithm emits the original Han character
-/// (no normalisation). This is important for indexing pipelines
-/// that keep Traditional vs. Simplified glyphs distinct.
+/// **Skip:** whitespace, ASCII punctuation, and CJK full-width
+/// punctuation (`。 ， ！ ？ …`). Han glyphs themselves are
+/// never stripped.
+///
+/// **Surface preservation:** `original_words` carries each
+/// emitted character as-is (Han kept verbatim, Latin
+/// lowercased) so step 9 of the alignment algorithm emits the
+/// expected glyph. Pipelines that need traditional-vs-simplified
+/// fidelity for Han chars get it; Latin mid-Chinese loses
+/// case info (matches whisperX).
 #[derive(Default, Clone, Copy, Debug)]
 pub struct ChineseNormalizer;
 
@@ -66,22 +74,9 @@ fn is_punct_either(c: char) -> bool {
   is_cjk_punct(c) || is_ascii_punct(c)
 }
 
-fn is_han(c: char) -> bool {
-  matches!(
-      c as u32,
-      0x4E00..=0x9FFF // CJK Unified Ideographs
-          | 0x3400..=0x4DBF // Extension A
-          | 0x20000..=0x2A6DF // Extension B
-          | 0x2A700..=0x2B73F // Extension C
-          | 0x2B740..=0x2B81F // Extension D
-          | 0x2B820..=0x2CEAF // Extension E
-          | 0xF900..=0xFAFF // Compatibility Ideographs
-  )
-}
-
 impl TextNormalizer for ChineseNormalizer {
   /// Chinese is character-segmented: the whitespace this normaliser
-  /// emits between every Han glyph is purely an indexing device,
+  /// emits between every glyph is purely an indexing device,
   /// not a real word boundary. Returning `false` here keeps the
   /// tokeniser from forcing `|` between every glyph in the CTC
   /// alignment graph.
@@ -93,67 +88,41 @@ impl TextNormalizer for ChineseNormalizer {
     let mut normalized = String::with_capacity(text.len());
     let mut original_words: Vec<Cow<'a, str>> = Vec::new();
 
-    // We walk char-by-char through the input. Han glyphs each
-    // become one normalised word; Latin-letter runs accumulate
-    // until whitespace breaks them.
-    let bytes = text.as_bytes();
-    let mut latin_run_start: Option<usize> = None;
-
-    let flush_latin_run =
-      |start: usize, end: usize, normalized: &mut String, words: &mut Vec<Cow<'a, str>>| {
-        let raw = &text[start..end];
-        let stripped = raw
-          .trim_start_matches(is_punct_either)
-          .trim_end_matches(is_punct_either);
-        if stripped.is_empty() {
-          return;
-        }
-        let lower = stripped.to_lowercase();
-        if !normalized.is_empty() {
-          normalized.push(' ');
-        }
-        normalized.push_str(&lower);
-        let original = &text[start..end];
-        words.push(Cow::Borrowed(original));
-      };
-
-    let mut i = 0;
-    while i < bytes.len() {
-      let c = match text[i..].chars().next() {
-        Some(c) => c,
-        None => break,
-      };
-      let len = c.len_utf8();
-
-      if c.is_whitespace() {
-        if let Some(start) = latin_run_start.take() {
-          flush_latin_run(start, i, &mut normalized, &mut original_words);
-        }
-      } else if is_han(c) {
-        if let Some(start) = latin_run_start.take() {
-          flush_latin_run(start, i, &mut normalized, &mut original_words);
-        }
-        if !normalized.is_empty() {
-          normalized.push(' ');
-        }
-        let glyph = &text[i..i + len];
-        normalized.push_str(glyph);
-        original_words.push(Cow::Borrowed(glyph));
-      } else if is_punct_either(c) {
-        if let Some(start) = latin_run_start.take() {
-          flush_latin_run(start, i, &mut normalized, &mut original_words);
-        }
-        // Drop the punctuation character entirely.
-      } else {
-        // Latin letter, digit, etc. — accumulate.
-        if latin_run_start.is_none() {
-          latin_run_start = Some(i);
-        }
+    // WhisperX-matching per-character iteration. Every non-skipped
+    // char becomes its own word; Latin letters get lowercased on
+    // both the surface (`original_words`) and the normalised
+    // string before emit. See type-level doc.
+    for c in text.chars() {
+      if c.is_whitespace() || is_punct_either(c) {
+        continue;
       }
-      i += len;
-    }
-    if let Some(start) = latin_run_start.take() {
-      flush_latin_run(start, bytes.len(), &mut normalized, &mut original_words);
+      // Lowercase Latin (matches whisperX's `char.lower()`).
+      // Han glyphs and other non-Latin chars lowercase to
+      // themselves under Unicode `to_lowercase`, so this is a
+      // no-op for them and we don't special-case the script.
+      // The `to_lowercase()` iterator can yield multiple
+      // codepoints for a single input char (e.g. ß → ss); for
+      // the wav2vec2 ZH vocab those expansions don't occur in
+      // practice (Han + ASCII letters + digits), so we collect
+      // them all into one alignment word — preserving the
+      // 1-input-char ↔ 1-output-word contract.
+      let lowered: String = c.to_lowercase().collect();
+      if !normalized.is_empty() {
+        normalized.push(' ');
+      }
+      normalized.push_str(&lowered);
+      // For the surface form: ASCII letters use the lowered
+      // string (matches whisperX, vocab is upper-only and we
+      // lowered for the lookup); other chars use the raw glyph
+      // so traditional-vs-simplified Han stays intact.
+      if c.is_ascii_alphabetic() {
+        original_words.push(Cow::Owned(lowered));
+      } else {
+        let mut buf = [0u8; 4];
+        let s: &str = c.encode_utf8(&mut buf);
+        let owned = String::from(s);
+        original_words.push(Cow::Owned(owned));
+      }
     }
 
     if original_words.is_empty() {
@@ -189,9 +158,15 @@ mod tests {
   fn mixed_chinese_and_latin() {
     let n = ChineseNormalizer::new();
     let nt = n.normalize("我用 Python 写代码").unwrap();
-    // Han chars segment per-glyph; "Python" stays as one
-    // whitespace-bracketed token (lowercased).
-    assert_eq!(nt.normalized(), "我 用 python 写 代 码");
+    // Per-character: each Han glyph AND each Latin letter is
+    // its own word. "Python" → 6 separate words p y t h o n.
+    // Whitespace is dropped. Matches whisperX's
+    // LANGUAGES_WITHOUT_SPACES contract for `zh`.
+    assert_eq!(nt.normalized(), "我 用 p y t h o n 写 代 码");
+    assert_eq!(nt.original_words().len(), 11);
+    assert_eq!(nt.original_words()[2], "p");
+    assert_eq!(nt.original_words()[7], "n");
+    assert_eq!(nt.original_words()[10], "码");
   }
 
   #[test]
