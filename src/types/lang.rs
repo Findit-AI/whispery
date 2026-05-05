@@ -583,7 +583,10 @@ mod tests {
   #[test]
   fn serde_named_variant_serializes_as_lowercase_iso() {
     let json = serde_json::to_string(&Lang::En).expect("serialize");
-    assert_eq!(json, "\"en\"", "Lang::En must serialize as \"en\", not \"En\"");
+    assert_eq!(
+      json, "\"en\"",
+      "Lang::En must serialize as \"en\", not \"En\""
+    );
     let json = serde_json::to_string(&Lang::Yue).expect("serialize");
     assert_eq!(json, "\"yue\"");
   }
@@ -593,7 +596,10 @@ mod tests {
   fn serde_other_serializes_as_inner_string() {
     let v = Lang::Other(SmolStr::new("xx"));
     let json = serde_json::to_string(&v).expect("serialize");
-    assert_eq!(json, "\"xx\"", "Lang::Other(\"xx\") must serialize as \"xx\"");
+    assert_eq!(
+      json, "\"xx\"",
+      "Lang::Other(\"xx\") must serialize as \"xx\""
+    );
   }
 
   #[cfg(feature = "serde")]
@@ -637,7 +643,11 @@ mod tests {
   fn serde_accepts_any_case_for_named_variant() {
     for input in ["\"en\"", "\"EN\"", "\"En\"", "\"eN\""] {
       let lang: Lang = serde_json::from_str(input).expect(input);
-      assert_eq!(lang, Lang::En, "input {input} must canonicalise to Lang::En");
+      assert_eq!(
+        lang,
+        Lang::En,
+        "input {input} must canonicalise to Lang::En"
+      );
       // Re-serialisation always emits the lowercase form.
       assert_eq!(serde_json::to_string(&lang).unwrap(), "\"en\"");
     }
@@ -696,6 +706,9 @@ mod tests {
   #[test]
   fn serde_rejects_legacy_other_as_map() {
     let res: Result<Lang, _> = serde_json::from_str(r#"{"Other":"xx"}"#);
-    assert!(res.is_err(), "legacy Other-as-map encoding must be rejected");
+    assert!(
+      res.is_err(),
+      "legacy Other-as-map encoding must be rejected"
+    );
   }
 }
