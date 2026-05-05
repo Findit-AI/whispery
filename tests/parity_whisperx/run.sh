@@ -33,8 +33,16 @@ fi
 ARG="$1"
 if [ -d "$ARG" ]; then
   CLIP="$ARG/clip_16k.wav"
+  # Fixture-dir convention: parent dir name IS the fixture name
+  # (matches the dia/.../NN_xxx layout).
+  FIXTURE_NAME="$(basename "$ARG")"
 elif [ -f "$ARG" ]; then
   CLIP="$ARG"
+  # WAV-path mode: use the file's stem so multiple WAVs sharing
+  # a parent directory don't collide on the output JSON paths
+  # (the previous "basename of dirname" derivation gave every
+  # WAV in the same dir a single shared FIXTURE_NAME).
+  FIXTURE_NAME="$(basename "$ARG" .wav)"
 else
   echo "[run.sh] $ARG is neither a directory nor a WAV file" >&2
   exit 65
@@ -46,12 +54,6 @@ if [ ! -f "$CLIP" ]; then
 fi
 
 ABS_CLIP="$(cd "$(dirname "$CLIP")" && pwd)/$(basename "$CLIP")"
-FIXTURE_NAME="$(basename "$(dirname "$ABS_CLIP")")"
-# Fall back to the bare filename stem when the WAV isn't inside a
-# named fixture directory (e.g. user passed a one-off path).
-if [ "$FIXTURE_NAME" = "" ] || [ "$FIXTURE_NAME" = "/" ]; then
-  FIXTURE_NAME="$(basename "$ABS_CLIP" .wav)"
-fi
 
 OUT_DIR="$SCRIPT_DIR/out"
 mkdir -p "$OUT_DIR"
