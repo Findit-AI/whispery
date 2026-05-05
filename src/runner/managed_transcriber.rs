@@ -689,9 +689,7 @@ impl ManagedTranscriber {
     // timebase, ordering, and high-water against a projection
     // of the buffer's high water AFTER the upcoming push, so
     // either everything commits or nothing does.
-    let precheck = self
-      .core
-      .precheck_vad_segments(vad_segments, samples.len());
+    let precheck = self.core.precheck_vad_segments(vad_segments, samples.len());
     if let Err(e) = precheck {
       // Roll back the override stamp; nothing else mutated.
       self.core.set_runtime_override(None);

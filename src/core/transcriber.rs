@@ -688,8 +688,7 @@ impl Transcriber {
     }
 
     // Floor projection: assume zero gap-fill. See type doc.
-    let projected_high_water =
-      self.buffer.absolute_sample_offset() + samples_to_be_pushed as u64;
+    let projected_high_water = self.buffer.absolute_sample_offset() + samples_to_be_pushed as u64;
     let mut running_watermark = self.vad_watermark;
 
     for seg in vad_segments {
@@ -1894,7 +1893,10 @@ mod tests {
     // about-to-push.
     let segs = [VadSegment::new(0, 5_000)];
     match t.precheck_vad_segments(&segs, 0) {
-      Err(TranscriberError::VadAheadOfAudio { vad_end: 5_000, buffered: 1_000 }) => {}
+      Err(TranscriberError::VadAheadOfAudio {
+        vad_end: 5_000,
+        buffered: 1_000,
+      }) => {}
       other => panic!("expected VadAheadOfAudio; got {other:?}"),
     }
   }
@@ -1909,7 +1911,10 @@ mod tests {
       VadSegment::new(1_000, 1_500), // start < running watermark (3_000)
     ];
     match t.precheck_vad_segments(&segs, 0) {
-      Err(TranscriberError::PtsRegression { kind: crate::types::PushKind::VadSegment, .. }) => {}
+      Err(TranscriberError::PtsRegression {
+        kind: crate::types::PushKind::VadSegment,
+        ..
+      }) => {}
       other => panic!("expected PtsRegression; got {other:?}"),
     }
   }
@@ -1931,7 +1936,10 @@ mod tests {
     let r2 = t.precheck_vad_segments(&segs2, 1_000);
     assert!(matches!(
       r2,
-      Err(TranscriberError::VadAheadOfAudio { buffered: 1_000, .. })
+      Err(TranscriberError::VadAheadOfAudio {
+        buffered: 1_000,
+        ..
+      })
     ));
   }
 
