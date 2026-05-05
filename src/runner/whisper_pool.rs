@@ -839,7 +839,9 @@ pub(super) fn run_with_temperature_ladder(
     if nsp > p.no_speech_threshold() && !logprob_ok {
       return Ok(AsrResult::new(
         SmolStr::new(""),
-        p.language_hint().cloned().unwrap_or(Lang::Other(SmolStr::new(""))),
+        p.language_hint()
+          .cloned()
+          .unwrap_or(Lang::Other(SmolStr::new(""))),
         logprob,
         nsp,
         temperature,
