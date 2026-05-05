@@ -982,18 +982,14 @@ mod tests {
       serde_json::from_str(r#"{"language_hint": null}"#).expect("deserialize null");
     match ovr.language_hint() {
       Some(None) => {}
-      other => panic!(
-        "JSON null on language_hint must produce Some(None) (clear); got {other:?}"
-      ),
+      other => panic!("JSON null on language_hint must produce Some(None) (clear); got {other:?}"),
     }
 
     let ovr: AsrParamsOverride =
       serde_json::from_str(r#"{"initial_prompt": null}"#).expect("deserialize null");
     match ovr.initial_prompt() {
       Some(None) => {}
-      other => panic!(
-        "JSON null on initial_prompt must produce Some(None) (clear); got {other:?}"
-      ),
+      other => panic!("JSON null on initial_prompt must produce Some(None) (clear); got {other:?}"),
     }
   }
 
@@ -1010,8 +1006,8 @@ mod tests {
       other => panic!("expected Some(Some(Lang::En)); got {other:?}"),
     }
 
-    let ovr: AsrParamsOverride = serde_json::from_str(r#"{"initial_prompt": "hint"}"#)
-      .expect("deserialize value");
+    let ovr: AsrParamsOverride =
+      serde_json::from_str(r#"{"initial_prompt": "hint"}"#).expect("deserialize value");
     match ovr.initial_prompt() {
       Some(Some(s)) if s.as_str() == "hint" => {}
       other => panic!("expected Some(Some(\"hint\")); got {other:?}"),
@@ -1056,7 +1052,8 @@ mod tests {
     assert!(matches!(back.language_hint(), Some(Some(Lang::En))));
     assert!(
       matches!(back.initial_prompt(), Some(Some(s)) if s.as_str() == "hint"),
-      "got {:?}", back.initial_prompt()
+      "got {:?}",
+      back.initial_prompt()
     );
   }
 

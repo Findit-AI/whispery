@@ -556,10 +556,7 @@ mod tests {
     // gap-tolerance but no audio carried.
     let heartbeat_pts = next_expected.pts() + 100; // ~33 ms forward in 48k
     let r = b.append(ts_at_48k(heartbeat_pts), &[], 0);
-    assert!(
-      r.is_ok(),
-      "empty heartbeat must succeed; got {r:?}"
-    );
+    assert!(r.is_ok(), "empty heartbeat must succeed; got {r:?}");
 
     // Critical: the heartbeat MUST NOT have advanced state.
     assert_eq!(
@@ -618,7 +615,10 @@ mod tests {
 
     // Real packet at the originally-expected PTS succeeds.
     let r = b.append(next_expected, &[1.0; 500], 0);
-    assert!(r.is_ok(), "real packet at expected PTS must succeed; got {r:?}");
+    assert!(
+      r.is_ok(),
+      "real packet at expected PTS must succeed; got {r:?}"
+    );
     assert_eq!(b.absolute_sample_offset(), 500);
   }
 
