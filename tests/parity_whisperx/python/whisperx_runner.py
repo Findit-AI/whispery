@@ -63,7 +63,23 @@ def main() -> int:
     parser.add_argument(
         "--whisper-model",
         default="tiny.en",
-        help="faster-whisper model name (default: tiny.en).",
+        help=(
+            "faster-whisper model name (default: tiny.en). For non-English "
+            "audio, pass a multilingual model (e.g. 'tiny', 'small') and "
+            "set --language to auto so detection picks the right alignment "
+            "model from whisperx's DEFAULT_ALIGN_MODELS_HF."
+        ),
+    )
+    parser.add_argument(
+        "--language",
+        default="en",
+        help=(
+            "ISO 639-1 language code for ASR + alignment, or 'auto' to "
+            "let whisperx detect. Default 'en' matches the legacy parity "
+            "behaviour. 'auto' enables full multilingual mode (uses "
+            "whisperx's DEFAULT_ALIGN_MODELS_HF dict for the detected "
+            "language)."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -120,13 +136,14 @@ def main() -> int:
     # wrapper; the call signature is stable across 3.4.x. The
     # returned `result` is a dict-of-lists with `segments`, each
     # carrying tokenwise text + coarse word ranges.
-    asr_model = whisperx.load_model(
-        args.whisper_model,
-        device=args.device,
-        compute_type=args.compute_type,
-        # English-locked; matches the whispery runner's
-        # `LanguagePolicy::Lock { hint: Lang::En }`.
-        language="en",
+    #
+    # Language: when `--language=auto`, drop the locked-language
+    # kwarg and let whisperx detect from the audio's first 30 s.
+    # Otherwise lock to the given code (matches whispery's
+    # `LanguagePolicy::Lock { hint: Lang::<L> }`).
+    load_model_kwargs = {
+        "device": args.device,
+        "compute_type": args.compute_type,
         # Use silero VAD instead of the default pyannote VAD: the
         # pyannote VAD checkpoint on HuggingFace pickles
         # `omegaconf.ListConfig`, which torch >= 2.6 refuses to
@@ -135,8 +152,12 @@ def main() -> int:
         # format that loads cleanly under the same default.
         # Alignment is run over the whole audio anyway so VAD
         # choice has no effect on the per-word timing comparison.
-        vad_method="silero",
-    )
+        "vad_method": "silero",
+    }
+    if args.language != "auto":
+        load_model_kwargs["language"] = args.language
+
+    asr_model = whisperx.load_model(args.whisper_model, **load_model_kwargs)
     audio = whisperx.load_audio(str(wav_path))
 
     # SHA-256 over the actual float32 buffer the model consumes.
@@ -148,11 +169,23 @@ def main() -> int:
     result = asr_model.transcribe(audio, batch_size=args.batch_size)
     t_asr = time.monotonic()
 
-    # 2) wav2vec2 forced alignment. Same model family that whispery
-    # loads via ONNX (`facebook/wav2vec2-base-960h`); WhisperX picks
-    # it automatically for `language_code="en"`.
+    # The detected (or forced) language is on `result["language"]`
+    # after `transcribe()` — even when `--language` was passed,
+    # whisperx writes back the same code so we always have an
+    # authoritative source for downstream alignment-model lookup.
+    detected_language = result.get("language", args.language if args.language != "auto" else "en")
+    print(
+        f"[whisperx-parity] detected_language={detected_language}",
+        file=sys.stderr,
+    )
+
+    # 2) wav2vec2 forced alignment. Whisperx's
+    # `DEFAULT_ALIGN_MODELS_TORCH` / `_HF` dict picks the matching
+    # ONNX-or-Torch wav2vec2 by language code (e.g. `en` →
+    # `facebook/wav2vec2-base-960h`, `zh` →
+    # `jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn`).
     align_model, align_metadata = whisperx.load_align_model(
-        language_code="en",
+        language_code=detected_language,
         device=args.device,
     )
     aligned = whisperx.align(
@@ -252,6 +285,11 @@ def main() -> int:
         "clip_path": str(wav_path),
         "clip_sha256": clip_sha256,
         "duration_s": duration_s,
+        # The language whisperx used for ASR + alignment. The
+        # parity runner reads this to dispatch to the matching
+        # wav2vec2 ONNX (En/Ja/Zh today; whisperx's full
+        # DEFAULT_ALIGN_MODELS_HF set with future fixture rolls).
+        "language": detected_language,
         "transcript_count": len(aligned["segments"]),
         "segments": out_segments,
         "raw_asr_segments": raw_asr_segments,

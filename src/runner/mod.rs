@@ -24,5 +24,5 @@ pub use aligner::{
   Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
   ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE, DynTextNormalizer,
   EnglishNormalizer, JapaneseNormalizer, NormalizationError, NormalizedText, TextNormalizer,
-  bundled,
+  bundled, default_normalizer_for,
 };

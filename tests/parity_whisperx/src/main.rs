@@ -644,35 +644,102 @@ fn all_words_len(payload: &serde_json::Value) -> usize {
 /// Output schema is identical to the non-inject path so `score.py`
 /// is mode-agnostic.
 fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
-  let w2v_model = resolve_model(
-    args.w2v_model,
-    "WAV2VEC2_ONNX_PATH",
-    "wav2vec2-base-960h.onnx",
-  )?;
-  let w2v_tokenizer = resolve_model(
-    args.w2v_tokenizer,
-    "WAV2VEC2_TOKENIZER_PATH",
-    "wav2vec2-base-960h-tokenizer.json",
-  )?;
-
-  eprintln!(
-    "[whispery-parity:inject] inject_from={} w2v={} tok={}",
-    inject_path.display(),
-    w2v_model.display(),
-    w2v_tokenizer.display()
-  );
-
-  // Load the WhisperX JSON. We need `segments[]` (with `start_s`,
-  // `end_s`, `text`, and per-segment `words[]`) for the per-segment
-  // alignment flow; if it's missing, fall back to a synthesised
-  // single segment over the entire `words[]` for back-compat with
-  // older WhisperX outputs.
+  // Load the WhisperX JSON FIRST so we can read the top-level
+  // `language` field and pick the matching wav2vec2 ONNX. Falling
+  // back to "en" preserves the legacy behaviour (whisperx_runner.py
+  // outputs without a `language` field, or with `language: en`).
   let injected: serde_json::Value = {
     let bytes = fs::read(&inject_path)
       .with_context(|| format!("read whisperX JSON {}", inject_path.display()))?;
     serde_json::from_slice(&bytes)
       .with_context(|| format!("parse whisperX JSON {}", inject_path.display()))?
   };
+  let language_code = injected
+    .get("language")
+    .and_then(|v| v.as_str())
+    .unwrap_or("en")
+    .to_lowercase();
+  let lang = whispery::Lang::from_iso639_1(&language_code);
+
+  // Pick the aligner fixture for the detected language. The
+  // English path stays where it always was; Ja/Zh use the
+  // FinDIT-Studio-mirrored fixtures (build.rs writes
+  // WHISPERY_W2V_{JA,ZH}_{MODEL,TOKENIZER} when
+  // `WHISPERY_FETCH_W2V=1`). Future languages just add a match
+  // arm + the corresponding option_env! pair.
+  let (w2v_model, w2v_tokenizer) = match lang {
+    whispery::Lang::Ja => {
+      let model = option_env!("WHISPERY_W2V_JA_MODEL")
+        .map(PathBuf::from)
+        .or_else(|| {
+          models_dir()
+            .map(|d| d.join("jonatasgrosman--wav2vec2-large-xlsr-53-japanese.onnx"))
+        })
+        .ok_or_else(|| anyhow::anyhow!(
+          "no Japanese wav2vec2 fixture; run `WHISPERY_FETCH_MODEL=1 WHISPERY_FETCH_W2V=1 \
+           cargo build --features alignment` to fetch from FinDIT-Studio"
+        ))?;
+      let tok = option_env!("WHISPERY_W2V_JA_TOKENIZER")
+        .map(PathBuf::from)
+        .or_else(|| {
+          models_dir().map(|d| {
+            d.join("jonatasgrosman--wav2vec2-large-xlsr-53-japanese-tokenizer.json")
+          })
+        })
+        .ok_or_else(|| anyhow::anyhow!("no Japanese tokenizer fixture"))?;
+      (model, tok)
+    }
+    whispery::Lang::Zh | whispery::Lang::Yue => {
+      let model = option_env!("WHISPERY_W2V_ZH_MODEL")
+        .map(PathBuf::from)
+        .or_else(|| {
+          models_dir().map(|d| {
+            d.join("jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn.onnx")
+          })
+        })
+        .ok_or_else(|| anyhow::anyhow!(
+          "no Chinese wav2vec2 fixture; run `WHISPERY_FETCH_MODEL=1 WHISPERY_FETCH_W2V=1 \
+           cargo build --features alignment` to fetch from FinDIT-Studio"
+        ))?;
+      let tok = option_env!("WHISPERY_W2V_ZH_TOKENIZER")
+        .map(PathBuf::from)
+        .or_else(|| {
+          models_dir().map(|d| {
+            d.join(
+              "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn-tokenizer.json",
+            )
+          })
+        })
+        .ok_or_else(|| anyhow::anyhow!("no Chinese tokenizer fixture"))?;
+      (model, tok)
+    }
+    _ => {
+      // Fall through to English / CLI-supplied paths for any
+      // language we don't have a multi-lang fixture for. Behaves
+      // exactly like pre-multilingual parity-runner: the user can
+      // still pass --w2v-model + --w2v-tokenizer for an arbitrary
+      // language fixture.
+      let model = resolve_model(
+        args.w2v_model,
+        "WAV2VEC2_ONNX_PATH",
+        "wav2vec2-base-960h.onnx",
+      )?;
+      let tok = resolve_model(
+        args.w2v_tokenizer,
+        "WAV2VEC2_TOKENIZER_PATH",
+        "wav2vec2-base-960h-tokenizer.json",
+      )?;
+      (model, tok)
+    }
+  };
+
+  eprintln!(
+    "[whispery-parity:inject] inject_from={} language={} w2v={} tok={}",
+    inject_path.display(),
+    lang.as_str(),
+    w2v_model.display(),
+    w2v_tokenizer.display()
+  );
   let injected_words_total = injected
     .get("words")
     .and_then(|v| v.as_array())
@@ -834,14 +901,22 @@ fn run_inject_mode(args: Args, inject_path: PathBuf) -> Result<()> {
   );
 
   // Build the aligner directly — no Transcriber, no
-  // ManagedTranscriber, no whisper.cpp.
-  let mut aligner = Aligner::from_paths(
-    Lang::En,
-    &w2v_model,
-    &w2v_tokenizer,
-    Box::new(EnglishNormalizer::new()),
-  )
-  .context("build wav2vec2 Aligner")?;
+  // ManagedTranscriber, no whisper.cpp. The normalizer is picked
+  // by language via `default_normalizer_for(lang)`; for languages
+  // whispery doesn't yet ship a built-in normalizer for (Arabic,
+  // Korean, etc.) we fall back to EnglishNormalizer with a
+  // diagnostic log.
+  let normalizer = whispery::default_normalizer_for(&lang).unwrap_or_else(|| {
+    eprintln!(
+      "[whispery-parity:inject] no built-in normalizer for {:?}; \
+       falling back to EnglishNormalizer (parity numbers will be \
+       meaningless on non-Latin scripts)",
+      lang
+    );
+    Box::new(EnglishNormalizer::new())
+  });
+  let mut aligner = Aligner::from_paths(lang.clone(), &w2v_model, &w2v_tokenizer, normalizer)
+    .context("build wav2vec2 Aligner")?;
 
   // VAD-style sub-segments are computed per-segment below (each
   // covers its own slice in chunk-local 16 kHz coordinates).

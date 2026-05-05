@@ -87,7 +87,25 @@ uv pip install -e . > /dev/null
 # parity. The non-inject path in main.rs is kept intact for that day.
 cd "$SCRIPT_DIR/python"
 echo "[run.sh] running whisperx_runner.py ..."
-uv run python whisperx_runner.py "$ABS_CLIP" --out "$WHISPERX_OUT"
+# Multilingual mode: pass `WHISPERY_PARITY_LANGUAGE=auto` (or any
+# specific code: ja/zh/...) to enable language detection and
+# load whisperx's matching wav2vec2 ONNX. Default keeps the
+# legacy English-locked behaviour for the dia 5-fixture suite
+# whose tiny.en model can only ASR English.
+WHISPERX_LANG="${WHISPERY_PARITY_LANGUAGE:-en}"
+WHISPERX_MODEL="${WHISPERY_PARITY_WHISPER_MODEL:-tiny.en}"
+# tiny.en is English-only by design; the .en checkpoints don't
+# carry the multilingual decoder. Auto/non-en runs need a
+# multilingual base model — bump to `tiny` (or larger) when
+# the user requests anything other than `en`.
+if [ "$WHISPERX_LANG" != "en" ] && [ "$WHISPERX_MODEL" = "tiny.en" ]; then
+  WHISPERX_MODEL="tiny"
+  echo "[run.sh] non-English language ($WHISPERX_LANG); auto-bumped whisper model to '$WHISPERX_MODEL' (tiny.en is English-only)"
+fi
+uv run python whisperx_runner.py "$ABS_CLIP" \
+  --whisper-model "$WHISPERX_MODEL" \
+  --language "$WHISPERX_LANG" \
+  --out "$WHISPERX_OUT"
 
 # 3) Rust runner in inject mode. Reads WhisperX's transcript and
 # feeds it into whispery's aligner directly — no whisper.cpp.

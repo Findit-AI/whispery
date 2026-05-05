@@ -63,7 +63,7 @@ pub use runner::{
   Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
   ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE, DynTextNormalizer,
   EnglishNormalizer, JapaneseNormalizer, NormalizationError, NormalizedText, TextNormalizer,
-  bundled,
+  bundled, default_normalizer_for,
 };
 
 // Re-export ort types that appear on the alignment public API.
