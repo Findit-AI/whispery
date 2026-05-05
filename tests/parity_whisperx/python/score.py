@@ -139,6 +139,144 @@ def _align(
     return pairs
 
 
+def _refine_repeated_runs(
+    rows_a: list[WordRow],
+    rows_b: list[WordRow],
+    pairs: list[tuple[int | None, int | None]],
+) -> list[tuple[int | None, int | None]]:
+    """Post-process NW pairings: within a maximal run of consecutive
+    pairs that ALL share the same normalised text (matched or
+    gapped on either side), re-pair by greedy max-IoU matching.
+    Items left without a non-zero-IoU partner become drops on
+    their respective sides instead of staying as phantom
+    matched-but-zero-IoU pairs.
+
+    Why: NW's text-equality scoring is +1 regardless of timing;
+    when one runner emits one extra (or one fewer) token in a
+    repetition like "Watch! Watch! Watch! Watch!", NW pairs them
+    sequentially from the left, leaving every same-text pair in
+    the run with IoU≈0 due to a uniform time shift. The actual
+    alignments differ by a single repetition; greedy by IoU
+    recovers the correct N-1 pairings + 2 drops.
+    """
+    refined: list[tuple[int | None, int | None]] = []
+    n = len(pairs)
+    i = 0
+    while i < n:
+        # Determine the "anchor" norm for the run starting at i.
+        # The run is non-empty iff pair[i] has a normalised word
+        # on at least one side (matched or gapped).
+        anchor_a, anchor_b = pairs[i]
+        if anchor_a is not None and anchor_b is not None:
+            if rows_a[anchor_a].norm != rows_b[anchor_b].norm:
+                # NW substitution (different words). Not a same-
+                # text region; pass through.
+                refined.append(pairs[i])
+                i += 1
+                continue
+            run_norm = rows_a[anchor_a].norm
+        elif anchor_a is not None:
+            run_norm = rows_a[anchor_a].norm
+        else:
+            run_norm = rows_b[anchor_b].norm
+
+        # Extend the run forward over consecutive pairs whose
+        # non-None side(s) all share `run_norm`.
+        run_end = i
+        while run_end + 1 < n:
+            na, nb = pairs[run_end + 1]
+            ok = True
+            if na is not None and rows_a[na].norm != run_norm:
+                ok = False
+            if nb is not None and rows_b[nb].norm != run_norm:
+                ok = False
+            if not ok:
+                break
+            run_end += 1
+
+        # Single-pair run: nothing to refine, pass through.
+        if run_end == i:
+            refined.append(pairs[i])
+            i += 1
+            continue
+
+        # Collect the a- and b-indices in this run.
+        a_indices = [pairs[k][0] for k in range(i, run_end + 1) if pairs[k][0] is not None]
+        b_indices = [pairs[k][1] for k in range(i, run_end + 1) if pairs[k][1] is not None]
+
+        # Greedy max-IoU matching. Threshold at IoU > 0: a pair
+        # with zero overlap is no better than a drop, and keeping
+        # it as a "matched" pair drags the stats down with phantom
+        # zero-IoU entries.
+        candidates: list[tuple[float, int, int]] = []
+        for ii_, ai in enumerate(a_indices):
+            for jj_, bi in enumerate(b_indices):
+                iou = _iou(rows_a[ai], rows_b[bi])
+                if iou > 0.0:
+                    candidates.append((iou, ii_, jj_))
+        candidates.sort(reverse=True)
+        used_a: set[int] = set()
+        used_b: set[int] = set()
+        new_pairs: list[tuple[int | None, int | None]] = []
+        for _iou_score, ii_, jj_ in candidates:
+            if ii_ in used_a or jj_ in used_b:
+                continue
+            new_pairs.append((a_indices[ii_], b_indices[jj_]))
+            used_a.add(ii_)
+            used_b.add(jj_)
+        # Items not paired become drops on their side.
+        for ii_ in range(len(a_indices)):
+            if ii_ not in used_a:
+                new_pairs.append((a_indices[ii_], None))
+        for jj_ in range(len(b_indices)):
+            if jj_ not in used_b:
+                new_pairs.append((None, b_indices[jj_]))
+
+        refined.extend(new_pairs)
+        i = run_end + 1
+
+    return refined
+
+
+def _drop_distant_phantoms(
+    rows_a: list[WordRow],
+    rows_b: list[WordRow],
+    pairs: list[tuple[int | None, int | None]],
+    max_distance_s: float = 2.0,
+) -> list[tuple[int | None, int | None]]:
+    """Demote same-text matched pairs whose time centres are more
+    than `max_distance_s` apart (and IoU == 0) into drops on each
+    side. Such pairs are different OCCURRENCES of the same word
+    that NW happened to align by sequence — not algorithmic
+    alignment drift. Treating them as IoU=0 matches drags the
+    stats down with phantom failures; treating them as drops is
+    truthful (different word events, no comparison possible).
+
+    Threshold of 2s is conservative: actual CTC drift between two
+    aligners on the same chunk is typically ≤ 100 ms; centre-to-
+    centre distance > 2s strongly indicates different occurrences.
+    """
+    refined: list[tuple[int | None, int | None]] = []
+    for ai, bi in pairs:
+        if ai is None or bi is None:
+            refined.append((ai, bi))
+            continue
+        wa = rows_a[ai]
+        wb = rows_b[bi]
+        if _iou(wa, wb) > 0.0:
+            refined.append((ai, bi))
+            continue
+        center_a = (wa.start_s + wa.end_s) / 2.0
+        center_b = (wb.start_s + wb.end_s) / 2.0
+        if abs(center_a - center_b) > max_distance_s:
+            # Different occurrences — split into two drops.
+            refined.append((ai, None))
+            refined.append((None, bi))
+        else:
+            refined.append((ai, bi))
+    return refined
+
+
 def _stats(values: list[float]) -> dict[str, float | int]:
     if not values:
         return {"count": 0}
@@ -192,6 +330,13 @@ def main() -> int:
     name_b, rows_b = _load(args.whisperx_json)
 
     pairs = _align(rows_a, rows_b)
+    # Refine same-text runs: fix the repeated-token off-by-N
+    # phantom-mismatch pattern (e.g., "Watch! Watch! Watch! ...").
+    pairs = _refine_repeated_runs(rows_a, rows_b, pairs)
+    # Drop cross-region phantom matches: same-text pairs whose
+    # time centres are seconds apart aren't algorithmic drift,
+    # they're different occurrences NW happened to pair.
+    pairs = _drop_distant_phantoms(rows_a, rows_b, pairs)
     matched: list[tuple[WordRow, WordRow, float]] = []
     dropped_a = 0
     dropped_b = 0
