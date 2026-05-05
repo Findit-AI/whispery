@@ -957,6 +957,22 @@ impl Drop for WhisperPool {
   }
 }
 
+/// True iff a `recv_timeout` on the watchdog's cancel channel
+/// indicates a real per-job timeout (vs. a clean cancellation
+/// from the worker dropping `cancel_tx`).
+///
+/// Codex round-36 introduced this helper to fix a critical
+/// regression in the previous `recv_timeout(timeout).is_err()`
+/// shortcut: `Err(Disconnected)` (clean cancel) ALSO matches
+/// `is_err()`, so every fast successful job tripped the post-
+/// watchdog check and got rewritten to `WorkerHangTimeout`. Only
+/// `RecvTimeoutError::Timeout` indicates an actual hang.
+fn watchdog_should_signal_timeout(
+  result: Result<(), crossbeam_channel::RecvTimeoutError>,
+) -> bool {
+  matches!(result, Err(crossbeam_channel::RecvTimeoutError::Timeout))
+}
+
 /// Worker thread main loop. Implements per-worker timeout-streak
 /// recycling.
 fn worker_loop(
@@ -1007,11 +1023,17 @@ fn worker_loop(
       .name("whispery-asr-watchdog".into())
       .spawn(move || {
         // Block on the cancel channel for up to `timeout`.
-        // If the worker drops cancel_tx (or sends), we exit
-        // early without flipping the abort_flag. If the
-        // recv times out, we flip — which whisper.cpp's
-        // abort_callback will pick up and abort inference.
-        if cancel_rx.recv_timeout(timeout).is_err() {
+        //
+        // Codex round-36 fix: only flip `abort_flag` on a real
+        // `RecvTimeoutError::Timeout`. Clean cancellation
+        // (`Ok(())` from a sender, or `Err(Disconnected)` from
+        // the worker dropping `cancel_tx` after fast inference)
+        // must NOT flip the flag — the round-32 post-watchdog
+        // check would otherwise rewrite every successful
+        // `AsrResult` to `WorkerHangTimeout`. The shared
+        // `watchdog_should_signal_timeout` helper makes the
+        // discrimination explicit and unit-testable.
+        if watchdog_should_signal_timeout(cancel_rx.recv_timeout(timeout)) {
           abort_flag.store(true, Ordering::Relaxed);
         }
       }) {
@@ -1084,6 +1106,89 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  // --- Codex round-36: ASR watchdog cancellation discrimination ---
+
+  /// `Err(Timeout)` is the only case that should flip the
+  /// abort_flag. This is the actual hang signal whisper.cpp's
+  /// abort_callback picks up.
+  #[test]
+  fn watchdog_signals_timeout_on_real_timeout() {
+    assert!(watchdog_should_signal_timeout(Err(
+      crossbeam_channel::RecvTimeoutError::Timeout
+    )));
+  }
+
+  /// `Err(Disconnected)` is what the worker's `drop(cancel_tx)`
+  /// produces after a fast successful inference. It MUST NOT
+  /// be treated as a timeout — otherwise round-32's post-
+  /// watchdog check rewrites every successful `AsrResult` into
+  /// `WorkerHangTimeout`. This is the regression Codex round-36
+  /// caught.
+  #[test]
+  fn watchdog_does_not_signal_timeout_on_clean_disconnect() {
+    assert!(!watchdog_should_signal_timeout(Err(
+      crossbeam_channel::RecvTimeoutError::Disconnected
+    )));
+  }
+
+  /// `Ok(())` (sender explicitly sent) is also a clean exit.
+  /// We don't use the send path today, but the helper has to
+  /// handle it for completeness; treating it as a timeout
+  /// would be a footgun for any future "early-cancel via send"
+  /// path.
+  #[test]
+  fn watchdog_does_not_signal_timeout_on_clean_send() {
+    assert!(!watchdog_should_signal_timeout(Ok(())));
+  }
+
+  /// End-to-end watchdog behaviour with a real channel: a fast
+  /// "drop tx" never flips the abort flag.
+  #[test]
+  fn watchdog_loop_drop_tx_does_not_flip_flag() {
+    use core::sync::atomic::AtomicBool;
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let timeout = Duration::from_secs(5); // long
+    let (cancel_tx, cancel_rx) = bounded::<()>(1);
+    let abort_clone = abort_flag.clone();
+    let handle = std::thread::spawn(move || {
+      if watchdog_should_signal_timeout(cancel_rx.recv_timeout(timeout)) {
+        abort_clone.store(true, Ordering::Relaxed);
+      }
+    });
+    drop(cancel_tx);
+    handle.join().unwrap();
+    assert!(
+      !abort_flag.load(Ordering::Relaxed),
+      "clean drop(cancel_tx) must NOT flip abort_flag"
+    );
+  }
+
+  /// End-to-end watchdog behaviour: a real timeout DOES flip
+  /// the abort flag.
+  #[test]
+  fn watchdog_loop_timeout_flips_flag() {
+    use core::sync::atomic::AtomicBool;
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let timeout = Duration::from_millis(40);
+    let (cancel_tx, cancel_rx) = bounded::<()>(1);
+    let abort_clone = abort_flag.clone();
+    let handle = std::thread::spawn(move || {
+      if watchdog_should_signal_timeout(cancel_rx.recv_timeout(timeout)) {
+        abort_clone.store(true, Ordering::Relaxed);
+      }
+    });
+    // Sleep past the watchdog timeout before dropping. The
+    // watchdog's recv_timeout fires Err(Timeout) and flips the
+    // flag; the subsequent drop is a no-op.
+    std::thread::sleep(Duration::from_millis(120));
+    drop(cancel_tx);
+    handle.join().unwrap();
+    assert!(
+      abort_flag.load(Ordering::Relaxed),
+      "real timeout MUST flip abort_flag"
+    );
+  }
 
   /// Language-code interning must allocate at most once per
   /// distinct value. Calling `intern_lang_str` twice with the
