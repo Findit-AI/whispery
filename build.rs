@@ -217,6 +217,41 @@ fn fetch_wav2vec2_fixtures(fixture_dir: &std::path::Path) {
     "cargo:rustc-env=WHISPERY_W2V_TOKENIZER={}",
     tokenizer_path.display()
   );
+
+  // Multi-language fixtures (Ja, Zh, ...) are exported by an
+  // external `fetch_align_model.py` script, NOT downloaded by
+  // build.rs. We just probe for them and emit env vars when
+  // present, so multi-lang tests skip-when-fixture-absent
+  // identically to the single-language path above.
+  detect_extra_align_fixture(fixture_dir, "WHISPERY_W2V_JA",
+    "jonatasgrosman--wav2vec2-large-xlsr-53-japanese");
+  detect_extra_align_fixture(fixture_dir, "WHISPERY_W2V_ZH",
+    "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn");
+}
+
+/// Detect a multi-language alignment fixture pair (an `.onnx` file
+/// and a `<stem>-tokenizer.json`) under `fixture_dir`. When both
+/// exist, export `<env_prefix>_MODEL` and `<env_prefix>_TOKENIZER`
+/// so `option_env!()` in tests can find them. When missing, do
+/// nothing — the test path skips.
+fn detect_extra_align_fixture(
+  fixture_dir: &std::path::Path,
+  env_prefix: &str,
+  stem: &str,
+) {
+  let model_path = fixture_dir.join(format!("{stem}.onnx"));
+  let tokenizer_path = fixture_dir.join(format!("{stem}-tokenizer.json"));
+  if !model_path.exists() || !tokenizer_path.exists() {
+    return;
+  }
+  println!(
+    "cargo:rustc-env={env_prefix}_MODEL={}",
+    model_path.display()
+  );
+  println!(
+    "cargo:rustc-env={env_prefix}_TOKENIZER={}",
+    tokenizer_path.display()
+  );
 }
 
 /// Idempotent fetch + SHA-256 verify. Returns true on success

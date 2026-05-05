@@ -1711,4 +1711,118 @@ mod tests {
       result.words()
     );
   }
+
+  /// Smoke test: load the Japanese wav2vec2 fixture (downloaded
+  /// via `tests/parity_whisperx/python/fetch_align_model.py ja`
+  /// — see `multi-lang-alignment` branch). Skips when the
+  /// fixture isn't present so default `cargo test` runs stay
+  /// network/disk-free.
+  ///
+  /// Verifies the multi-lang path end-to-end on the loader side:
+  /// `Aligner::from_paths` accepts the jonatasgrosman tokenizer
+  /// shape, the JapaneseNormalizer is wired up via
+  /// `default_normalizer_for(Lang::Ja)`, and the empty-input
+  /// short-circuit returns Ok(empty AlignmentResult) just like
+  /// the English aligner.
+  #[test]
+  fn japanese_aligner_loads_and_short_circuits_on_empty_text() {
+    use core::sync::atomic::AtomicBool;
+
+    use mediatime::{TimeRange, Timebase};
+
+    use crate::runner::aligner::default_normalizer_for;
+
+    let model_path = match option_env!("WHISPERY_W2V_JA_MODEL") {
+      Some(p) => p,
+      None => return,
+    };
+    let tokenizer_path = match option_env!("WHISPERY_W2V_JA_TOKENIZER") {
+      Some(p) => p,
+      None => return,
+    };
+
+    let normalizer = default_normalizer_for(&Lang::Ja).expect("Ja normalizer must exist");
+    let mut aligner = Aligner::from_paths(
+      Lang::Ja,
+      Path::new(model_path),
+      Path::new(tokenizer_path),
+      normalizer,
+    )
+    .expect("Aligner::from_paths(Ja)");
+
+    let samples = alloc::vec![0.0_f32; 16_000];
+    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let abort = AtomicBool::new(false);
+    let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
+    let result = aligner
+      .align(
+        &samples,
+        &sub_segments,
+        /* text: */ "!!!...",
+        /* chunk_first_sample_in_stream: */ 0,
+        |start, end| {
+          TimeRange::new(
+            start as i64,
+            end as i64,
+            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+          )
+        },
+        &abort,
+        &run_options,
+      )
+      .expect("Ja aligner empty-text must short-circuit Ok");
+    assert!(result.words().is_empty());
+  }
+
+  /// Smoke test: load the Chinese wav2vec2 fixture. Mirrors the
+  /// Japanese smoke test above; skips when fixture absent.
+  #[test]
+  fn chinese_aligner_loads_and_short_circuits_on_empty_text() {
+    use core::sync::atomic::AtomicBool;
+
+    use mediatime::{TimeRange, Timebase};
+
+    use crate::runner::aligner::default_normalizer_for;
+
+    let model_path = match option_env!("WHISPERY_W2V_ZH_MODEL") {
+      Some(p) => p,
+      None => return,
+    };
+    let tokenizer_path = match option_env!("WHISPERY_W2V_ZH_TOKENIZER") {
+      Some(p) => p,
+      None => return,
+    };
+
+    let normalizer = default_normalizer_for(&Lang::Zh).expect("Zh normalizer must exist");
+    let mut aligner = Aligner::from_paths(
+      Lang::Zh,
+      Path::new(model_path),
+      Path::new(tokenizer_path),
+      normalizer,
+    )
+    .expect("Aligner::from_paths(Zh)");
+
+    let samples = alloc::vec![0.0_f32; 16_000];
+    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let abort = AtomicBool::new(false);
+    let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
+    let result = aligner
+      .align(
+        &samples,
+        &sub_segments,
+        "!!!...",
+        0,
+        |start, end| {
+          TimeRange::new(
+            start as i64,
+            end as i64,
+            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+          )
+        },
+        &abort,
+        &run_options,
+      )
+      .expect("Zh aligner empty-text must short-circuit Ok");
+    assert!(result.words().is_empty());
+  }
 }
