@@ -17,9 +17,15 @@
 
 extern crate alloc;
 
+pub mod align;
 pub mod core;
 pub mod time;
 pub mod types;
+
+pub use align::{BoundsSource, Run, SegmentLike, dispatch_segments};
+
+#[cfg(feature = "runner")]
+pub use align::dispatch;
 
 // Re-exports of mediatime types that appear in whispery's public API
 // (so consumers don't need to add a separate `mediatime` dependency
