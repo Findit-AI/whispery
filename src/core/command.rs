@@ -487,6 +487,16 @@ impl Default for SamplingStrategy {
 
 /// Result of one chunk's ASR inference. Fields are private; use
 /// [`AsrResult::new`] and accessors.
+///
+/// The `runs` field carries the script-dispatcher's per-language
+/// breakdown of the transcript (see
+/// [`crate::align::dispatch_segments`]). Whisper workers that have
+/// access to the live `whisper.cpp` segment list populate it; the
+/// alignment worker uses it to dispatch each language slice to the
+/// matching [`crate::runner::Aligner`]. An empty `runs` is valid —
+/// it falls back to whole-chunk alignment using
+/// [`AsrResult::language`], identical to the pre-script-dispatch
+/// behaviour.
 #[derive(Clone, Debug)]
 pub struct AsrResult {
   text: SmolStr,
@@ -494,10 +504,15 @@ pub struct AsrResult {
   avg_logprob: f32,
   no_speech_prob: f32,
   temperature: f32,
+  runs: Vec<crate::align::Run>,
 }
 
 impl AsrResult {
-  /// Construct from all fields.
+  /// Construct from all fields except [`Self::runs`], which defaults
+  /// to empty. Callers that have access to the whisper segment list
+  /// (e.g. the runner's whisper worker) should populate it via
+  /// [`Self::with_runs`] / [`Self::set_runs`] so the alignment stage
+  /// can dispatch per-language.
   pub fn new(
     text: SmolStr,
     language: Lang,
@@ -511,6 +526,7 @@ impl AsrResult {
       avg_logprob,
       no_speech_prob,
       temperature,
+      runs: Vec::new(),
     }
   }
 
@@ -537,6 +553,25 @@ impl AsrResult {
   /// Final temperature used after fallback retries.
   pub const fn temperature(&self) -> f32 {
     self.temperature
+  }
+
+  /// Per-language script-dispatcher runs over the transcript.
+  /// Empty when no dispatcher was run (or when the chunk produced
+  /// no segments).
+  pub fn runs(&self) -> &[crate::align::Run] {
+    &self.runs
+  }
+
+  /// Builder-style: replace the runs vector.
+  #[must_use]
+  pub fn with_runs(mut self, runs: Vec<crate::align::Run>) -> Self {
+    self.runs = runs;
+    self
+  }
+
+  /// In-place: replace the runs vector.
+  pub fn set_runs(&mut self, runs: Vec<crate::align::Run>) {
+    self.runs = runs;
   }
 }
 
@@ -631,6 +666,12 @@ pub enum Command {
     text: SmolStr,
     /// Detected language.
     language: Lang,
+    /// Script-dispatcher per-language runs derived from the
+    /// whisper segments. Empty when the runner did not populate
+    /// it (legacy single-language path); the alignment worker
+    /// then falls back to whole-chunk alignment keyed on
+    /// `language`.
+    runs: Vec<crate::align::Run>,
   },
 }
 

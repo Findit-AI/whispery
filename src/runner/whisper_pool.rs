@@ -924,13 +924,33 @@ fn build_asr_result(
       .unwrap_or(Lang::Other(SmolStr::new("")))
   });
 
-  Ok(AsrResult::new(
-    SmolStr::new(text.trim()),
-    language,
-    avg_logprob,
-    no_speech_prob,
-    final_temperature,
-  ))
+  // Script-dispatch: walk the just-decoded segments and split each
+  // into per-language [`Run`]s. Materialising into a Vec here is
+  // necessary because `dispatch` takes `&[Segment<'_>]` and the
+  // segment iterator is consumed lazily; the live borrow on
+  // `state` is OK because the dispatcher only reads each
+  // segment's text + tokens + DTW timestamps and produces an
+  // owned `Vec<Run>` whose data outlives the state borrow.
+  //
+  // `state_lang` is the just-detected language (or the hint),
+  // used by `script_to_lang` for Latin / ambiguous-script
+  // disambiguation. Passing `Some(language.clone())` rather than
+  // `params.language_hint()` lets the dispatcher benefit from
+  // whisper.cpp's own auto-detection in the auto-detect path
+  // (`language_hint = None` originally).
+  let segments: alloc::vec::Vec<whispercpp::Segment<'_>> = state.segments_iter().collect();
+  let runs = crate::align::dispatch(&segments, Some(language.clone()));
+
+  Ok(
+    AsrResult::new(
+      SmolStr::new(text.trim()),
+      language,
+      avg_logprob,
+      no_speech_prob,
+      final_temperature,
+    )
+    .with_runs(runs),
+  )
 }
 
 /// Worker pool. Shared `Arc<WhisperContext>` per the v1 architecture

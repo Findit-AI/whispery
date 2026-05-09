@@ -617,6 +617,7 @@ impl Dispatch {
         sub_segments: record.sub_segments.clone(),
         text: result.text().clone(),
         language: result.language().clone(),
+        runs: result.runs().to_vec(),
       });
     } else {
       // Build the Transcript with empty words.

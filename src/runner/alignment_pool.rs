@@ -44,6 +44,13 @@ pub(super) struct AlignWorkItem {
   pub text: SmolStr,
   /// Detected language for this chunk.
   pub language: Lang,
+  /// Script-dispatcher per-language runs over the transcript,
+  /// computed by the whisper worker just after `state.full(...)`.
+  /// Empty when the dispatcher was not run (no segments, or a
+  /// caller injecting `AsrResult` directly without populating
+  /// `AsrResult::runs`); the worker then falls back to a single
+  /// whole-chunk alignment keyed on [`Self::language`].
+  pub runs: alloc::vec::Vec<crate::align::Run>,
   /// Per-job timeout. The worker's watchdog flips abort_flag
   /// after this elapses.
   pub align_timeout: core::time::Duration,
@@ -234,25 +241,38 @@ fn run_one_alignment(
 
   let started_at = Instant::now();
 
-  // Lookup + dispatch. Strict on registered failure.
-  let outcome = match set.lookup(&job.language) {
-    AlignmentLookup::Hit { aligner, .. } => {
-      // Registered aligner; failure does NOT consult Any.
-      run_under_lock(aligner, job, &run_options)
+  // Lookup + dispatch. Two paths:
+  //
+  // 1. **Per-run dispatch** (`!job.runs.is_empty()`): each
+  //    [`crate::align::Run`] in `job.runs` is a single-language
+  //    slice of the chunk's transcript carrying its own audio
+  //    bounds. We walk the list, look up the per-language
+  //    `Aligner`, and call `align_chunk` once per run; results are
+  //    stitched into a single `AlignmentResult`.
+  //
+  // 2. **Legacy whole-chunk dispatch** (`job.runs.is_empty()`):
+  //    the runner did not populate `runs` (no segments emitted, or
+  //    a caller injecting `AsrResult` directly without filling
+  //    `runs`). We fall back to the pre-script-dispatch behaviour:
+  //    one alignment over the full chunk text, keyed on
+  //    `job.language`.
+  //
+  // Strict-lookup contract: registered `Lang(L)` failure does NOT
+  // silently fall through to `Any`. The per-run path applies the
+  // same rule per-run.
+  let outcome = if job.runs.is_empty() {
+    match set.lookup(&job.language) {
+      AlignmentLookup::Hit { aligner, .. } => run_under_lock(aligner, job, &run_options),
+      AlignmentLookup::AnyFallback { aligner } => run_under_lock(aligner, job, &run_options),
+      AlignmentLookup::Miss { fallback } => match fallback {
+        AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(alloc::vec::Vec::new())),
+        AlignmentFallback::Error => Err(WorkFailure::LanguageUnsupportedForAlignment {
+          language: job.language.clone(),
+        }),
+      },
     }
-    AlignmentLookup::AnyFallback { aligner } => {
-      // Multilingual fallback; same call shape.
-      run_under_lock(aligner, job, &run_options)
-    }
-    AlignmentLookup::Miss { fallback } => match fallback {
-      AlignmentFallback::SkipChunk => {
-        // Empty result is a valid alignment outcome.
-        Ok(AlignmentResult::new(alloc::vec::Vec::new()))
-      }
-      AlignmentFallback::Error => Err(WorkFailure::LanguageUnsupportedForAlignment {
-        language: job.language.clone(),
-      }),
-    },
+  } else {
+    dispatch_runs(set, job, &run_options)
   };
 
   // Cancel the watchdog by dropping the sender. The watchdog's
@@ -380,6 +400,323 @@ fn run_under_lock(
   )
 }
 
+/// Per-chunk script-dispatch telemetry. Counts how the
+/// dispatcher's [`crate::align::BoundsSource`] decisions
+/// distributed across the chunk's runs, plus how many runs
+/// landed on a [`Lang`] with no registered aligner.
+///
+/// The counters are accumulated once per chunk by
+/// [`dispatch_runs`] and emitted to stderr with a
+/// `script_dispatch chunk=...` prefix. Fields are private with
+/// accessors per the project convention.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct BoundsSourceCounters {
+  runs_total: usize,
+  runs_dtw: usize,
+  runs_segment: usize,
+  runs_wholeclip: usize,
+  runs_unaligned: usize,
+}
+
+impl BoundsSourceCounters {
+  /// Tally one run's [`crate::align::BoundsSource`].
+  pub(super) fn observe_bounds(&mut self, source: crate::align::BoundsSource) {
+    self.runs_total += 1;
+    match source {
+      crate::align::BoundsSource::Dtw => self.runs_dtw += 1,
+      crate::align::BoundsSource::Segment => self.runs_segment += 1,
+      crate::align::BoundsSource::Wholeclip => self.runs_wholeclip += 1,
+    }
+  }
+
+  /// Increment the unaligned-language counter (run's `Lang` had
+  /// no [`crate::Aligner`] registered AND no `Any` fallback).
+  pub(super) const fn observe_unaligned(&mut self) {
+    self.runs_unaligned += 1;
+  }
+
+  /// Total runs observed.
+  pub(super) const fn runs_total(&self) -> usize {
+    self.runs_total
+  }
+
+  /// Runs whose bounds came from per-token DTW timestamps.
+  pub(super) const fn runs_dtw(&self) -> usize {
+    self.runs_dtw
+  }
+
+  /// Runs whose bounds came from the parent segment envelope.
+  pub(super) const fn runs_segment(&self) -> usize {
+    self.runs_segment
+  }
+
+  /// Runs whose bounds came from the whole-clip sentinel
+  /// fallback.
+  pub(super) const fn runs_wholeclip(&self) -> usize {
+    self.runs_wholeclip
+  }
+
+  /// Runs whose `Lang` had no registered aligner.
+  pub(super) const fn runs_unaligned(&self) -> usize {
+    self.runs_unaligned
+  }
+}
+
+/// Per-run dispatch path: for each [`crate::align::Run`] in
+/// `job.runs`, look up the matching [`crate::Aligner`] and run
+/// `align_chunk` over the run's audio slice. Results are stitched
+/// into a single [`AlignmentResult`].
+///
+/// **Audio slicing.** The dispatcher inherits each run's bounds
+/// from the parent whisper segment (per the design spec — finer
+/// per-token slicing is a follow-up). We translate
+/// `(audio_t0_ms, audio_t1_ms)` to chunk-local sample indices
+/// via the analysis sample rate (16 kHz). The whole-clip
+/// sentinel ([`crate::align::BoundsSource::Wholeclip`])
+/// degrades to running over the full chunk audio.
+///
+/// **Sub-segment intersection.** Sub-VAD segments are passed
+/// through unchanged; the aligner's silence-mask handles the
+/// case where they extend past the run window (out-of-range
+/// positions get clamped inside `Aligner::align`).
+///
+/// **Fallback for unaligned languages.** When neither a
+/// `Lang(L)` aligner nor an `Any` aligner is registered, AND
+/// the configured fallback is `SkipChunk`, we synthesise a
+/// single pseudo-[`crate::types::Word`] covering the run's
+/// `(audio_t0_ms, audio_t1_ms)` with `score = 0.0` and the
+/// run's verbatim text. This preserves the run's place in the
+/// output stream (downstream consumers can render it as
+/// non-aligned text) instead of dropping it. The
+/// `AlignmentFallback::Error` policy still surfaces an error.
+///
+/// **Telemetry.** Logs one `script_dispatch chunk=...` line per
+/// dispatched chunk to stderr with the
+/// [`BoundsSourceCounters`] distribution.
+fn dispatch_runs(
+  set: &AlignmentSet,
+  job: &AlignWorkItem,
+  run_options: &RunOptions,
+) -> Result<AlignmentResult, WorkFailure> {
+  use crate::align::BoundsSource;
+
+  let mut counters = BoundsSourceCounters::default();
+  let mut all_words: alloc::vec::Vec<crate::types::Word> = alloc::vec::Vec::new();
+
+  for run in job.runs.iter() {
+    counters.observe_bounds(run.bounds_source());
+
+    // Resolve the audio slice for this run. Bounds in ms get
+    // converted to chunk-local sample indices at 16 kHz; the
+    // wholeclip sentinel falls back to the full chunk.
+    let (slice_lo, slice_hi) =
+      run_audio_slice(run, job.samples.len(), job.chunk_first_sample_in_stream);
+
+    let lookup = set.lookup(run.language());
+    let aligner_lock = match lookup {
+      AlignmentLookup::Hit { aligner, .. } => Some(aligner),
+      AlignmentLookup::AnyFallback { aligner } => Some(aligner),
+      AlignmentLookup::Miss { fallback } => match fallback {
+        AlignmentFallback::SkipChunk => {
+          counters.observe_unaligned();
+          all_words.push(unsupported_language_pseudo_word(run));
+          None
+        }
+        AlignmentFallback::Error => {
+          emit_telemetry(job.chunk_id, &counters);
+          return Err(WorkFailure::LanguageUnsupportedForAlignment {
+            language: run.language().clone(),
+          });
+        }
+      },
+    };
+
+    let Some(aligner) = aligner_lock else {
+      continue;
+    };
+
+    // Slice sub_segments to those that overlap the run's audio
+    // window. The aligner clamps out-of-range PTS internally,
+    // but pre-filtering keeps the silence mask sharp.
+    let run_subs = clip_sub_segments(&job.sub_segments, slice_lo, slice_hi);
+    let run_samples = &job.samples[slice_lo..slice_hi];
+
+    // Per-run `chunk_first_sample_in_stream`: the parent chunk's
+    // first sample plus this run's offset inside the chunk. The
+    // aligner uses this to convert frame indices back into
+    // stream sample space, which downstream
+    // `samples_to_output_range` then maps to caller timebase.
+    let run_first_sample_in_stream = job
+      .chunk_first_sample_in_stream
+      .saturating_add(slice_lo as u64);
+
+    let outcome = run_one_per_run(
+      aligner,
+      run,
+      run_samples,
+      &run_subs,
+      run_first_sample_in_stream,
+      job.samples_to_output_range.clone(),
+      &job.abort_flag,
+      run_options,
+    );
+    match outcome {
+      Ok(result) => {
+        for word in result.into_words() {
+          all_words.push(word);
+        }
+      }
+      Err(failure) => {
+        if alignment_failure_is_recoverable(&failure) {
+          // Recoverable: drop this run's words but keep going on
+          // remaining runs so a single bad run doesn't poison
+          // the whole chunk's alignment.
+          continue;
+        }
+        emit_telemetry(job.chunk_id, &counters);
+        return Err(failure);
+      }
+    }
+    // Defensive: if we've consumed the full chunk on a
+    // `Wholeclip`-bounded run there's no more audio left to
+    // align — break to avoid replaying the same audio for a
+    // second run.
+    if matches!(run.bounds_source(), BoundsSource::Wholeclip) {
+      break;
+    }
+  }
+
+  emit_telemetry(job.chunk_id, &counters);
+  Ok(AlignmentResult::new(all_words))
+}
+
+/// Translate a run's `(audio_t0_ms, audio_t1_ms)` into chunk-local
+/// sample indices. The whole-clip sentinel
+/// ([`crate::align::BoundsSource::Wholeclip`]) maps to the full
+/// chunk (`0..samples_len`). Out-of-range or inverted bounds
+/// degrade to the full chunk as well — the dispatcher should never
+/// emit those, but we tolerate them defensively rather than panic
+/// inside the alignment worker.
+///
+/// `_chunk_first_sample_in_stream` is currently unused; it is
+/// reserved for a future refinement that lets the dispatcher emit
+/// per-run audio bounds in stream coordinates rather than chunk-
+/// local ms (the runner already passes the chunk-relative form
+/// here).
+fn run_audio_slice(
+  run: &crate::align::Run,
+  samples_len: usize,
+  _chunk_first_sample_in_stream: u64,
+) -> (usize, usize) {
+  use crate::align::BoundsSource;
+  if matches!(run.bounds_source(), BoundsSource::Wholeclip) {
+    return (0, samples_len);
+  }
+  let t0 = run.audio_t0_ms();
+  let t1 = run.audio_t1_ms();
+  if t0 < 0 || t1 <= t0 {
+    return (0, samples_len);
+  }
+  // 16 kHz sample rate: 1 ms = 16 samples.
+  let lo = (t0 as u64)
+    .saturating_mul(16)
+    .min(samples_len as u64) as usize;
+  let hi = (t1 as u64)
+    .saturating_mul(16)
+    .min(samples_len as u64) as usize;
+  if hi <= lo {
+    return (0, samples_len);
+  }
+  (lo, hi)
+}
+
+/// Clip and offset chunk-local sub-segments into a run's
+/// audio window. Inputs are in chunk-local 1/16000 timebase
+/// (start/end PTS == sample indices); outputs are in the
+/// run's local 1/16000 timebase (start/end PTS == sample
+/// indices relative to `slice_lo`).
+fn clip_sub_segments(
+  subs: &[TimeRange],
+  slice_lo: usize,
+  slice_hi: usize,
+) -> alloc::vec::Vec<TimeRange> {
+  use core::num::NonZeroU32;
+  let tb = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+  let mut out = alloc::vec::Vec::with_capacity(subs.len());
+  let lo_i = slice_lo as i64;
+  let hi_i = slice_hi as i64;
+  for sub in subs {
+    let s = sub.start_pts().max(lo_i);
+    let e = sub.end_pts().min(hi_i);
+    if e > s {
+      out.push(TimeRange::new(s - lo_i, e - lo_i, tb));
+    }
+  }
+  out
+}
+
+/// Pseudo-word for runs whose [`Lang`] has no registered aligner
+/// and the configured fallback is `SkipChunk`. Carries the run's
+/// verbatim text and audio bounds with `score = 0.0` so
+/// downstream consumers can render the un-aligned slice as
+/// timed-but-unscored text. Word range is in milliseconds (1/1000
+/// timebase, matching the dispatcher's `audio_t*_ms` fields).
+fn unsupported_language_pseudo_word(run: &crate::align::Run) -> crate::types::Word {
+  use core::num::NonZeroU32;
+  let tb = mediatime::Timebase::new(1, NonZeroU32::new(1_000).unwrap());
+  let t0 = run.audio_t0_ms().max(0);
+  let t1 = run.audio_t1_ms().max(t0);
+  let range = TimeRange::new(t0, t1, tb);
+  crate::types::Word::new(SmolStr::new(run.text()), range, 0.0)
+}
+
+/// Lock + run for one per-run alignment call. Mirrors
+/// [`run_under_lock`] but with the run's audio slice + sub-segment
+/// intersection.
+#[allow(clippy::too_many_arguments)]
+fn run_one_per_run(
+  aligner: &Mutex<Aligner>,
+  run: &crate::align::Run,
+  run_samples: &[f32],
+  run_sub_segments: &[TimeRange],
+  run_first_sample_in_stream: u64,
+  samples_to_output_range: Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync>,
+  abort_flag: &AtomicBool,
+  run_options: &RunOptions,
+) -> Result<AlignmentResult, WorkFailure> {
+  let mut guard = match aligner.lock() {
+    Ok(g) => g,
+    Err(poisoned) => poisoned.into_inner(),
+  };
+  let bound = samples_to_output_range.clone();
+  guard.align(
+    run_samples,
+    run_sub_segments,
+    run.text(),
+    run_first_sample_in_stream,
+    move |a, b| (bound)(a, b),
+    abort_flag,
+    run_options,
+  )
+}
+
+/// One-line telemetry per chunk. Format chosen to be greppable
+/// from logs (`grep script_dispatch`) and to match the structured
+/// shape from the spec:
+/// `script_dispatch chunk=<id> runs=<total> dtw=<n> segment=<n>
+/// wholeclip=<n> unaligned=<n>`.
+fn emit_telemetry(chunk_id: ChunkId, c: &BoundsSourceCounters) {
+  std::eprintln!(
+    "script_dispatch chunk={} runs={} dtw={} segment={} wholeclip={} unaligned={}",
+    chunk_id.as_u64(),
+    c.runs_total(),
+    c.runs_dtw(),
+    c.runs_segment(),
+    c.runs_wholeclip(),
+    c.runs_unaligned(),
+  );
+}
+
 // Re-exports of the algorithm error kinds so the worker can
 // surface them without re-importing the chain.
 #[allow(dead_code)]
@@ -480,5 +817,141 @@ mod tests {
       kind: AsrFailureKind::AllTemperaturesFailed,
       message: alloc::string::String::new(),
     }));
+  }
+
+  /// `BoundsSourceCounters` accumulates the dispatcher's
+  /// `BoundsSource` distribution one observation at a time. The
+  /// counters in script_dispatch chunk-level telemetry are derived
+  /// solely from these increments, so a regression here would silently
+  /// corrupt every line of operator-facing log output.
+  #[test]
+  fn bounds_source_counters_accumulate_distribution() {
+    use crate::align::BoundsSource;
+    let mut c = BoundsSourceCounters::default();
+    c.observe_bounds(BoundsSource::Dtw);
+    c.observe_bounds(BoundsSource::Dtw);
+    c.observe_bounds(BoundsSource::Segment);
+    c.observe_bounds(BoundsSource::Wholeclip);
+    c.observe_unaligned();
+    c.observe_unaligned();
+    assert_eq!(c.runs_total(), 4);
+    assert_eq!(c.runs_dtw(), 2);
+    assert_eq!(c.runs_segment(), 1);
+    assert_eq!(c.runs_wholeclip(), 1);
+    assert_eq!(c.runs_unaligned(), 2);
+  }
+
+  /// Default-constructed counters are all-zero — used when a chunk
+  /// dispatches the legacy whole-chunk path (empty `runs`).
+  #[test]
+  fn bounds_source_counters_default_is_zero() {
+    let c = BoundsSourceCounters::default();
+    assert_eq!(c.runs_total(), 0);
+    assert_eq!(c.runs_dtw(), 0);
+    assert_eq!(c.runs_segment(), 0);
+    assert_eq!(c.runs_wholeclip(), 0);
+    assert_eq!(c.runs_unaligned(), 0);
+  }
+
+  /// `run_audio_slice` translates the dispatcher's millisecond
+  /// bounds into chunk-local sample indices at the analysis
+  /// sample rate (16 kHz). Spot-check the standard segment-sourced
+  /// case, the wholeclip sentinel, and the inverted-bounds
+  /// defensive fallback.
+  #[test]
+  fn run_audio_slice_segment_bounds_clamp_to_chunk_length() {
+    use crate::align::{BoundsSource, Run};
+    use smol_str::SmolStr;
+    let r = Run::new(
+      Lang::En,
+      SmolStr::new("hi"),
+      100,
+      300,
+      0,
+      BoundsSource::Segment,
+    );
+    let (lo, hi) = run_audio_slice(&r, 16_000, 0);
+    assert_eq!(lo, 1_600);
+    assert_eq!(hi, 4_800);
+  }
+
+  #[test]
+  fn run_audio_slice_wholeclip_uses_full_chunk() {
+    use crate::align::{BoundsSource, Run};
+    use smol_str::SmolStr;
+    let r = Run::new(
+      Lang::En,
+      SmolStr::new("hi"),
+      i64::MIN,
+      i64::MAX,
+      0,
+      BoundsSource::Wholeclip,
+    );
+    let (lo, hi) = run_audio_slice(&r, 16_000, 0);
+    assert_eq!(lo, 0);
+    assert_eq!(hi, 16_000);
+  }
+
+  #[test]
+  fn run_audio_slice_inverted_bounds_fall_back_to_full_chunk() {
+    use crate::align::{BoundsSource, Run};
+    use smol_str::SmolStr;
+    let r = Run::new(
+      Lang::En,
+      SmolStr::new("hi"),
+      500,
+      100,
+      0,
+      BoundsSource::Segment,
+    );
+    let (lo, hi) = run_audio_slice(&r, 16_000, 0);
+    assert_eq!(lo, 0);
+    assert_eq!(hi, 16_000);
+  }
+
+  /// `clip_sub_segments` keeps only the portion of each
+  /// sub-segment that overlaps the run's audio window, and
+  /// re-bases the timestamps so they remain chunk-local within
+  /// the run's slice.
+  #[test]
+  fn clip_sub_segments_offsets_into_run_local_space() {
+    use core::num::NonZeroU32;
+    let tb = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
+    let subs = alloc::vec![
+      // Fully inside the run window.
+      TimeRange::new(2_000, 3_000, tb),
+      // Straddles the lower bound.
+      TimeRange::new(800, 2_400, tb),
+      // Outside the run entirely; dropped.
+      TimeRange::new(8_000, 9_000, tb),
+    ];
+    let out = clip_sub_segments(&subs, 1_600, 4_800);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].start_pts(), 400);
+    assert_eq!(out[0].end_pts(), 1_400);
+    assert_eq!(out[1].start_pts(), 0);
+    assert_eq!(out[1].end_pts(), 800);
+  }
+
+  /// Pseudo-word for unsupported-language runs carries the run's
+  /// verbatim text and a millisecond-timebase range covering the
+  /// run's audio bounds. `score = 0.0` flags it as un-aligned.
+  #[test]
+  fn unsupported_language_pseudo_word_carries_run_text_and_bounds() {
+    use crate::align::{BoundsSource, Run};
+    use smol_str::SmolStr;
+    let r = Run::new(
+      Lang::Other(SmolStr::new("xx")),
+      SmolStr::new("untranslated"),
+      120,
+      450,
+      0,
+      BoundsSource::Segment,
+    );
+    let w = unsupported_language_pseudo_word(&r);
+    assert_eq!(w.text(), "untranslated");
+    assert_eq!(w.range().start_pts(), 120);
+    assert_eq!(w.range().end_pts(), 450);
+    assert!((w.score() - 0.0).abs() < f32::EPSILON);
   }
 }

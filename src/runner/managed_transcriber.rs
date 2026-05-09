@@ -118,6 +118,7 @@ impl ManagedTranscriber {
         sub_segments,
         text,
         language,
+        runs,
       } => {
         // text + language are Whisper's authoritative output
         // (the registry lookup depends on `language`). They are
@@ -135,6 +136,7 @@ impl ManagedTranscriber {
             sub_segments,
             text,
             language,
+            runs,
           });
         };
 
@@ -152,6 +154,7 @@ impl ManagedTranscriber {
             sub_segments,
             text,
             language,
+            runs,
           });
         };
 
@@ -170,6 +173,7 @@ impl ManagedTranscriber {
               sub_segments,
               text,
               language,
+              runs,
             });
           }
         };
@@ -206,6 +210,7 @@ impl ManagedTranscriber {
           sub_segments: chunk_local_subs_as_ranges,
           text,
           language,
+          runs,
           align_timeout: self.align_timeout,
           abort_flag,
           chunk_first_sample_in_stream: chunk_first_sample,
@@ -222,13 +227,17 @@ impl ManagedTranscriber {
             // poll_command can rebuild from there. For the
             // re-parked Command we ship an empty Vec — the
             // data is recoverable from the record on retry
-            // via this same try_dispatch path.
+            // via this same try_dispatch path. `runs` survives
+            // verbatim — the dispatcher output is computed once
+            // by the whisper worker and is identical across
+            // retries.
             let cmd = Command::RunAlignment {
               chunk_id: item.chunk_id,
               samples: item.samples,
               sub_segments: alloc::vec::Vec::new(),
               text: item.text,
               language: item.language,
+              runs: item.runs,
             };
             DispatchOutcome::Backpressure(cmd)
           }
