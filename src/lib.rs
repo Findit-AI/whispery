@@ -65,8 +65,8 @@ pub use whispercpp::{Context as WhisperContext, ContextParams as WhisperContextP
 pub use runner::{
   Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
   ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE, DynTextNormalizer,
-  EnglishNormalizer, JapaneseNormalizer, NormalizationError, NormalizedText, TextNormalizer,
-  bundled, default_normalizer_for,
+  EnglishNormalizer, JapaneseNormalizer, LatinNormalizer, NormalizationError, NormalizedText,
+  TextNormalizer, bundled, default_normalizer_for,
 };
 
 // Re-export ort types that appear on the alignment public API.

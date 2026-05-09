@@ -23,6 +23,6 @@ pub use whisper_pool::WhisperPoolOptions;
 pub use aligner::{
   Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
   ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE, DynTextNormalizer,
-  EnglishNormalizer, JapaneseNormalizer, NormalizationError, NormalizedText, TextNormalizer,
-  bundled, default_normalizer_for,
+  EnglishNormalizer, JapaneseNormalizer, LatinNormalizer, NormalizationError, NormalizedText,
+  TextNormalizer, bundled, default_normalizer_for,
 };

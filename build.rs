@@ -67,6 +67,75 @@ const TOKENIZER_W2V_ZH_FILENAME: &str =
 const TOKENIZER_W2V_ZH_SHA256: &str =
   "7bb5c156e0ea01980f42ae1904193834132019ae8a6276a9957805cd5a6b37f5";
 
+// --- Latin-language alignment fixtures (Es, Fr, De, It, Pt) --------
+//
+// Same shape as Ja / Zh: jonatasgrosman ships PyTorch only, we
+// re-export to ONNX once and host the result under
+// `FinDIT-Studio/wav2vec2-large-xlsr-53-{lang}-onnx`. Each pair is
+// SHA-verified after upload via `curl -L <url> | sha256sum`.
+//
+// SHAs marked TODO will resolve once the corresponding ONNX file
+// is uploaded to the FinDIT-Studio mirror; until then build.rs's
+// fetch step short-circuits on the SHA mismatch and the
+// dependent integration tests skip via `option_env!()`. List of
+// pending uploads is tracked in the branch report.
+//
+// IMPORTANT: keep this block contiguous so a sibling Korean
+// branch's parallel additions merge mechanically.
+
+const MODEL_W2V_ES_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-spanish-onnx/resolve/main/model.onnx";
+const MODEL_W2V_ES_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-spanish.onnx";
+// TODO(latin-mirror): compute via `curl -L <MODEL_W2V_ES_URL> | sha256sum`
+// once the Spanish ONNX is uploaded to the FinDIT-Studio mirror.
+const MODEL_W2V_ES_SHA256: &str = "TODO";
+const TOKENIZER_W2V_ES_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-spanish-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_ES_FILENAME: &str =
+  "jonatasgrosman--wav2vec2-large-xlsr-53-spanish-tokenizer.json";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const TOKENIZER_W2V_ES_SHA256: &str = "TODO";
+
+const MODEL_W2V_FR_URL: &str =
+  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-french-onnx/resolve/main/model.onnx";
+const MODEL_W2V_FR_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-french.onnx";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const MODEL_W2V_FR_SHA256: &str = "TODO";
+const TOKENIZER_W2V_FR_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-french-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_FR_FILENAME: &str =
+  "jonatasgrosman--wav2vec2-large-xlsr-53-french-tokenizer.json";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const TOKENIZER_W2V_FR_SHA256: &str = "TODO";
+
+const MODEL_W2V_DE_URL: &str =
+  "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-german-onnx/resolve/main/model.onnx";
+const MODEL_W2V_DE_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-german.onnx";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const MODEL_W2V_DE_SHA256: &str = "TODO";
+const TOKENIZER_W2V_DE_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-german-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_DE_FILENAME: &str =
+  "jonatasgrosman--wav2vec2-large-xlsr-53-german-tokenizer.json";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const TOKENIZER_W2V_DE_SHA256: &str = "TODO";
+
+const MODEL_W2V_IT_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-italian-onnx/resolve/main/model.onnx";
+const MODEL_W2V_IT_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-italian.onnx";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const MODEL_W2V_IT_SHA256: &str = "TODO";
+const TOKENIZER_W2V_IT_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-italian-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_IT_FILENAME: &str =
+  "jonatasgrosman--wav2vec2-large-xlsr-53-italian-tokenizer.json";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const TOKENIZER_W2V_IT_SHA256: &str = "TODO";
+
+const MODEL_W2V_PT_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-portuguese-onnx/resolve/main/model.onnx";
+const MODEL_W2V_PT_FILENAME: &str = "jonatasgrosman--wav2vec2-large-xlsr-53-portuguese.onnx";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const MODEL_W2V_PT_SHA256: &str = "TODO";
+const TOKENIZER_W2V_PT_URL: &str = "https://huggingface.co/FinDIT-Studio/wav2vec2-large-xlsr-53-portuguese-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_W2V_PT_FILENAME: &str =
+  "jonatasgrosman--wav2vec2-large-xlsr-53-portuguese-tokenizer.json";
+// TODO(latin-mirror): compute via curl + sha256sum after upload.
+const TOKENIZER_W2V_PT_SHA256: &str = "TODO";
+
 fn main() {
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-changed=assets/wav2vec2_base_960h_tokenizer.json");
@@ -286,6 +355,64 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
     TOKENIZER_W2V_ZH_FILENAME,
     TOKENIZER_W2V_ZH_SHA256,
   );
+
+  // Latin-language fixtures (Es, Fr, De, It, Pt). Same opt-in
+  // (`WHISPERY_FETCH_W2V`) as Ja / Zh. Each entry's SHA is `TODO`
+  // until the corresponding ONNX is uploaded to FinDIT-Studio's
+  // HF mirror; `fetch_extra_align_fixture` short-circuits on
+  // SHA mismatch and the dependent integration tests skip via
+  // `option_env!()`. The block stays contiguous so a sibling
+  // Korean branch's parallel additions merge mechanically.
+  fetch_extra_align_fixture(
+    models_dir,
+    "WHISPERY_W2V_ES",
+    MODEL_W2V_ES_URL,
+    MODEL_W2V_ES_FILENAME,
+    MODEL_W2V_ES_SHA256,
+    TOKENIZER_W2V_ES_URL,
+    TOKENIZER_W2V_ES_FILENAME,
+    TOKENIZER_W2V_ES_SHA256,
+  );
+  fetch_extra_align_fixture(
+    models_dir,
+    "WHISPERY_W2V_FR",
+    MODEL_W2V_FR_URL,
+    MODEL_W2V_FR_FILENAME,
+    MODEL_W2V_FR_SHA256,
+    TOKENIZER_W2V_FR_URL,
+    TOKENIZER_W2V_FR_FILENAME,
+    TOKENIZER_W2V_FR_SHA256,
+  );
+  fetch_extra_align_fixture(
+    models_dir,
+    "WHISPERY_W2V_DE",
+    MODEL_W2V_DE_URL,
+    MODEL_W2V_DE_FILENAME,
+    MODEL_W2V_DE_SHA256,
+    TOKENIZER_W2V_DE_URL,
+    TOKENIZER_W2V_DE_FILENAME,
+    TOKENIZER_W2V_DE_SHA256,
+  );
+  fetch_extra_align_fixture(
+    models_dir,
+    "WHISPERY_W2V_IT",
+    MODEL_W2V_IT_URL,
+    MODEL_W2V_IT_FILENAME,
+    MODEL_W2V_IT_SHA256,
+    TOKENIZER_W2V_IT_URL,
+    TOKENIZER_W2V_IT_FILENAME,
+    TOKENIZER_W2V_IT_SHA256,
+  );
+  fetch_extra_align_fixture(
+    models_dir,
+    "WHISPERY_W2V_PT",
+    MODEL_W2V_PT_URL,
+    MODEL_W2V_PT_FILENAME,
+    MODEL_W2V_PT_SHA256,
+    TOKENIZER_W2V_PT_URL,
+    TOKENIZER_W2V_PT_FILENAME,
+    TOKENIZER_W2V_PT_SHA256,
+  );
 }
 
 /// Fetch + SHA-verify a multi-language alignment fixture pair
@@ -297,6 +424,7 @@ fn fetch_wav2vec2_fixtures(models_dir: &std::path::Path) {
 /// returns silently — tests guard the fixtures with `option_env!`,
 /// so a partial-fixture state just makes the corresponding test
 /// skip rather than fail the build.
+#[allow(clippy::too_many_arguments)]
 fn fetch_extra_align_fixture(
   models_dir: &std::path::Path,
   env_prefix: &str,
@@ -378,7 +506,7 @@ fn find_target_dir() -> Option<PathBuf> {
 fn download(url: &str, dest: &std::path::Path) -> std::io::Result<()> {
   let resp = ureq::get(url)
     .call()
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    .map_err(|e| std::io::Error::other(format!("{e}")))?;
   // ureq 3: response → body → reader (was a single `into_reader()` call in ureq 2).
   let mut reader = resp.into_body().into_reader();
   let mut writer = fs::File::create(dest)?;

@@ -7,12 +7,14 @@
 mod chinese;
 mod english;
 mod japanese;
+mod latin;
 #[cfg(test)]
 mod tests;
 
 pub use chinese::ChineseNormalizer;
 pub use english::EnglishNormalizer;
 pub use japanese::JapaneseNormalizer;
+pub use latin::LatinNormalizer;
 
 use crate::{runner::aligner::normalizer::TextNormalizer, types::Lang};
 
@@ -92,7 +94,7 @@ pub fn default_normalizer_for(lang: &Lang) -> Option<alloc::boxed::Box<dyn TextN
     | Lang::Tr
     | Lang::Cs
     | Lang::Pl
-    | Lang::Lv => Some(Box::new(EnglishNormalizer::new())),
+    | Lang::Lv => Some(Box::new(LatinNormalizer::new(lang.clone()))),
 
     // Languages WhisperX supports but whispery has no normalizer
     // for yet (different scripts that need custom punctuation /

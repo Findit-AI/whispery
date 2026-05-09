@@ -1825,4 +1825,116 @@ mod tests {
       .expect("Zh aligner empty-text must short-circuit Ok");
     assert!(result.words().is_empty());
   }
+
+  /// Helper for the Latin-language smoke tests below. Loads the
+  /// per-language wav2vec2 fixture (when present), wires in the
+  /// per-language `LatinNormalizer` via `default_normalizer_for`,
+  /// and exercises the empty-text short-circuit path that
+  /// doesn't require ONNX inference. Returns `None` when the
+  /// fixture isn't on disk so the calling test gracefully skips.
+  fn try_smoke_latin_aligner(
+    lang: Lang,
+    model_env: Option<&'static str>,
+    tokenizer_env: Option<&'static str>,
+  ) -> Option<()> {
+    use core::sync::atomic::AtomicBool;
+
+    use mediatime::{TimeRange, Timebase};
+
+    use crate::runner::aligner::default_normalizer_for;
+
+    let model_path = model_env?;
+    let tokenizer_path = tokenizer_env?;
+
+    let normalizer = default_normalizer_for(&lang).expect("Latin lang must resolve a normalizer");
+    let mut aligner = Aligner::from_paths(
+      lang.clone(),
+      Path::new(model_path),
+      Path::new(tokenizer_path),
+      normalizer,
+    )
+    .expect("Aligner::from_paths(Latin)");
+
+    let samples = alloc::vec![0.0_f32; 16_000];
+    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let abort = AtomicBool::new(false);
+    let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
+    let result = aligner
+      .align(
+        &samples,
+        &sub_segments,
+        /* text: */ "!!!...",
+        /* chunk_first_sample_in_stream: */ 0,
+        |start, end| {
+          TimeRange::new(
+            start as i64,
+            end as i64,
+            Timebase::new(1, core::num::NonZeroU32::new(16_000).unwrap()),
+          )
+        },
+        &abort,
+        &run_options,
+      )
+      .expect("Latin aligner empty-text must short-circuit Ok");
+    assert!(
+      result.words().is_empty(),
+      "{lang:?} aligner empty-text must yield zero words"
+    );
+    Some(())
+  }
+
+  /// Spanish smoke test — gracefully skips when the ES fixture
+  /// isn't on disk (mirror SHA still TODO).
+  #[test]
+  fn spanish_aligner_loads_and_short_circuits_on_empty_text() {
+    let _ = try_smoke_latin_aligner(
+      Lang::Es,
+      option_env!("WHISPERY_W2V_ES_MODEL"),
+      option_env!("WHISPERY_W2V_ES_TOKENIZER"),
+    );
+  }
+
+  /// French smoke test — gracefully skips when the FR fixture
+  /// isn't on disk.
+  #[test]
+  fn french_aligner_loads_and_short_circuits_on_empty_text() {
+    let _ = try_smoke_latin_aligner(
+      Lang::Fr,
+      option_env!("WHISPERY_W2V_FR_MODEL"),
+      option_env!("WHISPERY_W2V_FR_TOKENIZER"),
+    );
+  }
+
+  /// German smoke test — gracefully skips when the DE fixture
+  /// isn't on disk.
+  #[test]
+  fn german_aligner_loads_and_short_circuits_on_empty_text() {
+    let _ = try_smoke_latin_aligner(
+      Lang::De,
+      option_env!("WHISPERY_W2V_DE_MODEL"),
+      option_env!("WHISPERY_W2V_DE_TOKENIZER"),
+    );
+  }
+
+  /// Italian smoke test — gracefully skips when the IT fixture
+  /// isn't on disk.
+  #[test]
+  fn italian_aligner_loads_and_short_circuits_on_empty_text() {
+    let _ = try_smoke_latin_aligner(
+      Lang::It,
+      option_env!("WHISPERY_W2V_IT_MODEL"),
+      option_env!("WHISPERY_W2V_IT_TOKENIZER"),
+    );
+  }
+
+  /// Portuguese smoke test — gracefully skips when the PT
+  /// fixture isn't on disk.
+  #[test]
+  fn portuguese_aligner_loads_and_short_circuits_on_empty_text() {
+    let _ = try_smoke_latin_aligner(
+      Lang::Pt,
+      option_env!("WHISPERY_W2V_PT_MODEL"),
+      option_env!("WHISPERY_W2V_PT_TOKENIZER"),
+    );
+  }
 }
