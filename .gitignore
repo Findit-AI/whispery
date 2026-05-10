@@ -22,3 +22,10 @@ Cargo.lock
 target/whispery-test-fixtures/
 docs/
 models/
+
+# Audio parity fixtures live in https://github.com/Findit-AI/audio-fixtures.
+# CI (or `scripts/fetch_fixtures.sh` for local runs) populates
+# tests/parity/fixtures/ at test time. The directory MUST stay
+# untracked here so the ~283 MB of WAV blobs never end up in
+# whispery's git history.
+tests/parity/fixtures/

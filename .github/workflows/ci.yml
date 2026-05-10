@@ -156,6 +156,18 @@ jobs:
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable
+    # Audio parity fixtures (~283 MB of WAV + RTTM) live in the
+    # sibling repo `Findit-AI/audio-fixtures`, NOT in whispery's
+    # git history. The fetch is opt-in via
+    # `WHISPERY_FETCH_FIXTURES=1` so the default `cargo test`
+    # path stays network-free and fast. Tests that need the
+    # fixtures gate themselves on the populated path
+    # (`tests/parity/fixtures/<name>/clip_16k.wav`) and
+    # short-circuit when absent.
+    - name: Fetch audio parity fixtures
+      if: env.WHISPERY_FETCH_FIXTURES == '1'
+      shell: bash
+      run: bash scripts/fetch_fixtures.sh
     - name: Run test
       # Explicit feature combos — see build job for rationale.
       run: |
@@ -219,6 +231,10 @@ jobs:
           key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-coverage-
+      - name: Fetch audio parity fixtures
+        if: env.WHISPERY_FETCH_FIXTURES == '1'
+        shell: bash
+        run: bash scripts/fetch_fixtures.sh
       - name: Run tarpaulin
         env:
           RUSTFLAGS: "--cfg tarpaulin"

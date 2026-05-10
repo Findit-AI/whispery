@@ -115,8 +115,22 @@ the caller's responsibility — pass model paths into
 and set `ORT_DYLIB_PATH` to your `libonnxruntime` (see "ONNX
 Runtime" below). `cargo build` makes no network requests.
 
-Plain `cargo build` makes no network requests; fixture
-downloads only run when both env vars are set.
+### Audio parity fixtures (~283 MB)
+
+Whispery's parity tests reference 14 WAV clips + RTTM speaker
+annotations stored out-of-tree at
+[Findit-AI/audio-fixtures](https://github.com/Findit-AI/audio-fixtures).
+Populate them locally with:
+
+```bash
+bash scripts/fetch_fixtures.sh
+```
+
+The script shallow-clones the sibling repo, lays files out
+under `tests/parity/fixtures/<name>/{clip_16k.wav,reference.rttm}`
+(the layout existing tests expect), and is idempotent. CI
+runs the same script when `WHISPERY_FETCH_FIXTURES=1` is set
+on the workflow run; default `cargo test` stays network-free.
 
 ## ONNX Runtime
 
