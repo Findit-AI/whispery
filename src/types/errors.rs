@@ -4,7 +4,7 @@
 //!
 //! - [`TranscriberError`] is for state-machine push/inject failures
 //!   returned synchronously from `Transcriber::push_*` /
-//!   `inject_*` / `restart_at`.
+//!   `inject_*` / `handle_restart`.
 //! - [`WorkFailure`] is for per-chunk inference failures surfaced
 //!   asynchronously via `Event::Error { chunk_id, error: WorkFailure }`
 //!   (drained by `poll_event`).
@@ -30,7 +30,7 @@ pub enum TranscriberError {
 
   /// Forward gap exceeds the configured tolerance. Caller likely
   /// has a stream restart or a packet drop larger than expected.
-  /// Recover via `Transcriber::restart_at`.
+  /// Recover via `Transcriber::handle_restart`.
   #[error("forward gap {gap_samples} samples exceeds tolerance {tolerance_samples}")]
   GapExceedsTolerance {
     /// Size of the forward gap in 16 kHz samples.
@@ -51,17 +51,17 @@ pub enum TranscriberError {
     cap: usize,
   },
 
-  /// `push_vad_segment` was called before any `push_samples`. The
+  /// `handle_vad_segment` was called before any `handle_samples`. The
   /// output timebase is not yet established.
-  #[error("push_vad_segment called before any push_samples")]
+  #[error("handle_vad_segment called before any handle_samples")]
   OutputTimebaseUnset,
 
-  /// `push_vad_segment` referenced audio that has not been
+  /// `handle_vad_segment` referenced audio that has not been
   /// buffered yet — `seg.end_sample()` is past the buffer's
   /// high-water mark. This typically indicates upstream
   /// VAD/sample skew (the caller pushed VAD ahead of the
   /// corresponding audio packets). Without this guard, a later
-  /// `signal_eof` flush or chunk emission would `extract` past
+  /// `handle_eof` flush or chunk emission would `extract` past
   /// the buffer's tail and panic.
   #[error("VAD segment end {vad_end} is past buffered samples {buffered}")]
   VadAheadOfAudio {
@@ -71,7 +71,7 @@ pub enum TranscriberError {
     buffered: u64,
   },
 
-  /// `push_samples` was called with a `Timestamp` whose timebase
+  /// `handle_samples` was called with a `Timestamp` whose timebase
   /// does not match the timebase recorded from the first push.
   #[error("inconsistent output timebase: expected {expected:?}, got {got:?}")]
   InconsistentTimebase {
@@ -98,10 +98,10 @@ pub enum TranscriberError {
   #[error("unknown or already-resolved chunk_id {0}")]
   UnknownChunk(ChunkId),
 
-  /// Caller called `signal_eof` and then attempted to push or
-  /// `restart_at`. Once a stream is ended it cannot be re-anchored;
+  /// Caller called `handle_eof` and then attempted to push or
+  /// `handle_restart`. Once a stream is ended it cannot be re-anchored;
   /// construct a fresh `Transcriber` instead.
-  #[error("operation rejected after signal_eof")]
+  #[error("operation rejected after handle_eof")]
   AfterEof,
 }
 
@@ -195,9 +195,9 @@ pub enum AlignmentFailureKind {
 /// Which input kind triggered a `PtsRegression`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PushKind {
-  /// `push_samples`.
+  /// `handle_samples`.
   Samples,
-  /// `push_vad_segment`.
+  /// `handle_vad_segment`.
   VadSegment,
 }
 

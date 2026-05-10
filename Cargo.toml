@@ -171,7 +171,13 @@ bench-internals = ["alignment"]
 # guard against silently aligning pronounced symbols (`&` in `AT&T`)
 # to whichever vocab item happens to win the frame. Off by default;
 # opt in only if downstream consumers expect WhisperX-1:1 behaviour.
-whisperx-strict-tokenizer = ["alignment"]
+# `whisperx-strict-tokenizer` feature removed in the Sans-I/O OOV
+# refactor. The runtime equivalent is now
+# `wildcard_all_decisions(&oov_events)` from `core::oov` —
+# pass the resulting `Vec<OovDecision>` to
+# `AlignWorkItem::from_run_alignment` (or
+# `Aligner::align_chunk_with_abort`). Per-deployment policy is
+# data, not a compile-time flag.
 # Diagnostic-only: write `wy_seg<N>.{emission,trellis}.bin` and a
 # `wy_seg<N>.tokens.json` companion to the directory pointed to by
 # `WHISPERY_PARITY_DUMP_TRELLIS` whenever set on a process running

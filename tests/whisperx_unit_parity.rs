@@ -189,15 +189,47 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
 }
 
 /// Run align() end-to-end on `text` with `num_frames` frames over
-/// `duration_s` seconds. Returns one `AlignedWord` per non-empty
-/// word in the text (mirroring WhisperX's `result["word_segments"]`).
+/// `duration_s` seconds. Uses whispery's historical default OOV
+/// policy. Returns one `AlignedWord` per non-empty word in the
+/// text (mirroring WhisperX's `result["word_segments"]`).
 fn run_align(text: &str, num_frames: usize, duration_s: f32) -> Vec<AlignedWord> {
+  run_align_with_policy(
+    text,
+    num_frames,
+    duration_s,
+    whispery::core::default_oov_decisions,
+  )
+}
+
+/// Like [`run_align`] but the caller picks the OOV policy as
+/// a `fn(&[OovEvent]) -> Vec<ResolvedOov>` (e.g.
+/// `wildcard_all_decisions`, `fail_closed_all_decisions`, or
+/// a custom helper). The Sans-I/O entry point — every other
+/// test in this file is `run_align(...)` (default policy).
+fn run_align_with_policy(
+  text: &str,
+  num_frames: usize,
+  duration_s: f32,
+  policy: fn(&[whispery::core::OovEvent]) -> Vec<whispery::core::ResolvedOov>,
+) -> Vec<AlignedWord> {
   let tokenizer = load_tokenizer();
   let unk = tokenizer.token_to_id("<unk>");
   let words: Vec<&str> = text.split_whitespace().collect();
   let word_count = words.len();
 
-  let tokenized = tokenize_with_word_map(
+  let oov_events = whispery::__bench::detect_oov_events(
+    &tokenizer,
+    text,
+    word_count,
+    /* uppercase_input: */ true,
+    unk,
+    &Lang::En,
+    /* wildcard_boundary_per_word: */ &[],
+  )
+  .expect("OOV detection must succeed");
+  let oov_decisions = policy(&oov_events);
+
+  let tokenize_result = tokenize_with_word_map(
     &tokenizer,
     text,
     word_count,
@@ -206,8 +238,17 @@ fn run_align(text: &str, num_frames: usize, duration_s: f32) -> Vec<AlignedWord>
     /* unk_token_id: */ unk,
     /* wildcard_boundary_per_word: */ &[],
     &Lang::En,
-  )
-  .expect("tokenize must succeed (or chunk-drop, in which case empty)");
+    &oov_decisions,
+  );
+  let tokenized = match tokenize_result {
+    Ok(t) => t,
+    Err(_) => {
+      // FailClosed path: chunk-drop equivalent. Mirror
+      // WhisperX's "no word_segments" response by returning
+      // empty.
+      return Vec::new();
+    }
+  };
 
   // Whispery's chunk-drop path returns empty token_ids. Mirror
   // WhisperX's "no word_segments" response by returning empty.
@@ -372,7 +413,13 @@ fn known_neighbour_score_is_positive_around_unknown() {
 }
 
 // =====================================================================
-// Strategy 2 + 3: test 7 — gated on `whisperx-strict-tokenizer`.
+// Test 7 — formerly gated on the removed
+// `whisperx-strict-tokenizer` Cargo feature, now unconditional:
+// the test calls `tokenize_with_word_map` with
+// `wildcard_all_decisions` (the runtime equivalent the feature
+// flipped to). Default policy is whispery's
+// `default_oov_decisions` (run_align uses that); test 7 opts
+// into the WhisperX 1:1 policy via data, no Cargo feature.
 // =====================================================================
 
 /// **Test 7** (regression for whisperX issue #1372): `"4,9"` (digits
@@ -380,24 +427,26 @@ fn known_neighbour_score_is_positive_around_unknown() {
 ///
 /// Whispery's default policy drops the chunk because `,` is a non-
 /// alphanumeric pronounced char (the German speaker pronounces it
-/// "Komma"). Under `whisperx-strict-tokenizer` the chunk-drop is
-/// relaxed and the comma wildcards, matching WhisperX 1:1.
-///
-/// Compiled only when the relaxed feature is on. Without the
-/// feature, the test is skipped at the `#[cfg]` gate (whispery's
-/// default behaviour is correct: drop the chunk, surface no word
-/// for `4,9`).
-#[cfg(feature = "whisperx-strict-tokenizer")]
+/// "Komma"). Calling `tokenize_with_word_map` with
+/// `wildcard_all_decisions` opts into WhisperX's `*` placeholder
+/// behaviour 1:1 — the comma wildcards instead of dropping.
 #[test]
 fn issue_1372_digits_comma_no_timestamps() {
-  // 200 frames — WhisperX's regression reproducer uses the same
-  // higher frame count because the German sentence is long.
-  let result = run_align("halt mit 4,9 nicht ins parlament", 200, DEFAULT_DURATION_S);
+  // 200 frames — WhisperX's regression reproducer uses the
+  // same higher frame count because the German sentence is
+  // long. Use `wildcard_all_decisions` to opt into WhisperX's
+  // `*` placeholder behaviour for the pronounced comma.
+  let result = run_align_with_policy(
+    "halt mit 4,9 nicht ins parlament",
+    200,
+    DEFAULT_DURATION_S,
+    whispery::core::wildcard_all_decisions,
+  );
   let by_word: std::collections::HashMap<&str, &AlignedWord> =
     result.iter().map(|w| (w.word.as_str(), w)).collect();
   let target = by_word.get("4,9").unwrap_or_else(|| {
     panic!(
-      "'4,9' must align under whisperx-strict-tokenizer; got {:?}",
+      "'4,9' must align under wildcard_all_decisions; got {:?}",
       result.iter().map(|w| &w.word).collect::<Vec<_>>()
     )
   });

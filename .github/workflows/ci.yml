@@ -64,7 +64,7 @@ jobs:
         cargo clippy
         cargo clippy --features alignment
         cargo clippy --features alignment,serde
-        cargo clippy --features alignment,whisperx-strict-tokenizer
+        cargo clippy --features alignment,bench-internals
         if [ "$RUNNER_OS" = "macOS" ]; then
           cargo clippy --features alignment,metal,coreml
         fi
@@ -126,7 +126,7 @@ jobs:
         cargo build
         cargo build --features alignment
         cargo build --features alignment,serde
-        cargo build --features alignment,whisperx-strict-tokenizer
+        cargo build --features alignment,bench-internals
         if [ "$RUNNER_OS" = "macOS" ]; then
           cargo build --features alignment,metal,coreml
         fi
@@ -175,7 +175,7 @@ jobs:
         cargo test
         cargo test --features alignment
         cargo test --features alignment,serde
-        cargo test --features alignment,whisperx-strict-tokenizer
+        cargo test --features alignment,bench-internals
       shell: bash
 
   # valgrind:
@@ -241,7 +241,7 @@ jobs:
         # Coverage runs Linux. `metal` / `coreml` need
         # Apple frameworks; diagnostic toggles ship internals.
         # Cover the full default-runner-and-alignment surface.
-        run: cargo tarpaulin --features alignment,serde,whisperx-strict-tokenizer --run-types tests --run-types doctests --workspace --out xml
+        run: cargo tarpaulin --features alignment,serde,bench-internals --run-types tests --run-types doctests --workspace --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v6
         with:

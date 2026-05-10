@@ -191,7 +191,7 @@ impl Cut {
   /// the configured `flush_on_silence_gap` threshold. Returns
   /// `false` if no chunk is accumulating yet.
   ///
-  /// `signal_no_speech_through` calls this to pre-flush whenever a
+  /// `handle_no_speech_through` calls this to pre-flush whenever a
   /// hypothetical future segment at `sample_index` would have
   /// triggered a flush — the caller has already declared that no
   /// such segment is coming, so the partial chunk can yield now

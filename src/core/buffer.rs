@@ -24,7 +24,7 @@ pub(crate) struct SampleBuffer {
   /// first push.
   base_pts_out_anchor: i64,
   /// Total samples ever appended (monotonic; reset only by
-  /// `restart_at`).
+  /// `handle_restart`).
   absolute_sample_offset: u64,
   /// Samples dropped by trim (monotonic).
   buffer_drop_offset: u64,
@@ -58,7 +58,7 @@ impl SampleBuffer {
   }
 
   /// PTS-anchor at stream-zero, in the current output timebase.
-  /// Mutates only on `restart_at`; chunks extracted within a
+  /// Mutates only on `handle_restart`; chunks extracted within a
   /// single between-restart epoch share this value. The
   /// alignment dispatch snapshots it onto each chunk record at
   /// extract time so post-restart word-mapping for surviving
@@ -228,7 +228,7 @@ impl SampleBuffer {
     Ok(())
   }
 
-  /// Total samples ever appended (after restart_at, this restarts
+  /// Total samples ever appended (after handle_restart, this restarts
   /// from 0). Crate-private; the cut state machine consumes this.
   pub(crate) fn absolute_sample_offset(&self) -> u64 {
     self.absolute_sample_offset
@@ -282,7 +282,7 @@ impl SampleBuffer {
   /// pair onto each chunk record at extract time (see
   /// `dispatch::ChunkRecord::output_tb`) and feeds it back here
   /// at alignment-dispatch time, so word ranges stay anchored in
-  /// the chunk's own PTS epoch even after a `restart_at` shifts
+  /// the chunk's own PTS epoch even after a `handle_restart` shifts
   /// the live buffer onto a new one.
   ///
   /// Conversion math is identical to
@@ -319,13 +319,13 @@ impl SampleBuffer {
     self.buffer_drop_offset += drop_count as u64;
   }
 
-  /// Reset the buffer's anchor for `restart_at`. Clears the live
+  /// Reset the buffer's anchor for `handle_restart`. Clears the live
   /// `Vec<f32>`, sets `base_pts_out_anchor` to `starts_at.pts()`,
   /// and zeroes both offsets so the next push starts a fresh
   /// contiguous segment with `delta_pts_out == 0` exactly.
   /// Pre-restart in-flight chunks are unaffected — they hold their
   /// audio in their own `Arc<[f32]>`s.
-  pub(crate) fn restart_at(&mut self, starts_at: Timestamp) {
+  pub(crate) fn handle_restart(&mut self, starts_at: Timestamp) {
     self.output_tb = Some(starts_at.timebase());
     self.base_pts_out_anchor = starts_at.pts();
     self.absolute_sample_offset = 0;
@@ -553,10 +553,10 @@ mod tests {
   }
 
   #[test]
-  fn restart_at_resets_offsets_and_anchor() {
+  fn handle_restart_resets_offsets_and_anchor() {
     let mut b = SampleBuffer::new(1_000_000, 3200);
     b.append(ts_at_48k(0), &[1.0; 1000], 0).unwrap();
-    b.restart_at(ts_at_48k(50_000_000));
+    b.handle_restart(ts_at_48k(50_000_000));
     assert_eq!(b.absolute_sample_offset(), 0);
     assert_eq!(b.buffer_drop_offset(), 0);
     assert_eq!(b.buffered_samples(), 0);

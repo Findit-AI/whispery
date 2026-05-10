@@ -7,7 +7,7 @@
 //!   sample-index space.
 //! - **External (output) timebase = caller-chosen.** Every public
 //!   [`mediatime::TimeRange`] whispery emits is in the timebase of
-//!   the caller's first `push_samples` call.
+//!   the caller's first `handle_samples` call.
 
 use core::num::NonZeroU32;
 use mediatime::Timebase;

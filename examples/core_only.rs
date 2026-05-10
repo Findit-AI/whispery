@@ -20,22 +20,23 @@ fn main() {
 
   // Push 4 seconds of audio at 16 kHz internal = 64_000 samples.
   let samples = vec![0.0_f32; 64_000];
-  t.push_samples(Timestamp::new(0, output_tb), &samples)
+  t.handle_samples(Timestamp::new(0, output_tb), &samples)
     .unwrap();
 
   // Two VAD segments, each ~2 s.
-  t.push_vad_segment(VadSegment::new(0, 32_000)).unwrap();
-  t.push_vad_segment(VadSegment::new(32_000, 64_000)).unwrap();
-  t.signal_eof().unwrap();
+  t.handle_vad_segment(VadSegment::new(0, 32_000)).unwrap();
+  t.handle_vad_segment(VadSegment::new(32_000, 64_000))
+    .unwrap();
+  t.handle_eof().unwrap();
 
   // Drain commands, feed mocked results back.
   while let Some(cmd) = t.poll_command() {
     match cmd {
-      Command::RunAsr {
+      Command::Asr {
         chunk_id, samples, ..
       } => {
         println!("[asr] chunk {} ({} samples)", chunk_id, samples.len());
-        t.inject_asr_result(
+        t.handle_asr(
           chunk_id,
           AsrResult::new(
             format!("(mock transcript for chunk {})", chunk_id).into(),
@@ -47,7 +48,7 @@ fn main() {
         )
         .unwrap();
       }
-      Command::RunAlignment { .. } => {
+      Command::Alignment { .. } => {
         unreachable!("alignment off in this example");
       }
     }

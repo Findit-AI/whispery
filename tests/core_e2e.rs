@@ -29,25 +29,27 @@ fn happy_path_three_chunks_emit_in_order() {
 
   // Push 6 seconds of audio at 16 kHz = 96_000 samples, anchored
   // at output PTS 0 with timebase 1/48000.
-  t.push_samples(ts(0), &vec![0.0_f32; 96_000]).unwrap();
+  t.handle_samples(ts(0), &vec![0.0_f32; 96_000]).unwrap();
 
   // Three VAD segments, each ~2 seconds long. cut_size = 2s, so
   // each segment closes one chunk on the *next* segment's push.
-  t.push_vad_segment(VadSegment::new(0, 32_000)).unwrap();
-  t.push_vad_segment(VadSegment::new(32_000, 64_000)).unwrap();
-  t.push_vad_segment(VadSegment::new(64_000, 96_000)).unwrap();
-  t.signal_eof().unwrap();
+  t.handle_vad_segment(VadSegment::new(0, 32_000)).unwrap();
+  t.handle_vad_segment(VadSegment::new(32_000, 64_000))
+    .unwrap();
+  t.handle_vad_segment(VadSegment::new(64_000, 96_000))
+    .unwrap();
+  t.handle_eof().unwrap();
 
   // Drain commands and feed back results.
   let mut chunk_ids = Vec::new();
   while let Some(cmd) = t.poll_command() {
     match cmd {
-      Command::RunAsr { chunk_id, .. } => {
+      Command::Asr { chunk_id, .. } => {
         chunk_ids.push(chunk_id);
-        t.inject_asr_result(chunk_id, happy_asr_result(&format!("c{}", chunk_id)))
+        t.handle_asr(chunk_id, happy_asr_result(&format!("c{}", chunk_id)))
           .unwrap();
       }
-      Command::RunAlignment { .. } => panic!("alignment off in this test"),
+      Command::Alignment { .. } => panic!("alignment off in this test"),
     }
   }
 
@@ -76,13 +78,15 @@ fn out_of_order_completion_emits_in_chunk_id_order() {
     .with_language_policy(LanguagePolicy::Auto);
   let mut t = Transcriber::new(config);
 
-  t.push_samples(ts(0), &vec![0.0_f32; 64_000]).unwrap();
-  t.push_vad_segment(VadSegment::new(0, 16_000)).unwrap();
-  t.push_vad_segment(VadSegment::new(16_000, 32_000)).unwrap();
-  t.push_vad_segment(VadSegment::new(32_000, 48_000)).unwrap();
-  t.signal_eof().unwrap();
+  t.handle_samples(ts(0), &vec![0.0_f32; 64_000]).unwrap();
+  t.handle_vad_segment(VadSegment::new(0, 16_000)).unwrap();
+  t.handle_vad_segment(VadSegment::new(16_000, 32_000))
+    .unwrap();
+  t.handle_vad_segment(VadSegment::new(32_000, 48_000))
+    .unwrap();
+  t.handle_eof().unwrap();
 
-  // Issue all RunAsr commands.
+  // Issue all Asr commands.
   let mut commands = Vec::new();
   while let Some(cmd) = t.poll_command() {
     commands.push(cmd);
@@ -91,9 +95,8 @@ fn out_of_order_completion_emits_in_chunk_id_order() {
 
   // Resolve in reverse order.
   for cmd in commands.into_iter().rev() {
-    if let Command::RunAsr { chunk_id, .. } = cmd {
-      t.inject_asr_result(chunk_id, happy_asr_result("x"))
-        .unwrap();
+    if let Command::Asr { chunk_id, .. } = cmd {
+      t.handle_asr(chunk_id, happy_asr_result("x")).unwrap();
     }
   }
 

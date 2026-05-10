@@ -10,7 +10,7 @@ use crate::types::TranscriberError;
 /// inference failure surfaced asynchronously via `Event::Error`.
 /// `RunnerError` is returned synchronously from
 /// [`crate::runner::ManagedTranscriber::process_packet`],
-/// `signal_eof`, `drain`, the builder's `build`, and (with the
+/// `handle_eof`, `drain`, the builder's `build`, and (with the
 /// `alignment` feature) `Aligner::from_paths`.
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {

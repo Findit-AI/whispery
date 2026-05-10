@@ -57,7 +57,7 @@ impl Transcript {
   }
 
   /// Bounds of the merged chunk in the caller's output timebase
-  /// (the timebase of the first `push_samples` Timestamp).
+  /// (the timebase of the first `handle_samples` Timestamp).
   pub fn range(&self) -> TimeRange {
     self.range
   }

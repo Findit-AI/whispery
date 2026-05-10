@@ -51,10 +51,49 @@ pub struct NormalizedText<'a> {
   /// of the word's encoded chars, making leading and trailing
   /// punctuation indistinguishable in the CTC graph.
   ///
-  /// `(prefix, suffix) = (left_stripped_count, right_stripped_count)`.
   /// Empty (zero-length) means "no wildcard padding tracked";
-  /// every word interpreted as `(0, 0)`.
-  wildcard_boundary_per_word: Vec<(u32, u32)>,
+  /// every word interpreted as `WildcardBoundary { prefix: 0,
+  /// suffix: 0 }`.
+  wildcard_boundary_per_word: Vec<WildcardBoundary>,
+}
+
+/// Per-word boundary wildcard counts produced by a
+/// [`TextNormalizer`] when it strips leading / trailing
+/// punctuation. The downstream tokeniser
+/// (`tokenize_with_word_map`) consults this per word to decide
+/// how many `WILDCARD_TOKEN_ID` tokens to emit on each side of
+/// the encoded letter chars; CTC alignment treats those
+/// wildcards as "match any non-blank vocab item" so the
+/// alignment doesn't lose frames over the stripped char.
+///
+/// Replaces the historical `(u32, u32)` tuple shape. Carrying a
+/// named struct gives the boundary count a stable type identity
+/// (the prefix vs suffix distinction can't accidentally swap on
+/// destructuring, and downstream code reads as
+/// `boundary.prefix` instead of `boundary.0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct WildcardBoundary {
+  /// Number of leading-punctuation chars the normaliser
+  /// stripped from this word's source form. The tokeniser
+  /// emits this many `WILDCARD_TOKEN_ID` tokens BEFORE the
+  /// word's encoded letter chars so leading punctuation like
+  /// `"hello` aligns its `*` placeholders ahead of `h, e, l,
+  /// l, o`.
+  pub prefix: u32,
+  /// Number of trailing-punctuation chars the normaliser
+  /// stripped from this word's source form. Tokens emitted
+  /// AFTER the encoded chars; mirrors the prefix story for
+  /// trailing punct like `hello"`.
+  pub suffix: u32,
+}
+
+impl WildcardBoundary {
+  /// Convenience: zero on both sides — i.e. "no boundary
+  /// wildcards for this word".
+  pub const NONE: Self = Self {
+    prefix: 0,
+    suffix: 0,
+  };
 }
 
 impl<'a> NormalizedText<'a> {
@@ -69,14 +108,14 @@ impl<'a> NormalizedText<'a> {
     }
   }
 
-  /// Construct with explicit per-word `(prefix, suffix)` wildcard
-  /// counts. Length must match `original_words`. Panics on length
-  /// mismatch because the count is structurally tied to word
-  /// indexing.
+  /// Construct with explicit per-word [`WildcardBoundary`]
+  /// counts. Length must match `original_words`. Panics on
+  /// length mismatch because the count is structurally tied
+  /// to word indexing.
   pub fn with_wildcards(
     normalized: String,
     original_words: Vec<Cow<'a, str>>,
-    wildcard_boundary_per_word: Vec<(u32, u32)>,
+    wildcard_boundary_per_word: Vec<WildcardBoundary>,
   ) -> Self {
     assert_eq!(
       original_words.len(),
@@ -100,11 +139,10 @@ impl<'a> NormalizedText<'a> {
     &self.original_words
   }
 
-  /// Per-word `(prefix, suffix)` wildcard char counts, or empty
-  /// if the normaliser didn't track them. See
-  /// [`Self::with_wildcards`] / [`Self::new`] for how this is
-  /// populated.
-  pub fn wildcard_boundary_per_word(&self) -> &[(u32, u32)] {
+  /// Per-word [`WildcardBoundary`] counts, or empty if the
+  /// normaliser didn't track them. See [`Self::with_wildcards`]
+  /// / [`Self::new`] for how this is populated.
+  pub fn wildcard_boundary_per_word(&self) -> &[WildcardBoundary] {
     &self.wildcard_boundary_per_word
   }
 }

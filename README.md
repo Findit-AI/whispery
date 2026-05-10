@@ -111,23 +111,44 @@ let abort_flag = Arc::new(AtomicBool::new(false));
 
 while let Some(cmd) = transcriber.poll_command() {
   match cmd {
-    Command::RunAsr { chunk_id, samples, params, .. } => {
+    Command::Asr { chunk_id, samples, params, .. } => {
       let result = asr_source.run_chunk(AsrChunkContext {
         samples: &samples, params: &params,
         abort_flag: &abort_flag, chunk_id,
       })?;
-      transcriber.inject_asr_result(chunk_id, result)?;
+      transcriber.handle_asr(chunk_id, result)?;
     }
-    Command::RunAlignment { chunk_id, samples, sub_segments: _, text, language, runs } => {
+    Command::Alignment { chunk_id, samples, sub_segments: _, text, language, runs } => {
+      // Sans-I/O OOV resolution: per-run detect + decide.
+      // Each run gets its own decisions vec sized + ordered
+      // by the events `detect_oov` produces for that run's
+      // text + language. Whole-chunk fallback (when `runs`
+      // is empty) gets one inner vec.
+      // `default_oov_decisions` mirrors the historical
+      // behaviour (alphanumeric → wildcard, pronounced
+      // symbols → fail-closed); swap for
+      // `wildcard_all_decisions` (WhisperX 1:1) or write
+      // your own per-run / per-language policy.
+      let oov_decisions: Vec<Vec<whispery::core::ResolvedOov>> = if runs.is_empty() {
+        let events = alignment_set.detect_oov(&text, &language)?;
+        vec![whispery::core::default_oov_decisions(&events)]
+      } else {
+        alignment_set.detect_oov_per_run(&runs)?
+          .iter()
+          .map(|events| whispery::core::default_oov_decisions(events))
+          .collect()
+      };
+
       let job = AlignWorkItem::from_run_alignment(
         &transcriber, chunk_id, samples, text, language,
         runs, abort_flag.clone(),
+        oov_decisions,
       ).expect("chunk in flight");
       // Fresh `RunOptions` per chunk so a watchdog's
       // `terminate()` for chunk N does not poison chunk N+1.
       let run_options = RunOptions::new()?;
       let aligned = run_one_alignment(&alignment_set, &job, &run_options)?;
-      transcriber.inject_alignment_result(chunk_id, aligned)?;
+      transcriber.handle_alignment(chunk_id, aligned)?;
     }
   }
 }
@@ -160,19 +181,18 @@ between coarse stages too.
 | `serde` | no | Derive `serde::{Serialize, Deserialize}` on public state-machine types (`Transcript`, `Word`, `AsrParams`, …). Implies `runner`. |
 | `metal` | no | Apple-only: enables `whispercpp/metal` so the encoder runs on the unified-memory Metal backend. Implies `runner`. |
 | `coreml` | no | Apple-only: enables `whispercpp/coreml` so the encoder additionally dispatches to ANE if the caller has produced a CoreML companion `.mlmodelc`. Implies `runner`. |
-| `whisperx-strict-tokenizer` | no | Wildcards every OOV character — including pronounced symbols (`&`, `@`, `%`, `,`) — matching WhisperX's `clean_char.append('*')` 1:1. Default whispery instead fails closed on pronounced OOV (returns `SemanticOutOfVocab` so the chunk's ASR transcript still ships but word timings are dropped + an `eprintln!` makes the drop observable). Opt in only if downstream consumers expect WhisperX-bit-equivalent output and accept the silent-misalignment risk on pronounced symbols. Implies `alignment`. |
 | `bench-internals` | no | Re-exports `pub(crate)` alignment internals (scalar/SIMD normaliser variants, raw `ctc_viterbi`, `LogProbsTV`) under `whispery::__bench` so the SIMD baseline bench can call them directly. Doc-hidden; never enable in shipping builds. Implies `alignment`. |
 | `parity-dump-emission` | no | Diagnostic-only: writes `wy_seg<N>.{emission,trellis}.bin` + a `wy_seg<N>.tokens.json` companion to `WHISPERY_PARITY_DUMP_TRELLIS` whenever set. Implies `alignment`. Do NOT enable in shipping builds. |
 
-The CTC parity tests run as part of the regular test suite — no
-feature flag required for the default policy:
+The CTC parity tests run as part of the regular test suite —
+the OOV policy is per-test runtime data (no Cargo feature):
 
 ```bash
 cargo test --features alignment,bench-internals --test whisperx_unit_parity
-# 7/7 (default policy)
-
-cargo test --features alignment,bench-internals,whisperx-strict-tokenizer --test whisperx_unit_parity
-# 8/8 (strict-tokenizer policy adds the `4,9` digits-comma case)
+# 8/8 — tests 1-6 + 8 use `default_oov_decisions` (whispery
+# default); test 7 (`4,9` digits-comma WhisperX issue #1372)
+# uses `wildcard_all_decisions` to opt into WhisperX 1:1
+# behaviour for pronounced symbols.
 ```
 
 These tests port WhisperX's

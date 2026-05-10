@@ -74,7 +74,7 @@ pub(crate) struct ChunkRecord {
   /// Held alongside [`Self::base_pts_out_anchor`] so the
   /// runner's alignment dispatch can rebuild a
   /// `samples_to_output_range` closure for *this* chunk's
-  /// epoch — necessary because `Transcriber::restart_at` resets
+  /// epoch — necessary because `Transcriber::handle_restart` resets
   /// the live buffer's anchor while in-flight chunks survive,
   /// so a fresh closure built post-restart would map this
   /// chunk's pre-restart sample indices through the wrong PTS
@@ -94,9 +94,9 @@ pub(crate) struct ChunkRecord {
 
 /// A chunk whose audio has been extracted from the live buffer and
 /// whose output-timebase ranges have been computed, but which has
-/// not yet been promoted to `in_flight` (no `RunAsr` command issued
+/// not yet been promoted to `in_flight` (no `Asr` command issued
 /// yet). `cut_pending` entries are stored as `ExtractedChunk` so
-/// they survive `restart_at`'s buffer reset without needing the old
+/// they survive `handle_restart`'s buffer reset without needing the old
 /// `draining_for_restart` bypass — and so the AutoLockAfter
 /// observation-window gate is preserved during recovery.
 #[derive(Debug)]
@@ -116,7 +116,7 @@ pub(crate) struct ExtractedChunk {
   /// onto [`ChunkRecord::output_tb`] so the runner's alignment
   /// dispatch can rebuild a per-chunk
   /// `samples_to_output_range` closure that survives a later
-  /// `restart_at`.
+  /// `handle_restart`.
   #[cfg(feature = "alignment")]
   pub output_tb: mediatime::Timebase,
   /// PTS anchor at stream-zero, captured at extract time. See
@@ -127,7 +127,7 @@ pub(crate) struct ExtractedChunk {
   /// Per-packet `AsrParamsOverride` snapshot captured at the
   /// moment this chunk was extracted from the live buffer. The
   /// runner stamps the dispatch's `current_override` here so a
-  /// `RunAsr` command emitted at promote time (which can happen
+  /// `Asr` command emitted at promote time (which can happen
   /// in a different `process_packet` call than the one that
   /// pushed the audio) carries the override that was active at
   /// chunk-creation time. Without this snapshot the runner used
@@ -165,7 +165,7 @@ impl ExtractedChunk {
       .collect();
     let sub_origins: Vec<SubOrigin> = chunk.subs.iter().map(|s| s.origin).collect();
     // Capture the output timebase + PTS anchor *now*, before
-    // any later `restart_at` shifts the buffer onto a new
+    // any later `handle_restart` shifts the buffer onto a new
     // epoch. Promoted to `ChunkRecord` at promote-time and
     // consulted at alignment-dispatch time.
     #[cfg(feature = "alignment")]
@@ -207,7 +207,7 @@ impl ExtractedChunk {
 pub(crate) struct Dispatch {
   /// Chunks emitted by Cut that haven't yet been promoted to
   /// `in_flight`. Stored as `ExtractedChunk` (audio already
-  /// pulled from the live buffer) so they survive `restart_at`'s
+  /// pulled from the live buffer) so they survive `handle_restart`'s
   /// buffer reset without bypassing the AutoLockAfter gate.
   pub cut_pending: VecDeque<ExtractedChunk>,
   pub in_flight: BTreeMap<ChunkId, ChunkRecord>,
@@ -218,7 +218,7 @@ pub(crate) struct Dispatch {
   pub max_in_flight: usize,
   pub asr_params: AsrParams,
   /// Language detection / locking strategy. Applied at promote
-  /// time (sets `RunAsr.params.language_hint` based on the policy
+  /// time (sets `Asr.params.language_hint` based on the policy
   /// + the most recent locked-language detection).
   pub language_policy: LanguagePolicy,
   /// The language to lock subsequent ASR commands to, once a lock
@@ -287,7 +287,7 @@ impl Dispatch {
     // first promotion already applies the hint. Auto and
     // AutoLockAfter both start with no lock; AutoLockAfter
     // populates locked_language after observing n non-empty
-    // results in inject_asr_result.
+    // results in handle_asr.
     let locked_language = match &language_policy {
       LanguagePolicy::Lock { hint } => Some(hint.clone()),
       _ => None,
@@ -336,9 +336,9 @@ impl Dispatch {
 
   /// Called by `Transcriber` whenever the cut state machine emits
   /// a `MergedChunk`. Always pre-extracts the chunk's audio (so it
-  /// survives later `restart_at` buffer resets), then either
+  /// survives later `handle_restart` buffer resets), then either
   /// promotes the chunk to `in_flight` immediately (and emits a
-  /// `RunAsr` command) or queues it on `cut_pending` if the
+  /// `Asr` command) or queues it on `cut_pending` if the
   /// effective cap is saturated.
   ///
   /// The chunk arrives with its `override_at_start` already
@@ -391,7 +391,7 @@ impl Dispatch {
   /// of slot count.
   ///
   /// Cut_pending entries hold pre-extracted audio, so the gate is
-  /// enforced even across `restart_at`.
+  /// enforced even across `handle_restart`.
   fn can_promote(&self, chunk_id: ChunkId) -> bool {
     if self.in_flight.len() >= self.max_in_flight {
       return false;
@@ -407,7 +407,7 @@ impl Dispatch {
   }
 
   /// Move a pre-extracted chunk to `in_flight` and queue its
-  /// `RunAsr` command. Applies the locked language hint if one
+  /// `Asr` command. Applies the locked language hint if one
   /// has been established, then layers the per-packet override
   /// captured on the chunk at extract time. Crate-private; called
   /// by `on_emit` and by `after_inject`'s post-resolve promotion
@@ -448,7 +448,7 @@ impl Dispatch {
     };
     self.in_flight.insert(chunk_id, record);
 
-    self.pending_commands.push_back(Command::RunAsr {
+    self.pending_commands.push_back(Command::Asr {
       chunk_id,
       samples,
       sample_rate: crate::time::SAMPLE_RATE_HZ,
@@ -520,7 +520,7 @@ impl Dispatch {
   /// `safe_trim_high_water` is the upper bound on trim: usually
   /// the caller's VAD analysis watermark (`vad_watermark`).
   /// Passing `buffer.absolute_sample_offset()` is only safe in
-  /// `signal_eof` paths where the stream is ending and audio
+  /// `handle_eof` paths where the stream is ending and audio
   /// past the watermark won't be analyzed.
   pub(crate) fn after_inject(
     &mut self,
@@ -550,7 +550,7 @@ impl Dispatch {
   /// machine builds the `Transcript` (with empty `words` if
   /// alignment is off) and either marks the chunk Ready, or — if
   /// alignment is on AND the result has non-empty text —
-  /// transitions to AwaitingAlignment and queues a RunAlignment
+  /// transitions to AwaitingAlignment and queues a Alignment
   /// command. Caller must invoke `after_inject(&mut buffer)` to
   /// flush events and run trim.
   ///
@@ -560,7 +560,7 @@ impl Dispatch {
   /// `AwaitingAlignment` that should be receiving an alignment
   /// result instead) returns `UnknownChunk` — the in-flight record
   /// is treated as opaque outside its expected phase.
-  pub(crate) fn inject_asr_result(
+  pub(crate) fn handle_asr(
     &mut self,
     chunk_id: ChunkId,
     result: AsrResult,
@@ -611,7 +611,7 @@ impl Dispatch {
       // overwrite the Ready transcript.
       record.asr_result = Some(result.clone());
       record.phase = ChunkPhase::AwaitingAlignment;
-      self.pending_commands.push_back(Command::RunAlignment {
+      self.pending_commands.push_back(Command::Alignment {
         chunk_id,
         samples: record.samples.clone(),
         sub_segments: record.sub_segments.clone(),
@@ -644,7 +644,7 @@ impl Dispatch {
   /// Phase contract: only chunks in `AwaitingAlignment` accept an
   /// alignment result. Calling on a chunk in any other phase
   /// returns `UnknownChunk`.
-  pub(crate) fn inject_alignment_result(
+  pub(crate) fn handle_alignment(
     &mut self,
     chunk_id: ChunkId,
     result: crate::core::command::AlignmentResult,
@@ -684,7 +684,7 @@ impl Dispatch {
   /// (Ready / FailedReady, blocked behind an earlier chunk's
   /// emission) return `UnknownChunk` rather than letting an
   /// unsolicited failure overwrite their final outcome.
-  pub(crate) fn inject_failure(
+  pub(crate) fn handle_failure(
     &mut self,
     chunk_id: ChunkId,
     failure: WorkFailure,
@@ -776,7 +776,7 @@ impl Dispatch {
   /// Build the `samples_to_output_range` closure for `chunk_id`
   /// using the chunk's *captured-at-extract-time* `(timebase,
   /// base_pts_out_anchor)` pair, so word ranges land in the
-  /// chunk's own PTS epoch even after a `restart_at` has shifted
+  /// chunk's own PTS epoch even after a `handle_restart` has shifted
   /// the live buffer's anchor.
   ///
   /// Returns `None` if `chunk_id` is not in flight (e.g. already
@@ -871,24 +871,24 @@ mod tests {
     d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
     d.on_emit(fake_chunk(2_000, 4_000), ChunkId::from_raw(1), &b);
     d.on_emit(fake_chunk(4_000, 6_000), ChunkId::from_raw(2), &b);
-    // All three issued RunAsr.
+    // All three issued Asr.
     assert_eq!(d.in_flight.len(), 3);
     assert_eq!(d.pending_commands.len(), 3);
 
     // Resolve out of order: 2, 0, 1.
-    d.inject_asr_result(ChunkId::from_raw(2), fake_asr_result("c2"))
+    d.handle_asr(ChunkId::from_raw(2), fake_asr_result("c2"))
       .unwrap();
     d.after_inject(&mut b, None, u64::MAX);
     // Chunk 2 is Ready but cannot emit yet (next_emit is 0).
     assert!(d.pending_events.is_empty());
 
-    d.inject_asr_result(ChunkId::from_raw(0), fake_asr_result("c0"))
+    d.handle_asr(ChunkId::from_raw(0), fake_asr_result("c0"))
       .unwrap();
     d.after_inject(&mut b, None, u64::MAX);
     // Chunk 0 emitted; chunk 1 still in_flight.
     assert_eq!(d.pending_events.len(), 1);
 
-    d.inject_asr_result(ChunkId::from_raw(1), fake_asr_result("c1"))
+    d.handle_asr(ChunkId::from_raw(1), fake_asr_result("c1"))
       .unwrap();
     d.after_inject(&mut b, None, u64::MAX);
     // Chunks 1 and 2 now emit (cascade).
@@ -910,7 +910,7 @@ mod tests {
   /// fix: a chunk emitted by the cut state machine under
   /// override O1 (snapshotted on `MergedChunk.override_at_start`),
   /// but promoted in a later "process_packet" with override O2
-  /// set, must still emit RunAsr with O1's params.
+  /// set, must still emit Asr with O1's params.
   ///
   /// Codex round-30 expanded this contract from "override at
   /// emit time" to "override at chunk-accumulation-start time" —
@@ -967,14 +967,14 @@ mod tests {
     let o2 = AsrParamsOverride::new().with_initial_temperature(Some(0.3));
     d.current_override = Some(o2);
     let mut buf_mut = make_buffer_with_samples(20_000);
-    d.inject_asr_result(ChunkId::from_raw(0), fake_asr_result("ok"))
+    d.handle_asr(ChunkId::from_raw(0), fake_asr_result("ok"))
       .unwrap();
     d.after_inject(&mut buf_mut, None, u64::MAX);
 
-    // Chunk 1's RunAsr should have temperature = 0.7 (O1), not 0.3 (O2).
-    let cmd1 = d.pending_commands.pop_front().expect("chunk 1 RunAsr");
-    let Command::RunAsr { params, .. } = &cmd1 else {
-      panic!("expected RunAsr; got {cmd1:?}");
+    // Chunk 1's Asr should have temperature = 0.7 (O1), not 0.3 (O2).
+    let cmd1 = d.pending_commands.pop_front().expect("chunk 1 Asr");
+    let Command::Asr { params, .. } = &cmd1 else {
+      panic!("expected Asr; got {cmd1:?}");
     };
     assert!(
       (params.initial_temperature() - 0.7).abs() < 1e-6,
@@ -986,16 +986,16 @@ mod tests {
   #[test]
   fn unknown_chunk_id_returns_error() {
     let mut d = dispatch_default();
-    let r = d.inject_asr_result(ChunkId::from_raw(99), fake_asr_result("nope"));
+    let r = d.handle_asr(ChunkId::from_raw(99), fake_asr_result("nope"));
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(c)) if c.as_u64() == 99));
   }
 
   #[test]
-  fn inject_failure_emits_error_event_in_order() {
+  fn handle_failure_emits_error_event_in_order() {
     let mut d = dispatch_default();
     let mut b = make_buffer_with_samples(10_000);
     d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
-    d.inject_failure(
+    d.handle_failure(
       ChunkId::from_raw(0),
       WorkFailure::AsrFailed {
         kind: crate::types::AsrFailureKind::AllTemperaturesFailed,
@@ -1026,7 +1026,7 @@ mod tests {
     assert_eq!(
       d.pending_commands.len(),
       2,
-      "only first two chunks issued RunAsr; pending chunks have no commands yet"
+      "only first two chunks issued Asr; pending chunks have no commands yet"
     );
   }
 
@@ -1039,15 +1039,15 @@ mod tests {
     d.unpoll_command(cmd);
     let cmd_again = d.poll_command().unwrap();
     match cmd_again {
-      Command::RunAsr { chunk_id, .. } => assert_eq!(chunk_id.as_u64(), 0),
-      _ => panic!("expected RunAsr"),
+      Command::Asr { chunk_id, .. } => assert_eq!(chunk_id.as_u64(), 0),
+      _ => panic!("expected Asr"),
     }
   }
 
   /// When an in-flight chunk completes and `after_inject` runs,
   /// a chunk that was queued in `cut_pending` because
   /// `max_in_flight` was full must be promoted (audio extracted,
-  /// RunAsr command queued) in the same call.
+  /// Asr command queued) in the same call.
   #[test]
   fn cut_pending_promotes_on_slot_open() {
     // Auto policy: tests pure max_in_flight gating without the
@@ -1065,8 +1065,8 @@ mod tests {
 
     // Resolve chunk 0; after_inject should both flush its event
     // AND promote chunk 2 from cut_pending into in_flight,
-    // emitting a third RunAsr command.
-    d.inject_asr_result(ChunkId::from_raw(0), fake_asr_result("c0"))
+    // emitting a third Asr command.
+    d.handle_asr(ChunkId::from_raw(0), fake_asr_result("c0"))
       .unwrap();
     d.after_inject(&mut b, None, u64::MAX);
 
@@ -1081,13 +1081,13 @@ mod tests {
     assert_eq!(
       d.pending_commands.len(),
       3,
-      "third RunAsr was issued for chunk 2 on promotion"
+      "third Asr was issued for chunk 2 on promotion"
     );
     assert_eq!(d.pending_events.len(), 1, "chunk 0's Transcript emitted");
   }
 
   /// `LanguagePolicy::Lock { hint }` must apply the hint to
-  /// every emitted RunAsr command.
+  /// every emitted Asr command.
   #[test]
   fn language_policy_lock_applies_hint_to_first_chunk() {
     let mut d = Dispatch::new(
@@ -1100,20 +1100,20 @@ mod tests {
     d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
     let cmd = d.poll_command().unwrap();
     match cmd {
-      Command::RunAsr { params, .. } => {
+      Command::Asr { params, .. } => {
         assert_eq!(
           params.language_hint(),
           Some(&Lang::Zh),
-          "Lock {{ hint: Zh }} must set language_hint on every RunAsr"
+          "Lock {{ hint: Zh }} must set language_hint on every Asr"
         );
       }
-      _ => panic!("expected RunAsr"),
+      _ => panic!("expected Asr"),
     }
   }
 
   /// `LanguagePolicy::AutoLockAfter(1)` must lock the language
   /// after observing the first non-empty ASR result, then apply
-  /// that hint to all subsequent RunAsr commands.
+  /// that hint to all subsequent Asr commands.
   #[test]
   fn language_policy_auto_lock_after_one_locks_on_first_observation() {
     let mut d = Dispatch::new(
@@ -1128,19 +1128,19 @@ mod tests {
     d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
     let cmd = d.poll_command().unwrap();
     match cmd {
-      Command::RunAsr { params, .. } => {
+      Command::Asr { params, .. } => {
         assert_eq!(
           params.language_hint(),
           None,
           "first chunk under AutoLockAfter(1) has no hint yet"
         );
       }
-      _ => panic!("expected RunAsr"),
+      _ => panic!("expected Asr"),
     }
 
     // Inject ASR result with detected language Zh — this is
     // the first non-empty observation.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(0),
       AsrResult::new(SmolStr::new("你好"), Lang::Zh, -0.5, 0.05, 0.0),
     )
@@ -1154,10 +1154,10 @@ mod tests {
     // Second chunk: hint should now be locked to Zh.
     d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
     // poll_command pops chunk 0's parked stuff first (none here)
-    // then chunk 1's RunAsr.
+    // then chunk 1's Asr.
     let cmd = d.pending_commands.pop_back().unwrap();
     match cmd {
-      Command::RunAsr {
+      Command::Asr {
         chunk_id, params, ..
       } => {
         assert_eq!(chunk_id.as_u64(), 1);
@@ -1167,11 +1167,11 @@ mod tests {
           "second chunk hint must be locked to first detection"
         );
       }
-      _ => panic!("expected RunAsr"),
+      _ => panic!("expected Asr"),
     }
   }
 
-  /// A duplicate `inject_asr_result` on a chunk that's already
+  /// A duplicate `handle_asr` on a chunk that's already
   /// `Ready` (waiting in-order) must be rejected — otherwise the
   /// second call could overwrite the final transcript.
   #[test]
@@ -1189,10 +1189,10 @@ mod tests {
     d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
     // Resolve chunk 1 first — it transitions to Ready but stays
     // in_flight because the cursor is at 0.
-    d.inject_asr_result(ChunkId::from_raw(1), fake_asr_result("c1"))
+    d.handle_asr(ChunkId::from_raw(1), fake_asr_result("c1"))
       .unwrap();
     // Now chunk 1's phase is Ready. Duplicate inject must be rejected.
-    let r = d.inject_asr_result(ChunkId::from_raw(1), fake_asr_result("c1-dup"));
+    let r = d.handle_asr(ChunkId::from_raw(1), fake_asr_result("c1-dup"));
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(c)) if c.as_u64() == 1));
   }
 
@@ -1206,7 +1206,7 @@ mod tests {
     let mut b = make_buffer_with_samples(10_000);
     d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
     // Phase is AwaitingAsr.
-    let r = d.inject_alignment_result(
+    let r = d.handle_alignment(
       ChunkId::from_raw(0),
       crate::core::command::AlignmentResult::new(alloc::vec::Vec::new()),
     );
@@ -1217,15 +1217,15 @@ mod tests {
   /// be rejected — it must not retroactively turn a successful
   /// Transcript into an Error.
   #[test]
-  fn inject_failure_on_ready_returns_unknown_chunk() {
+  fn handle_failure_on_ready_returns_unknown_chunk() {
     let mut d = dispatch_default();
     let mut b = make_buffer_with_samples(10_000);
     d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
     d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
     // Resolve chunk 1 to Ready (waiting on chunk 0 in-order).
-    d.inject_asr_result(ChunkId::from_raw(1), fake_asr_result("c1"))
+    d.handle_asr(ChunkId::from_raw(1), fake_asr_result("c1"))
       .unwrap();
-    let r = d.inject_failure(
+    let r = d.handle_failure(
       ChunkId::from_raw(1),
       WorkFailure::AsrFailed {
         kind: crate::types::AsrFailureKind::AllTemperaturesFailed,
@@ -1255,7 +1255,7 @@ mod tests {
     for (i, lang) in [Lang::En, Lang::En, Lang::Zh].iter().enumerate() {
       let s = (i as u64) * 1_000;
       d.on_emit(fake_chunk(s, s + 500), ChunkId::from_raw(i as u64), &b);
-      d.inject_asr_result(
+      d.handle_asr(
         ChunkId::from_raw(i as u64),
         AsrResult::new(SmolStr::new("text"), lang.clone(), -0.5, 0.05, 0.0),
       )
@@ -1282,7 +1282,7 @@ mod tests {
     d.on_emit(fake_chunk(3_000, 3_500), ChunkId::from_raw(3), &b);
     let cmd = d.pending_commands.pop_back().unwrap();
     match cmd {
-      Command::RunAsr {
+      Command::Asr {
         params, chunk_id, ..
       } => {
         assert_eq!(chunk_id.as_u64(), 3);
@@ -1292,7 +1292,7 @@ mod tests {
           "post-lock chunks must carry the locked language"
         );
       }
-      _ => panic!("expected RunAsr"),
+      _ => panic!("expected Asr"),
     }
   }
 
@@ -1320,7 +1320,7 @@ mod tests {
 
     // Chunk 1's ASR result arrives FIRST (out of order). Lock
     // must NOT advance — chunk 0 is still in flight.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(1),
       AsrResult::new(SmolStr::new("zh"), Lang::Zh, -0.5, 0.05, 0.0),
     )
@@ -1335,7 +1335,7 @@ mod tests {
     // and the cursor can advance through both in chunk_id order:
     // observations = [En, Zh] → mode picks En (first occurrence
     // wins on ties).
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(0),
       AsrResult::new(SmolStr::new("en"), Lang::En, -0.5, 0.05, 0.0),
     )
@@ -1369,7 +1369,7 @@ mod tests {
     d.on_emit(fake_chunk(1_000, 1_500), ChunkId::from_raw(2), &b);
 
     // Chunk 0 fails ASR.
-    d.inject_failure(
+    d.handle_failure(
       ChunkId::from_raw(0),
       WorkFailure::AsrFailed {
         kind: crate::types::AsrFailureKind::AllTemperaturesFailed,
@@ -1386,13 +1386,13 @@ mod tests {
     // Chunks 1 and 2 succeed in English. After both land, cursor
     // advances through 0 (failed, skipped) → 1 (En) → 2 (En) and
     // locks once observations.len() reaches 2.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(1),
       AsrResult::new(SmolStr::new("hello"), Lang::En, -0.5, 0.05, 0.0),
     )
     .unwrap();
     d.after_inject(&mut b, Some(0), u64::MAX);
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(2),
       AsrResult::new(SmolStr::new("world"), Lang::En, -0.5, 0.05, 0.0),
     )
@@ -1426,7 +1426,7 @@ mod tests {
     d.on_emit(fake_chunk(1_000, 1_500), ChunkId::from_raw(2), &b);
 
     // Chunk 1 (En) lands first (out of order).
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(1),
       AsrResult::new(SmolStr::new("hello"), Lang::En, -0.5, 0.05, 0.0),
     )
@@ -1435,7 +1435,7 @@ mod tests {
     assert_eq!(d.locked_language, None);
 
     // Chunk 0 (empty) — the cursor advances to 1, picks up En.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(0),
       AsrResult::new(SmolStr::new(""), Lang::En, -1.0, 0.95, 0.0),
     )
@@ -1447,7 +1447,7 @@ mod tests {
     );
 
     // Chunk 2 (En) — second observation lands; lock to En.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(2),
       AsrResult::new(SmolStr::new("world"), Lang::En, -0.5, 0.05, 0.0),
     )
@@ -1458,7 +1458,7 @@ mod tests {
 
   /// Under unlocked `AutoLockAfter(n)`, dispatch must hold back
   /// chunks past the observation window — otherwise chunks 1..N
-  /// get RunAsr with `language_hint = None` and may auto-detect
+  /// get Asr with `language_hint = None` and may auto-detect
   /// different languages, defeating the lock contract.
   /// Reproduction: `AutoLockAfter(1)` + `max_in_flight = 4`.
   /// Emit 3 chunks without injecting. Pre-fix code promoted all
@@ -1491,7 +1491,7 @@ mod tests {
     assert_eq!(
       d.pending_commands.len(),
       1,
-      "only chunk 0 issued a RunAsr — chunks 1, 2 wait for the lock"
+      "only chunk 0 issued a Asr — chunks 1, 2 wait for the lock"
     );
   }
 
@@ -1510,12 +1510,12 @@ mod tests {
     d.on_emit(fake_chunk(0, 1_000), ChunkId::from_raw(0), &b);
     d.on_emit(fake_chunk(1_000, 2_000), ChunkId::from_raw(1), &b);
     d.on_emit(fake_chunk(2_000, 3_000), ChunkId::from_raw(2), &b);
-    // Drain chunk 0's RunAsr from pending_commands so we can see
+    // Drain chunk 0's Asr from pending_commands so we can see
     // chunks 1 and 2's commands when they get emitted post-lock.
     let _ = d.pending_commands.pop_front();
 
     // Inject chunk 0's Zh — the lock fires.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(0),
       AsrResult::new(SmolStr::new("zh"), Lang::Zh, -0.5, 0.05, 0.0),
     )
@@ -1526,18 +1526,18 @@ mod tests {
     // Chunks 1 and 2 must now be in flight (cap reverted to 4).
     assert_eq!(d.in_flight.len(), 2);
     assert_eq!(d.cut_pending.len(), 0);
-    // Their RunAsr commands must carry the locked hint.
+    // Their Asr commands must carry the locked hint.
     assert_eq!(d.pending_commands.len(), 2);
     for cmd in d.pending_commands.iter() {
       match cmd {
-        Command::RunAsr { params, .. } => {
+        Command::Asr { params, .. } => {
           assert_eq!(
             params.language_hint(),
             Some(&Lang::Zh),
             "post-lock chunks must carry the locked hint"
           );
         }
-        _ => panic!("expected RunAsr"),
+        _ => panic!("expected Asr"),
       }
     }
   }
@@ -1579,7 +1579,7 @@ mod tests {
     );
 
     // Chunk 0 returns En. Only 1/3 observations; lock not set.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(0),
       AsrResult::new(SmolStr::new("a"), Lang::En, -0.5, 0.05, 0.0),
     )
@@ -1594,7 +1594,7 @@ mod tests {
     );
 
     // Chunk 1 returns En. 2/3 observations; lock not set.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(1),
       AsrResult::new(SmolStr::new("b"), Lang::En, -0.5, 0.05, 0.0),
     )
@@ -1604,7 +1604,7 @@ mod tests {
     assert_eq!(d.cut_pending.len(), 1, "chunk 3 still must not be promoted");
 
     // Chunk 2 returns En. 3/3 observations; lock fires.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(2),
       AsrResult::new(SmolStr::new("c"), Lang::En, -0.5, 0.05, 0.0),
     )
@@ -1616,7 +1616,7 @@ mod tests {
     assert_eq!(d.cut_pending.len(), 0, "chunk 3 promoted after lock");
     let mut found_chunk_3 = false;
     for cmd in d.pending_commands.iter() {
-      if let Command::RunAsr {
+      if let Command::Asr {
         chunk_id, params, ..
       } = cmd
       {
@@ -1632,7 +1632,7 @@ mod tests {
     }
     assert!(
       found_chunk_3,
-      "chunk 3's RunAsr command must be queued post-lock"
+      "chunk 3's Asr command must be queued post-lock"
     );
   }
 
@@ -1662,7 +1662,7 @@ mod tests {
     assert_eq!(d.cut_pending.len(), 1);
 
     // Chunk 0 returns empty — cursor advances, observations stays 0.
-    d.inject_asr_result(
+    d.handle_asr(
       ChunkId::from_raw(0),
       AsrResult::new(SmolStr::new(""), Lang::En, -1.0, 0.95, 0.0),
     )
@@ -1699,7 +1699,7 @@ mod tests {
     for (i, lang) in [Lang::En, Lang::Zh].iter().enumerate() {
       let s = (i as u64) * 500;
       d.on_emit(fake_chunk(s, s + 250), ChunkId::from_raw(i as u64), &b);
-      d.inject_asr_result(
+      d.handle_asr(
         ChunkId::from_raw(i as u64),
         AsrResult::new(SmolStr::new("text"), lang.clone(), -0.5, 0.05, 0.0),
       )

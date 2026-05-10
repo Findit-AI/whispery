@@ -635,8 +635,8 @@ impl AlignmentResult {
 #[derive(Debug)]
 pub enum Command {
   /// Run ASR on the chunk's audio. The runner ships the result
-  /// back via `Transcriber::inject_asr_result`.
-  RunAsr {
+  /// back via `Transcriber::handle_asr`.
+  Asr {
     /// Chunk identity.
     chunk_id: ChunkId,
     /// Chunk audio (16 kHz f32 mono).
@@ -652,11 +652,11 @@ pub enum Command {
   /// Run word-level alignment on the chunk's audio + transcribed
   /// text. Only emitted when the caller is configured to dispatch
   /// alignment work. Result returns via
-  /// [`super::Transcriber::inject_alignment_result`].
+  /// [`super::Transcriber::handle_alignment`].
   ///
   /// **Coordinate-space contract.** Codex round-37 round-18
   /// [high]: `sub_segments` here is in the caller's **output
-  /// timebase** (the timebase of the first `push_samples`
+  /// timebase** (the timebase of the first `handle_samples`
   /// `Timestamp`). For human readers / downstream consumers
   /// this is the "natural" form. **The aligner does NOT accept
   /// it directly** — `Aligner::align_chunk` requires
@@ -684,7 +684,7 @@ pub enum Command {
   /// VAD ranges for bookkeeping) get the natural form without
   /// a back-conversion. The runner module's worked example
   /// shows the full pump shape including the coordinate flip.
-  RunAlignment {
+  Alignment {
     /// Chunk identity.
     chunk_id: ChunkId,
     /// Chunk audio (16 kHz f32 mono).

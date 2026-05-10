@@ -387,13 +387,21 @@ pub(crate) fn normalize_with_silence_mask(samples: &[f32], speech_mask: &[bool])
 /// handles the trailing `len % 4` samples without falling through
 /// to the scalar reference.
 #[cfg(target_arch = "aarch64")]
+#[doc(hidden)]
 pub mod neon {
   use super::Vec;
   use core::arch::aarch64::*;
 
-  /// SAFETY: caller must run on aarch64 with NEON available.
-  /// Marked `unsafe` to mirror the colconv convention; in practice
-  /// every aarch64 build of this crate satisfies the precondition.
+  /// NEON-vectorised zero-mean unit-variance normalisation.
+  /// Marked `unsafe` to mirror the colconv convention; in
+  /// practice every aarch64 build of this crate satisfies
+  /// the precondition.
+  ///
+  /// # Safety
+  ///
+  /// Caller must run on aarch64 with NEON available. NEON is
+  /// part of the aarch64 base ISA so this is satisfied
+  /// unconditionally on any supported aarch64 target.
   #[inline]
   #[target_feature(enable = "neon")]
   pub unsafe fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
@@ -481,6 +489,7 @@ pub mod neon {
 /// x86_64 SSE4.1 backend. 4-lane f32 — same lane count as NEON,
 /// so the speed-up profile mirrors the aarch64 path.
 #[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
 pub mod x86_sse41 {
   use super::Vec;
   use core::arch::x86_64::*;
@@ -500,7 +509,9 @@ pub mod x86_sse41 {
     }
   }
 
-  /// SAFETY: caller must run on x86_64 with SSE4.1 available.
+  /// # Safety
+  ///
+  /// Caller must run on x86_64 with SSE4.1 available.
   #[inline]
   #[target_feature(enable = "sse4.1")]
   pub unsafe fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
@@ -583,6 +594,7 @@ pub mod x86_sse41 {
 
 /// x86_64 AVX2 backend. 8-lane f32. Available on Haswell+ (2013).
 #[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
 pub mod x86_avx2 {
   use super::Vec;
   use core::arch::x86_64::*;
@@ -604,7 +616,9 @@ pub mod x86_avx2 {
     }
   }
 
-  /// SAFETY: caller must run on x86_64 with AVX2 available.
+  /// # Safety
+  ///
+  /// Caller must run on x86_64 with AVX2 available.
   #[inline]
   #[target_feature(enable = "avx2")]
   pub unsafe fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
@@ -690,11 +704,14 @@ pub mod x86_avx2 {
 /// AVX-512 use, so the dispatcher only takes this path when the
 /// runtime feature is actually present.
 #[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
 pub mod x86_avx512 {
   use super::Vec;
   use core::arch::x86_64::*;
 
-  /// SAFETY: caller must run on x86_64 with AVX-512F available.
+  /// # Safety
+  ///
+  /// Caller must run on x86_64 with AVX-512F available.
   #[inline]
   #[target_feature(enable = "avx512f")]
   pub unsafe fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {

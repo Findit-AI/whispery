@@ -164,6 +164,56 @@ impl Aligner {
     &self.language
   }
 
+  /// Detect out-of-vocab characters in `text` against this
+  /// aligner's wav2vec2 vocab + per-language normalizer,
+  /// without making any policy decision. Returns events in
+  /// the order [`tokenize_with_word_map`](crate::runner::aligner::algorithm::tokenize::tokenize_with_word_map)
+  /// will encounter them — caller-supplied `&[ResolvedOov]`
+  /// to `align_chunk_with_abort` (or via
+  /// [`AlignWorkItem::oov_decisions`](crate::AlignWorkItem))
+  /// must be in the same order.
+  ///
+  /// Sans-I/O OOV resolution: the library produces events as
+  /// data, the caller decides via pure functions in
+  /// [`crate::core::oov`] (or a custom policy), then passes
+  /// the decisions back as data. No callbacks, no traits the
+  /// library holds.
+  ///
+  /// Returns an empty vec for in-vocab text. Returns an error
+  /// only on tokenizer-engine failures or normalizer rejection
+  /// (`NormalizationError::EmptyText` for punctuation-only
+  /// input is converted to an empty event vec — there's
+  /// nothing to align, so nothing to decide).
+  pub fn detect_oov(
+    &self,
+    text: &str,
+  ) -> Result<alloc::vec::Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
+    use crate::runner::aligner::algorithm::tokenize::detect_oov_events;
+    let normalized = match self.normalizer.normalize(text) {
+      Ok(n) => n,
+      Err(crate::runner::aligner::normalizer::NormalizationError::EmptyText) => {
+        return Ok(alloc::vec::Vec::new());
+      }
+      Err(e) => {
+        return Err(crate::types::WorkFailure::AlignmentFailed {
+          kind: crate::types::AlignmentFailureKind::NormalizationFailed,
+          message: alloc::format!("normalize failed: {e:?}"),
+          language: self.language.clone(),
+        });
+      }
+    };
+    let n_words = normalized.normalized().split_whitespace().count();
+    detect_oov_events(
+      &self.tokenizer,
+      normalized.normalized(),
+      n_words,
+      self.vocab_uppercase_only,
+      self.unk_token_id,
+      &self.language,
+      normalized.wildcard_boundary_per_word(),
+    )
+  }
+
   /// Audio sample rate the model expects. Hardcoded to 16 kHz
   /// for wav2vec2; non-16 kHz models are not supported in v1
   /// (the silence mask, frame timebase, and stride checks all
@@ -313,6 +363,14 @@ impl Aligner {
       message: alloc::format!("RunOptions::new failed: {e:?}"),
       language: self.language.clone(),
     })?;
+    // Default OOV policy for the no-abort entrypoint:
+    // detect events first, apply the historical default
+    // (`alphanumeric → wildcard, pronounced → fail-closed`).
+    // Power users that want `wildcard_all_decisions` or a
+    // custom policy should use `align_chunk_with_abort` and
+    // supply explicit decisions.
+    let oov_events = self.detect_oov(text)?;
+    let oov_decisions = crate::core::default_oov_decisions(&oov_events);
     self.align(
       samples,
       sub_segments,
@@ -321,6 +379,7 @@ impl Aligner {
       samples_to_output_range,
       &abort_flag,
       &run_options,
+      &oov_decisions,
     )
   }
 
@@ -358,10 +417,31 @@ impl Aligner {
     samples_to_output_range: F,
     abort_flag: &core::sync::atomic::AtomicBool,
     run_options: &RunOptions,
+    // Caller-resolved per-OOV-event decisions. See
+    // `Self::align`'s `oov_decisions` parameter and
+    // `crate::core::oov` for the full Sans-I/O resolution
+    // flow.
+    oov_decisions: &[crate::core::ResolvedOov],
   ) -> Result<AlignmentResult, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
   {
+    // Codex round-37 round-12 (parity loop) [high]: dispatcher
+    // path validates `oov_decisions[i].event.language` against
+    // the run's requested language in `run_one_alignment`'s
+    // `validate_oov_decision_languages`. The public direct
+    // aligner path (this method) is reached without going
+    // through the dispatcher, so a direct caller (parity test,
+    // benchmark, external power-user) could pass cross-language
+    // decisions whose positional fields happen to match. The
+    // tokenizer's identity check via `OovEvent::matches_position`
+    // deliberately ignores `language` (so Any-fallback works),
+    // and would silently apply them.
+    //
+    // No `Any` fallback at this layer — `align_chunk_with_abort`
+    // is bound to a specific `Aligner`, so `self.language` IS
+    // the validation key. Reject mismatches loudly here.
+    validate_direct_decision_languages(oov_decisions, &self.language)?;
     self.align(
       samples,
       sub_segments,
@@ -370,6 +450,7 @@ impl Aligner {
       samples_to_output_range,
       abort_flag,
       run_options,
+      oov_decisions,
     )
   }
 
@@ -414,6 +495,12 @@ impl Aligner {
     samples_to_output_range: F,
     abort_flag: &core::sync::atomic::AtomicBool,
     run_options: &RunOptions,
+    // Caller-resolved per-OOV-event decisions, in the order
+    // `detect_oov_events` would have produced them. `None`
+    // falls back to the legacy `allow_wildcard` policy
+    // (slice 4 of the OOV refactor deletes the `None` arm).
+    // Threaded through to `tokenize_with_word_map`.
+    oov_decisions: &[crate::core::ResolvedOov],
   ) -> Result<AlignmentResult, WorkFailure>
   where
     F: Fn(u64, u64) -> TimeRange,
@@ -565,6 +652,12 @@ impl Aligner {
       self.unk_token_id,
       normalized.wildcard_boundary_per_word(),
       &self.language,
+      // OOV decisions threaded from the caller via
+      // `AlignWorkItem::oov_decisions`. `None` (the empty-
+      // vec case) means the caller wants the legacy
+      // `allow_wildcard` policy; slice 4 of the OOV refactor
+      // deletes that arm.
+      oov_decisions,
     )?;
 
     // No-alignable-tokens short-circuit: a chunk like `"1000"`
@@ -632,12 +725,17 @@ impl Aligner {
     } else {
       alloc::borrow::Cow::Borrowed(&normalized_samples[..])
     };
+    // Codex round-37 round-10 (parity loop) [medium]: see
+    // `classify_encode_abort` for the rationale — terminate-
+    // induced encode errors must surface as
+    // `WorkerHangTimeout`, not `ModelInferenceFailed`.
     let log_probs = encode_log_softmax(
       &mut self.session,
       &padded_samples,
       run_options,
       &self.language,
-    )?;
+    )
+    .map_err(|e| classify_encode_abort(abort_flag, e))?;
 
     // Diagnostic: when the parity harness sets
     // `WHISPERY_PARITY_DUMP_TRELLIS` to a directory, write a
@@ -858,6 +956,79 @@ impl Aligner {
       self.min_speech_coverage,
       self.max_intra_silent_run,
     ))
+  }
+}
+
+/// Codex round-37 round-12 (parity loop) [high]: validate
+/// every supplied `ResolvedOov.event.language` matches
+/// `expected_lang`.
+///
+/// Used by `Aligner::align_chunk_with_abort` (the public
+/// direct path). The dispatcher path (`run_one_alignment` →
+/// `validate_oov_decision_languages`) has its own boundary
+/// check against the chunk/run requested language; the
+/// in-tokenizer identity check via `OovEvent::matches_position`
+/// deliberately ignores `language` so `AlignerKey::Any`
+/// fallback works. That leaves the direct public aligner
+/// entrypoint as a hole: a parity-test / external power-user
+/// caller could pass cross-language `ResolvedOov` whose
+/// positional fields happen to match and silently apply
+/// wildcard timings the caller intended to fail-closed.
+///
+/// `Aligner::align_chunk_with_abort` is bound to one Aligner
+/// instance — no `Any` fallback applies — so `self.language`
+/// is the correct validation key.
+fn validate_direct_decision_languages(
+  oov_decisions: &[crate::core::ResolvedOov],
+  expected_lang: &Lang,
+) -> Result<(), WorkFailure> {
+  for (i, resolved) in oov_decisions.iter().enumerate() {
+    if &resolved.event.language != expected_lang {
+      return Err(WorkFailure::AlignmentFailed {
+        kind: crate::types::AlignmentFailureKind::TokenizationFailed,
+        message: alloc::format!(
+          "align_chunk_with_abort: oov_decisions[{i}].event.language = {:?} \
+           but this aligner's language is {:?}. Direct callers must pass \
+           ResolvedOov produced for THIS aligner's language. Recompute via \
+           `Self::detect_oov(text)` + a policy helper from `crate::core::oov`.",
+          resolved.event.language,
+          expected_lang,
+        ),
+        language: expected_lang.clone(),
+      });
+    }
+  }
+  Ok(())
+}
+
+/// Classify an `encode_log_softmax` failure based on whether the
+/// alignment watchdog already flipped `abort_flag` (Codex
+/// round-37 round-10, parity loop, severity medium).
+///
+/// The watchdog cancels in-flight ORT inference by calling
+/// `RunOptions::terminate()`. ORT then returns
+/// `Session::run_with_options` with an `Err`. If the caller
+/// just `?`-propagates that, the failure surfaces as
+/// `AlignmentFailureKind::ModelInferenceFailed` (looks like a
+/// broken backend or bad model) instead of
+/// `WorkFailure::WorkerHangTimeout` (the contract the watchdog
+/// publishes — alerts and retry policy hang off this kind).
+/// Promote terminate-induced errors to `WorkerHangTimeout`
+/// when `abort_flag` is set; otherwise pass through unchanged
+/// (so genuine model errors keep their `ModelInferenceFailed`
+/// classification).
+fn classify_encode_abort(
+  abort_flag: &core::sync::atomic::AtomicBool,
+  err: WorkFailure,
+) -> WorkFailure {
+  use core::sync::atomic::Ordering;
+  if abort_flag.load(Ordering::Relaxed) {
+    WorkFailure::WorkerHangTimeout {
+      kind: crate::types::WorkerKind::Alignment,
+      elapsed: core::time::Duration::ZERO,
+    }
+  } else {
+    err
   }
 }
 
@@ -1248,6 +1419,115 @@ fn has_top_level_key(bytes: &[u8], start: usize, end: usize, key: &[u8]) -> bool
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Codex round-37 round-10 (parity loop) [medium]: when the
+  /// alignment watchdog flips `abort_flag` and ORT returns an
+  /// error from terminate(), the encode-failure classifier
+  /// must promote it to `WorkerHangTimeout`, not pass it
+  /// through as `ModelInferenceFailed`. Live ORT termination
+  /// is too heavy for a unit test, but the classifier itself
+  /// is a pure function.
+  #[test]
+  fn classify_encode_abort_promotes_to_timeout_when_aborted() {
+    use core::sync::atomic::AtomicBool;
+    let aborted = AtomicBool::new(true);
+    let original = WorkFailure::AlignmentFailed {
+      kind: crate::types::AlignmentFailureKind::ModelInferenceFailed,
+      message: "ort terminate".into(),
+      language: Lang::En,
+    };
+    let classified = classify_encode_abort(&aborted, original);
+    match classified {
+      WorkFailure::WorkerHangTimeout {
+        kind: crate::types::WorkerKind::Alignment,
+        ..
+      } => {}
+      other => {
+        panic!("aborted-encode error must surface as WorkerHangTimeout(Alignment); got {other:?}",)
+      }
+    }
+  }
+
+  /// Codex round-37 round-12 (parity loop) [high]: the public
+  /// direct-aligner path validates that every supplied
+  /// `ResolvedOov.event.language` matches the aligner's
+  /// language. Pre-fix a parity test / power-user caller could
+  /// pass cross-language decisions whose positional fields
+  /// happen to match and silently apply wildcard timings the
+  /// caller intended to fail-closed.
+  #[test]
+  fn validate_direct_decision_languages_rejects_cross_language_payload() {
+    use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
+    let stale = alloc::vec![ResolvedOov {
+      event: OovEvent {
+        kind: OovKind::Symbol('&'),
+        char_index: 2,
+        word_index: 0,
+        language: Lang::Ko, // payload was made for Korean
+      },
+      decision: OovDecision::Wildcard,
+    }];
+    let result = validate_direct_decision_languages(&stale, &Lang::En);
+    match result {
+      Err(WorkFailure::AlignmentFailed {
+        kind: crate::types::AlignmentFailureKind::TokenizationFailed,
+        ref message,
+        ..
+      }) => assert!(
+        message.contains("oov_decisions[0].event.language")
+          && message.contains("Ko")
+          && message.contains("En"),
+        "diagnostic should cite the offending index + the languages; got {message:?}",
+      ),
+      other => panic!("expected TokenizationFailed cross-language; got {other:?}"),
+    }
+  }
+
+  /// Same-language payload passes through unchanged.
+  #[test]
+  fn validate_direct_decision_languages_accepts_matching_payload() {
+    use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
+    let ok = alloc::vec![ResolvedOov {
+      event: OovEvent {
+        kind: OovKind::Symbol('&'),
+        char_index: 2,
+        word_index: 0,
+        language: Lang::En,
+      },
+      decision: OovDecision::Wildcard,
+    }];
+    assert!(validate_direct_decision_languages(&ok, &Lang::En).is_ok());
+  }
+
+  /// Empty payload passes ("no OOV expected"). The aligner
+  /// surfaces `TokenizationFailed` downstream if a chunk hits
+  /// any OOV anyway via `tokenize_with_word_map`'s preflight.
+  #[test]
+  fn validate_direct_decision_languages_accepts_empty() {
+    assert!(validate_direct_decision_languages(&[], &Lang::En).is_ok());
+  }
+
+  /// And the dual: a genuine model failure (no abort) must
+  /// pass through unchanged, so callers don't get spurious
+  /// timeout alerts for real backend bugs.
+  #[test]
+  fn classify_encode_abort_passes_through_when_not_aborted() {
+    use core::sync::atomic::AtomicBool;
+    let not_aborted = AtomicBool::new(false);
+    let original = WorkFailure::AlignmentFailed {
+      kind: crate::types::AlignmentFailureKind::ModelInferenceFailed,
+      message: "ort genuine error".into(),
+      language: Lang::En,
+    };
+    let classified = classify_encode_abort(&not_aborted, original);
+    match classified {
+      WorkFailure::AlignmentFailed {
+        kind: crate::types::AlignmentFailureKind::ModelInferenceFailed,
+        ..
+      } => {}
+      other => panic!("non-aborted encode error must pass through unchanged; got {other:?}"),
+    }
+  }
 
   // Unit tests for `from_paths` are tricky: they require real
   // wav2vec2 ONNX + tokenizer.json files. The end-to-end test
@@ -1816,6 +2096,7 @@ mod tests {
         },
         &abort,
         &run_options,
+        &[],
       )
       .expect("EmptyText must short-circuit to Ok, not propagate as AlignmentFailed");
     assert!(
@@ -1883,6 +2164,7 @@ mod tests {
         },
         &abort,
         &run_options,
+        &[],
       )
       .expect("sub-400-sample chunks must Ok(empty), not propagate as AlignmentFailed");
     assert!(
@@ -1949,6 +2231,7 @@ mod tests {
         },
         &abort,
         &run_options,
+        &[],
       )
       .expect("Ja aligner empty-text must short-circuit Ok");
     assert!(result.words().is_empty());
@@ -2001,6 +2284,7 @@ mod tests {
         },
         &abort,
         &run_options,
+        &[],
       )
       .expect("Zh aligner empty-text must short-circuit Ok");
     assert!(result.words().is_empty());
@@ -2062,6 +2346,7 @@ mod tests {
         },
         &abort,
         &run_options,
+        &[],
       )
       .expect("Ko aligner empty-text must short-circuit Ok");
     assert!(result.words().is_empty());
@@ -2115,6 +2400,7 @@ mod tests {
         },
         &abort,
         &run_options,
+        &[],
       )
       .expect("Latin aligner empty-text must short-circuit Ok");
     assert!(

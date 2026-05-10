@@ -98,7 +98,7 @@ pub mod __bench {
   pub use crate::runner::aligner::algorithm::{
     encode::LogProbsTV,
     normalize::{scalar, zero_mean_unit_var_normalize},
-    tokenize::{TokenizedText, tokenize_with_word_map},
+    tokenize::{TokenizedText, detect_oov_events, tokenize_with_word_map},
     trellis_beam::{
       ALIGN_BEAM_WIDTH, PathPointPublic, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments,
       backtrack_beam, get_trellis,

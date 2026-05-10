@@ -14,8 +14,8 @@
 //! - [`crate::core::Transcriber`] — the existing Sans-I/O
 //!   state machine; pull commands via `poll_command()`,
 //!   dispatch them inline, push results back via
-//!   `inject_asr_result` / `inject_alignment_result` /
-//!   `inject_failure`.
+//!   `handle_asr` / `handle_alignment` /
+//!   `handle_failure`.
 //!
 //! Sync users (CLI tools, batch indexers) drive the pump on
 //! one thread. The full ASR + alignment loop, using
@@ -42,17 +42,32 @@
 //!
 //! while let Some(cmd) = transcriber.poll_command() {
 //!   match cmd {
-//!     Command::RunAsr { chunk_id, samples, params, .. } => {
+//!     Command::Asr { chunk_id, samples, params, .. } => {
 //!       let result = asr_source.run_chunk(AsrChunkContext {
 //!         samples: &samples,
 //!         params: &params,
 //!         abort_flag: &abort_flag,
 //!         chunk_id,
 //!       })?;
-//!       transcriber.inject_asr_result(chunk_id, result)?;
+//!       transcriber.handle_asr(chunk_id, result)?;
 //!     }
-//!     Command::RunAlignment { chunk_id, samples, sub_segments: _,
+//!     Command::Alignment { chunk_id, samples, sub_segments: _,
 //!                              text, language, runs } => {
+//!       // Sans-I/O OOV resolution: per-run detect + decide.
+//!       // Each run gets its own decisions vec sized + ordered
+//!       // by the events `detect_oov` produces for that run's
+//!       // text + language. Whole-chunk fallback (when `runs`
+//!       // is empty) gets one inner vec.
+//!       let oov_decisions: Vec<Vec<whispery::core::ResolvedOov>> =
+//!         if runs.is_empty() {
+//!           let events = alignment_set.detect_oov(&text, &language)?;
+//!           vec![whispery::core::default_oov_decisions(&events)]
+//!         } else {
+//!           alignment_set.detect_oov_per_run(&runs)?
+//!             .iter()
+//!             .map(|ev| whispery::core::default_oov_decisions(ev))
+//!             .collect()
+//!         };
 //!       // `AlignWorkItem::from_run_alignment` flips the
 //!       // command's output-timebase `sub_segments` into
 //!       // chunk-local 1/16000 (the form `Aligner::align`
@@ -61,13 +76,13 @@
 //!       // already drained — recoverable.
 //!       let job = AlignWorkItem::from_run_alignment(
 //!         &transcriber, chunk_id, samples, text, language,
-//!         runs, abort_flag.clone(),
+//!         runs, abort_flag.clone(), oov_decisions,
 //!       ).expect("chunk in flight");
 //!       // Fresh `RunOptions` per chunk so a watchdog's
 //!       // `terminate()` for chunk N does not poison chunk N+1.
 //!       let run_options = RunOptions::new().unwrap();
 //!       let aligned = run_one_alignment(&alignment_set, &job, &run_options)?;
-//!       transcriber.inject_alignment_result(chunk_id, aligned)?;
+//!       transcriber.handle_alignment(chunk_id, aligned)?;
 //!     }
 //!   }
 //! }
