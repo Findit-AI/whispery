@@ -1,7 +1,8 @@
 //! ONNX encode + log-softmax stage of the alignment algorithm.
 
-use alloc::{string::String, vec::Vec};
 
+
+use smol_str::{SmolStr, format_smolstr};
 use ort::{
   session::{RunOptions, Session},
   value::{Shape, Tensor},
@@ -109,7 +110,7 @@ pub(crate) fn encode_log_softmax(
   if t_samples == 0 {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: String::from("samples_for_aligner is empty"),
+      message: SmolStr::from("samples_for_aligner is empty"),
       language: language.clone(),
     });
   }
@@ -128,7 +129,7 @@ pub(crate) fn encode_log_softmax(
     Tensor::from_array((input_shape, samples_for_aligner.to_vec())).map_err(|e| {
       WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!("Tensor::from_array failed: {e:?}"),
+        message: format_smolstr!("Tensor::from_array failed: {e:?}"),
         language: language.clone(),
       }
     })?;
@@ -142,7 +143,7 @@ pub(crate) fn encode_log_softmax(
     .run_with_options(ort::inputs![input_tensor], run_options)
     .map_err(|e| WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!("Session::run_with_options failed: {e:?}"),
+      message: format_smolstr!("Session::run_with_options failed: {e:?}"),
       language: language.clone(),
     })?;
 
@@ -151,7 +152,7 @@ pub(crate) fn encode_log_softmax(
   let mut iter = outputs.into_iter();
   let (_, output_value) = iter.next().ok_or_else(|| WorkFailure::AlignmentFailed {
     kind: AlignmentFailureKind::ModelInferenceFailed,
-    message: String::from("Session::run returned no outputs"),
+    message: SmolStr::from("Session::run returned no outputs"),
     language: language.clone(),
   })?;
 
@@ -160,14 +161,14 @@ pub(crate) fn encode_log_softmax(
       .try_extract_tensor::<f32>()
       .map_err(|e| WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!("try_extract_tensor::<f32> failed: {e:?}"),
+        message: format_smolstr!("try_extract_tensor::<f32> failed: {e:?}"),
         language: language.clone(),
       })?;
 
   if shape.len() != 3 || shape[0] != 1 {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!("expected output shape (1, T, V); got {shape:?}"),
+      message: format_smolstr!("expected output shape (1, T, V); got {shape:?}"),
       language: language.clone(),
     });
   }
@@ -220,7 +221,7 @@ pub(crate) fn validate_output_dims(
   if raw_v <= 0 {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!("ORT output has non-positive vocab dim: V={raw_v}"),
+      message: format_smolstr!("ORT output has non-positive vocab dim: V={raw_v}"),
       language: language.clone(),
     });
   }
@@ -229,7 +230,7 @@ pub(crate) fn validate_output_dims(
   if raw_t < 0 {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!("ORT output has negative time dim: T={raw_t}"),
+      message: format_smolstr!("ORT output has negative time dim: T={raw_t}"),
       language: language.clone(),
     });
   }
@@ -243,7 +244,7 @@ pub(crate) fn validate_output_dims(
     if raw_len != 0 {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "ORT output declared T=0 but buffer has {raw_len} elements; shape/data mismatch"
         ),
         language: language.clone(),
@@ -251,7 +252,7 @@ pub(crate) fn validate_output_dims(
     }
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
-      message: String::from(
+      message: SmolStr::from(
         "ORT output has zero encoder frames (chunk too short to align); \
  transcript will surface with words: []",
       ),
@@ -265,7 +266,7 @@ pub(crate) fn validate_output_dims(
     Err(_) => {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!("ORT output T={raw_t} doesn't fit in usize"),
+        message: format_smolstr!("ORT output T={raw_t} doesn't fit in usize"),
         language: language.clone(),
       });
     }
@@ -275,7 +276,7 @@ pub(crate) fn validate_output_dims(
     Err(_) => {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!("ORT output V={raw_v} doesn't fit in usize"),
+        message: format_smolstr!("ORT output V={raw_v} doesn't fit in usize"),
         language: language.clone(),
       });
     }
@@ -285,7 +286,7 @@ pub(crate) fn validate_output_dims(
     None => {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "ORT output dimensions overflow: T={t} * V={v} doesn't fit in usize"
         ),
         language: language.clone(),
@@ -295,7 +296,7 @@ pub(crate) fn validate_output_dims(
   if total != raw_len {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!(
+      message: format_smolstr!(
         "ORT output buffer length {raw_len} doesn't match declared T={t} × V={v} = {total}"
       ),
       language: language.clone(),
@@ -346,7 +347,7 @@ pub(crate) fn validate_stride_extent(
   if frame_extent > upper_bound {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!(
+      message: format_smolstr!(
         "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
  sample-equivalents exceeds chunk ({chunk_extent} samples) + 2-frame slack \
  ({upper_bound}); model export uses a smaller stride than `hop_samples` \
@@ -358,7 +359,7 @@ pub(crate) fn validate_stride_extent(
   if frame_extent < lower_bound {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!(
+      message: format_smolstr!(
         "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
  sample-equivalents below chunk ({chunk_extent} samples) − 2-frame slack \
  ({lower_bound}); model export uses a larger stride than `hop_samples` \
@@ -394,7 +395,7 @@ pub(crate) fn validate_vocab_dim(
   if v != expected_v {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!(
+      message: format_smolstr!(
         "ORT output vocab dim V={v} doesn't match tokenizer vocab size {expected_v}; \
  model and tokenizer are paired incorrectly — Viterbi would otherwise read \
  posteriors from columns that don't correspond to the tokenizer's tokens"
@@ -433,7 +434,7 @@ pub(crate) fn log_softmax_with_finite_guard(
     if let Some(bad_v) = row.iter().position(|x| !x.is_finite()) {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "ORT returned non-finite logit at frame {t_idx}, vocab {bad_v}: {}",
           row[bad_v]
         ),
@@ -470,7 +471,7 @@ pub(crate) fn log_softmax_with_finite_guard(
       // also covers.
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "log-softmax shifted normaliser non-finite at frame {t_idx}: \
  sum.ln()={log_z_shifted}, max={max}"
         ),
@@ -494,7 +495,7 @@ pub(crate) fn log_softmax_with_finite_guard(
       if !lp.is_finite() {
         return Err(WorkFailure::AlignmentFailed {
           kind: AlignmentFailureKind::ModelInferenceFailed,
-          message: alloc::format!(
+          message: format_smolstr!(
             "log-softmax output non-finite at frame {t_idx}: \
  x={x}, max={max}, sum_ln={log_z_shifted}, lp={lp}"
           ),
@@ -526,7 +527,7 @@ pub(crate) fn reject_non_finite_input(samples: &[f32], language: &Lang) -> Resul
   if let Some(bad_idx) = samples.iter().position(|s| !s.is_finite()) {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!(
+      message: format_smolstr!(
         "samples_for_aligner contains non-finite value at index {bad_idx}: {}",
         samples[bad_idx]
       ),
@@ -566,7 +567,7 @@ mod tests {
   #[test]
   fn reject_non_finite_input_flags_nan() {
     use crate::types::Lang;
-    let samples = alloc::vec![0.1_f32, 0.2, f32::NAN, 0.4];
+    let samples = vec![0.1_f32, 0.2, f32::NAN, 0.4];
     let err = reject_non_finite_input(&samples, &Lang::En).unwrap_err();
     match err {
       WorkFailure::AlignmentFailed { kind, message, .. } => {
@@ -583,14 +584,14 @@ mod tests {
   #[test]
   fn reject_non_finite_input_flags_positive_infinity() {
     use crate::types::Lang;
-    let samples = alloc::vec![0.0_f32, f32::INFINITY];
+    let samples = vec![0.0_f32, f32::INFINITY];
     assert!(reject_non_finite_input(&samples, &Lang::En).is_err());
   }
 
   #[test]
   fn reject_non_finite_input_flags_negative_infinity() {
     use crate::types::Lang;
-    let samples = alloc::vec![f32::NEG_INFINITY, 0.0_f32];
+    let samples = vec![f32::NEG_INFINITY, 0.0_f32];
     assert!(reject_non_finite_input(&samples, &Lang::En).is_err());
   }
 
@@ -600,7 +601,7 @@ mod tests {
     // Both ordinary [-1, 1] audio and high-magnitude finite
     // inputs are accepted at this layer — magnitude precision
     // is the SIMD-precision-guard's job, not this guard's.
-    let samples = alloc::vec![-1.0_f32, 0.0, 1.0, 1e10, -1e10];
+    let samples = vec![-1.0_f32, 0.0, 1.0, 1e10, -1e10];
     assert!(reject_non_finite_input(&samples, &Lang::En).is_ok());
   }
 
@@ -609,7 +610,7 @@ mod tests {
     let lp = LogProbsTV {
       t: 2,
       v: 3,
-      data: alloc::vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0],
+      data: vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0],
     };
     assert_eq!(lp.at(0, 0), -1.0);
     assert_eq!(lp.at(0, 2), -3.0);
@@ -624,7 +625,7 @@ mod tests {
   #[test]
   fn log_softmax_rejects_nan_logits_with_model_inference_failed() {
     use crate::types::Lang;
-    let raw = alloc::vec![0.0_f32, f32::NAN, 0.0]; // 1×3
+    let raw = vec![0.0_f32, f32::NAN, 0.0]; // 1×3
     let err = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).unwrap_err();
     match err {
       WorkFailure::AlignmentFailed { kind, message, .. } => {
@@ -643,14 +644,14 @@ mod tests {
   #[test]
   fn log_softmax_rejects_positive_infinity_logits() {
     use crate::types::Lang;
-    let raw = alloc::vec![0.0_f32, f32::INFINITY, 0.0];
+    let raw = vec![0.0_f32, f32::INFINITY, 0.0];
     assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
   }
 
   #[test]
   fn log_softmax_rejects_negative_infinity_logits() {
     use crate::types::Lang;
-    let raw = alloc::vec![f32::NEG_INFINITY, 0.0, 0.0];
+    let raw = vec![f32::NEG_INFINITY, 0.0, 0.0];
     assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
   }
 
@@ -664,7 +665,7 @@ mod tests {
   #[test]
   fn log_softmax_rejects_all_neg_infinity_row() {
     use crate::types::Lang;
-    let raw = alloc::vec![f32::NEG_INFINITY; 3];
+    let raw = vec![f32::NEG_INFINITY; 3];
     assert!(log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).is_err());
   }
 
@@ -680,7 +681,7 @@ mod tests {
   #[test]
   fn log_softmax_rejects_finite_extremes_that_overflow_lp() {
     use crate::types::Lang;
-    let raw = alloc::vec![f32::MAX, -f32::MAX];
+    let raw = vec![f32::MAX, -f32::MAX];
     let err = log_softmax_with_finite_guard(&raw, 1, 2, &Lang::En).unwrap_err();
     let WorkFailure::AlignmentFailed { kind, message, .. } = err else {
       panic!("expected AlignmentFailed");
@@ -697,7 +698,7 @@ mod tests {
   #[test]
   fn log_softmax_finite_input_roundtrips() {
     use crate::types::Lang;
-    let raw = alloc::vec![1.0_f32, 2.0, 3.0];
+    let raw = vec![1.0_f32, 2.0, 3.0];
     let out = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).expect("ok");
     assert_eq!(out.len(), 3);
     assert!(out.iter().all(|x| x.is_finite()));
@@ -720,7 +721,7 @@ mod tests {
     // max_f64) - sum.ln()`) so the shifted log-prob is correct
     // regardless of `max`'s magnitude.
     use crate::types::Lang;
-    let raw = alloc::vec![1.0e20_f32, 1.0e20_f32];
+    let raw = vec![1.0e20_f32, 1.0e20_f32];
     let out = log_softmax_with_finite_guard(&raw, 1, 2, &Lang::En).expect("ok");
     assert_eq!(out.len(), 2);
     assert!(out.iter().all(|x| x.is_finite()));
@@ -968,7 +969,7 @@ mod tests {
   fn log_softmax_locates_nan_to_specific_frame() {
     use crate::types::Lang;
     // 3 frames × 2 vocab; frame 2's first element is NaN.
-    let raw = alloc::vec![0.0_f32, 0.1, 0.0, 0.1, f32::NAN, 0.1];
+    let raw = vec![0.0_f32, 0.1, 0.0, 0.1, f32::NAN, 0.1];
     let err = log_softmax_with_finite_guard(&raw, 3, 2, &Lang::En).unwrap_err();
     let WorkFailure::AlignmentFailed { message, .. } = err else {
       panic!("expected AlignmentFailed");

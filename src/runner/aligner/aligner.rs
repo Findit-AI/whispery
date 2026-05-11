@@ -669,7 +669,7 @@ impl Aligner {
     // of converting it into `Event::Error` — alignment becoming
     // optional, not a data-loss path.
     if tokenized.token_ids().is_empty() {
-      return Ok(AlignmentResult::new(alloc::vec::Vec::new()));
+      return Ok(AlignmentResult::new(Vec::new()));
     }
 
     if abort_flag.load(Ordering::Relaxed) {
@@ -2217,8 +2217,8 @@ mod tests {
     )
     .expect("Aligner::from_paths(Ja)");
 
-    let samples = alloc::vec![0.0_f32; 16_000];
-    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let samples = vec![0.0_f32; 16_000];
+    let sub_segments: Vec<TimeRange> = Vec::new();
     let abort = AtomicBool::new(false);
     let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
     let result = aligner
@@ -2270,8 +2270,8 @@ mod tests {
     )
     .expect("Aligner::from_paths(Zh)");
 
-    let samples = alloc::vec![0.0_f32; 16_000];
-    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let samples = vec![0.0_f32; 16_000];
+    let sub_segments: Vec<TimeRange> = Vec::new();
     let abort = AtomicBool::new(false);
     let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
     let result = aligner
@@ -2332,8 +2332,8 @@ mod tests {
     )
     .expect("Aligner::from_paths(Ko)");
 
-    let samples = alloc::vec![0.0_f32; 16_000];
-    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let samples = vec![0.0_f32; 16_000];
+    let sub_segments: Vec<TimeRange> = Vec::new();
     let abort = AtomicBool::new(false);
     let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
     let result = aligner
@@ -2386,8 +2386,8 @@ mod tests {
     )
     .expect("Aligner::from_paths(Latin)");
 
-    let samples = alloc::vec![0.0_f32; 16_000];
-    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let samples = vec![0.0_f32; 16_000];
+    let sub_segments: Vec<TimeRange> = Vec::new();
     let abort = AtomicBool::new(false);
     let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
     let result = aligner

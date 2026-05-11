@@ -40,7 +40,7 @@
 //!   special boundary rules beyond letting them through
 //!   `is_word_punct`'s strip phase.
 
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use std::borrow::Cow;
 
 use crate::{
   runner::aligner::normalizer::{NormalizationError, NormalizedText, TextNormalizer},
@@ -286,7 +286,7 @@ impl TextNormalizer for LatinNormalizer {
             })
             .collect()
         } else {
-          alloc::vec![(String::from(raw_token), 0usize, false)]
+          vec![(String::from(raw_token), 0usize, false)]
         };
 
       for (sub_token, sub_offset, is_clitic_left) in &token_pieces {

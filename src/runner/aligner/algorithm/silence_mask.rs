@@ -1,7 +1,7 @@
 //! Silence-mask construction stage of the alignment algorithm.
 
 #[cfg(test)]
-use alloc::vec::Vec;
+use Vec;
 
 #[cfg(test)]
 use mediatime::TimeRange;
@@ -49,7 +49,7 @@ where
   F: Fn(TimeRange) -> (u64, u64),
 {
   let n = samples.len();
-  let mut out = alloc::vec![0.0_f32; n];
+  let mut out = vec![0.0_f32; n];
 
   for &seg in sub_segments {
     let (start, end) = output_range_to_chunk_local(seg);
@@ -81,7 +81,7 @@ mod tests {
 
   #[test]
   fn empty_segments_zero_everything() {
-    let samples = alloc::vec![1.0_f32; 100];
+    let samples = vec![1.0_f32; 100];
     let masked = build_masked_samples(&samples, &[], ms_to_chunk_local);
     assert!(masked.iter().all(|&x| x == 0.0));
   }
@@ -119,7 +119,7 @@ mod tests {
 
   #[test]
   fn segment_past_end_clamps() {
-    let samples = alloc::vec![1.0_f32; 50];
+    let samples = vec![1.0_f32; 50];
     let seg = TimeRange::new(40, 200, tb_16k());
     let masked = build_masked_samples(&samples, &[seg], ms_to_chunk_local);
     assert!(masked.iter().take(40).all(|&x| x == 0.0));
@@ -128,7 +128,7 @@ mod tests {
 
   #[test]
   fn overlapping_segments_idempotent() {
-    let samples = alloc::vec![1.0_f32; 100];
+    let samples = vec![1.0_f32; 100];
     let segs = [
       TimeRange::new(20, 60, tb_16k()),
       TimeRange::new(40, 80, tb_16k()),
@@ -142,7 +142,7 @@ mod tests {
 
   #[test]
   fn does_not_mutate_input() {
-    let samples = alloc::vec![1.0_f32; 50];
+    let samples = vec![1.0_f32; 50];
     let snapshot = samples.clone();
     let _ = build_masked_samples(&samples, &[], ms_to_chunk_local);
     assert_eq!(samples, snapshot);

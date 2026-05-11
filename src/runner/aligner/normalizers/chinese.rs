@@ -1,6 +1,6 @@
 //! Chinese text normaliser (character-level, WhisperX-compatible).
 
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use std::borrow::Cow;
 
 use crate::runner::aligner::normalizer::{NormalizationError, NormalizedText, TextNormalizer};
 

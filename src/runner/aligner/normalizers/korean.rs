@@ -1,6 +1,6 @@
 //! Korean text normaliser (character-level).
 
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use std::borrow::Cow;
 
 use crate::runner::aligner::normalizer::{NormalizationError, NormalizedText, TextNormalizer};
 

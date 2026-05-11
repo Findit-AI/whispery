@@ -59,7 +59,7 @@
 //! SIMD paths come out measurably faster on real chunks (480 k
 //! samples for 30 s @ 16 kHz). All backends keep the f64 accumulator.
 
-use alloc::vec::Vec;
+use Vec;
 
 /// f32 horizontal-sum overflow recovery shared across all SIMD
 /// backends. Real audio in `[-1, 1]` never trips the check;
@@ -352,7 +352,7 @@ pub(crate) fn normalize_with_silence_mask(samples: &[f32], speech_mask: &[bool])
   // drops every word — exactly what the silence-mask contract
   // says should happen for an all-silent chunk.
   if count == 0 {
-    return alloc::vec![0.0_f32; samples.len()];
+    return vec![0.0_f32; samples.len()];
   }
 
   let mean = sum / count as f64;
@@ -879,7 +879,7 @@ mod tests {
 
   #[test]
   fn constant_signal_normalises_to_zero() {
-    let xs = alloc::vec![3.7_f32; 100];
+    let xs = vec![3.7_f32; 100];
     let out = zero_mean_unit_var_normalize(&xs);
     assert!(out.iter().all(|&v| v.abs() < 1e-3));
   }
@@ -894,7 +894,7 @@ mod tests {
   /// a 1-element tail to also exercise the per-backend tail
   /// loops on the recovery path.
   fn high_dynamic_range_input() -> Vec<f32> {
-    let mut xs = alloc::vec::Vec::with_capacity(33);
+    let mut xs = Vec::with_capacity(33);
     for _ in 0..16 {
       xs.push(1e20_f32);
       xs.push(-1e20_f32);
@@ -976,7 +976,7 @@ mod tests {
   /// canonical "f32 cancellation" shape.
   fn finite_high_magnitude_input() -> Vec<f32> {
     let base = 1.0e8_f32;
-    let mut xs = alloc::vec::Vec::with_capacity(1024);
+    let mut xs = Vec::with_capacity(1024);
     for i in 0..1024 {
       xs.push(if i % 2 == 0 { base } else { -base });
       // Add tiny finite jitter that f32 cannot represent at this
@@ -1026,7 +1026,7 @@ mod tests {
   #[test]
   fn silence_mask_normalize_keeps_masked_positions_at_zero() {
     // 16 samples: [speech with DC offset]+[silence]+[speech with DC offset].
-    let mut samples = alloc::vec![0.0_f32; 16];
+    let mut samples = vec![0.0_f32; 16];
     // Speech region 1: indices 0..4, DC = 0.5 with small ripple.
     samples[0] = 0.5;
     samples[1] = 0.6;
@@ -1039,7 +1039,7 @@ mod tests {
     samples[14] = 0.4;
     samples[15] = 0.5;
 
-    let mut speech_mask = alloc::vec![false; 16];
+    let mut speech_mask = vec![false; 16];
     for slot in &mut speech_mask[0..4] {
       *slot = true;
     }
@@ -1070,10 +1070,10 @@ mod tests {
   /// chunk.
   #[test]
   fn silence_mask_normalize_all_silence_yields_zeros() {
-    let samples = alloc::vec![0.5_f32, 0.6, 0.4, 0.5];
-    let speech_mask = alloc::vec![false; 4];
+    let samples = vec![0.5_f32, 0.6, 0.4, 0.5];
+    let speech_mask = vec![false; 4];
     let normed = normalize_with_silence_mask(&samples, &speech_mask);
-    assert_eq!(normed, alloc::vec![0.0_f32; 4]);
+    assert_eq!(normed, vec![0.0_f32; 4]);
   }
 
   /// Speech-only mask → identical to the regular
@@ -1082,8 +1082,8 @@ mod tests {
   /// for the all-speech case.
   #[test]
   fn silence_mask_normalize_all_speech_matches_regular_normalize() {
-    let samples = alloc::vec![0.5_f32, 0.6, 0.4, 0.5, -0.3, -0.1, 0.2, 0.8];
-    let speech_mask = alloc::vec![true; samples.len()];
+    let samples = vec![0.5_f32, 0.6, 0.4, 0.5, -0.3, -0.1, 0.2, 0.8];
+    let speech_mask = vec![true; samples.len()];
     let masked = normalize_with_silence_mask(&samples, &speech_mask);
     let regular = scalar::zero_mean_unit_var_normalize(&samples);
     assert_matches_scalar(&masked, &regular);
@@ -1100,7 +1100,7 @@ mod tests {
   #[test]
   fn dispatched_low_variance_near_one_matches_scalar() {
     let next_up_one = f32::from_bits(1.0_f32.to_bits() + 1);
-    let mut xs = alloc::vec::Vec::with_capacity(64);
+    let mut xs = Vec::with_capacity(64);
     for _ in 0..32 {
       xs.push(1.0_f32);
       xs.push(next_up_one);
@@ -1125,7 +1125,7 @@ mod tests {
     // magnitude more than 1e-4.
     let mag = 100.0_f32;
     let next_up = f32::from_bits(mag.to_bits() + 1);
-    let mut xs = alloc::vec::Vec::with_capacity(64);
+    let mut xs = Vec::with_capacity(64);
     for _ in 0..32 {
       xs.push(mag);
       xs.push(next_up);

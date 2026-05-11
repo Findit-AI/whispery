@@ -61,8 +61,8 @@ use crate::{runner::aligner::normalizer::TextNormalizer, types::Lang};
 /// normalizer (e.g., feeding Arabic text through the
 /// `EnglishNormalizer`) would bake in bugs that only surface
 /// during alignment as nonsensical IoU.
-pub fn default_normalizer_for(lang: &Lang) -> Option<alloc::boxed::Box<dyn TextNormalizer>> {
-  use alloc::boxed::Box;
+pub fn default_normalizer_for(lang: &Lang) -> Option<Box<dyn TextNormalizer>> {
+  use Box;
   match lang {
     // Chinese: char-level segmentation, no word delimiter.
     Lang::Zh | Lang::Yue => Some(Box::new(ChineseNormalizer::new())),

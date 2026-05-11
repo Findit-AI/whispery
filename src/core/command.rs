@@ -6,7 +6,7 @@
 //! `FullParams`; a future swap to candle-whisper or a CTranslate2
 //! binding would change only the runner.
 
-use alloc::{sync::Arc, vec::Vec};
+use std::sync::Arc;
 
 use mediatime::TimeRange;
 #[cfg(feature = "serde")]
@@ -151,7 +151,7 @@ where
   use serde::de::Error as _;
   let v = i32::deserialize(deserializer)?;
   if v < 1 {
-    return Err(D::Error::custom(alloc::format!(
+    return Err(D::Error::custom(format!(
       "n_threads must be >= 1 (got {v}); whisper.cpp would underflow / abort otherwise"
     )));
   }

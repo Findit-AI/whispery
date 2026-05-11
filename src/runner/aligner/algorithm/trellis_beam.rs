@@ -38,7 +38,8 @@
 //! / `ModelInferenceFailed` rather than a panicking out-of-bounds
 //! read.
 
-use alloc::{string::String, vec::Vec};
+
+use smol_str::{SmolStr, format_smolstr};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
@@ -203,7 +204,7 @@ pub fn get_trellis(
   if num_tokens == 0 {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
-      message: String::from("token sequence is empty"),
+      message: SmolStr::from("token sequence is empty"),
       language: language.clone(),
     });
   }
@@ -211,7 +212,7 @@ pub fn get_trellis(
   if (blank_id as usize) >= v {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!(
+      message: format_smolstr!(
         "blank token id {blank_id} >= model output vocab dim {v}; tokenizer/model mismatch?"
       ),
       language: language.clone(),
@@ -224,7 +225,7 @@ pub fn get_trellis(
     if tok < 0 {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::TokenizationFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "token id {tok} at position {i} is negative (only the wildcard \
  sentinel {WILDCARD_TOKEN_ID} is allowed); tokenizer bug?"
         ),
@@ -234,7 +235,7 @@ pub fn get_trellis(
     if (tok as usize) >= v {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::TokenizationFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "token id {tok} at position {i} >= model output vocab dim {v}; \
  tokenizer/model mismatch?"
         ),
@@ -250,7 +251,7 @@ pub fn get_trellis(
   if t < num_tokens {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
-      message: alloc::format!(
+      message: format_smolstr!(
         "audio too short: T={} frames < {} chars; trellis is degenerate",
         t,
         num_tokens
@@ -264,7 +265,7 @@ pub fn get_trellis(
     None => {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::NoAlignmentPath,
-        message: alloc::format!("trellis size overflows usize: T={t} * num_tokens={num_tokens}"),
+        message: format_smolstr!("trellis size overflows usize: T={t} * num_tokens={num_tokens}"),
         language: language.clone(),
       });
     }
@@ -272,7 +273,7 @@ pub fn get_trellis(
   if cells > TRELLIS_CELL_BUDGET {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
-      message: alloc::format!(
+      message: format_smolstr!(
         "trellis exceeds {} cells (T={} × num_tokens={} = {})",
         TRELLIS_CELL_BUDGET,
         t,
@@ -291,7 +292,7 @@ pub fn get_trellis(
 
   // Allocate as a flat `T * num_tokens` row-major buffer so we can
   // index with `trellis[t * num_tokens + j]` without nested Vecs.
-  let mut trellis = alloc::vec![0.0_f32; cells];
+  let mut trellis = vec![0.0_f32; cells];
 
   // `trellis[0, 1:] = -inf` — at frame 0 we can only be at column 0.
   for j in 1..num_tokens {
@@ -489,14 +490,14 @@ pub fn backtrack_beam(
   if num_tokens == 0 {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
-      message: String::from("token sequence is empty"),
+      message: SmolStr::from("token sequence is empty"),
       language: language.clone(),
     });
   }
   if t == 0 {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
-      message: String::from("emission has zero frames"),
+      message: SmolStr::from("emission has zero frames"),
       language: language.clone(),
     });
   }
@@ -511,7 +512,7 @@ pub fn backtrack_beam(
   if !final_score.is_finite() {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
-      message: alloc::format!(
+      message: format_smolstr!(
         "trellis end cell at (t={}, j={}) is non-finite ({}); no path to backtrack",
         final_t,
         final_j,
@@ -545,7 +546,7 @@ pub fn backtrack_beam(
     point_score: log_probs.at(final_t, blank_id as usize).exp(),
     prev: None,
   });
-  let mut active: Vec<u32> = alloc::vec![0_u32];
+  let mut active: Vec<u32> = vec![0_u32];
   let mut next_active: Vec<u32> = Vec::with_capacity(beam_width * 2);
 
   // Iterate until every beam has reached token 0 (or the beam list
@@ -645,7 +646,7 @@ pub fn backtrack_beam(
         if arena.len() >= BEAM_NODE_BUDGET {
           return Err(WorkFailure::AlignmentFailed {
             kind: AlignmentFailureKind::NoAlignmentPath,
-            message: alloc::format!(
+            message: format_smolstr!(
               "beam arena exceeded {BEAM_NODE_BUDGET} nodes; lattice likely degenerate \
  (high T, very few tokens). Aborting backtrack to bound memory."
             ),
@@ -668,7 +669,7 @@ pub fn backtrack_beam(
         if arena.len() >= BEAM_NODE_BUDGET {
           return Err(WorkFailure::AlignmentFailed {
             kind: AlignmentFailureKind::NoAlignmentPath,
-            message: alloc::format!(
+            message: format_smolstr!(
               "beam arena exceeded {BEAM_NODE_BUDGET} nodes (change branch); lattice \
  likely degenerate. Aborting backtrack to bound memory."
             ),
@@ -701,7 +702,7 @@ pub fn backtrack_beam(
   if active.is_empty() {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::NoAlignmentPath,
-      message: String::from("beam search emptied before reaching token 0"),
+      message: SmolStr::from("beam search emptied before reaching token 0"),
       language: language.clone(),
     });
   }
@@ -966,7 +967,7 @@ pub fn align_to_word_segments(
   if tokens.len() != word_idx_per_token.len() {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::TokenizationFailed,
-      message: alloc::format!(
+      message: format_smolstr!(
         "tokens.len() = {} != word_idx_per_token.len() = {}; tokenizer bug?",
         tokens.len(),
         word_idx_per_token.len()
@@ -1015,7 +1016,7 @@ mod tests {
   use super::*;
   use crate::types::Lang;
 
-  fn lp(t: usize, v: usize, vals: alloc::vec::Vec<f32>) -> LogProbsTV {
+  fn lp(t: usize, v: usize, vals: Vec<f32>) -> LogProbsTV {
     assert_eq!(vals.len(), t * v);
     LogProbsTV::new(t, v, vals)
   }
@@ -1033,7 +1034,7 @@ mod tests {
     // path.
     let v = 3;
     let t = 4;
-    let mut data = alloc::vec![0.0_f32; t * v];
+    let mut data = vec![0.0_f32; t * v];
     // Make blank's logprob -0.5 every frame; vocab 1 = -10.
     for ti in 0..t {
       data[ti * v] = -0.5; // blank
@@ -1057,7 +1058,7 @@ mod tests {
     // start at token 0.
     let v = 3;
     let t = 3;
-    let log_probs = lp(t, v, alloc::vec![-1.0_f32; t * v]);
+    let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
     let trellis = get_trellis(&log_probs, &[1, 2], 0, never(), &Lang::En).expect("trellis");
     assert!(trellis[1].is_infinite());
     assert!(trellis[1] < 0.0);
@@ -1069,7 +1070,7 @@ mod tests {
     // get +inf in column 0 to force the final advance.
     let v = 3;
     let t = 5;
-    let log_probs = lp(t, v, alloc::vec![-1.0_f32; t * v]);
+    let log_probs = lp(t, v, vec![-1.0_f32; t * v]);
     let trellis = get_trellis(&log_probs, &[1, 2, 1], 0, never(), &Lang::En).expect("trellis");
     assert!(trellis[3 * 3].is_infinite() && trellis[3 * 3] > 0.0);
     assert!(trellis[4 * 3].is_infinite() && trellis[4 * 3] > 0.0);
@@ -1084,7 +1085,7 @@ mod tests {
     let t = 3;
     // Make tokens more expensive than blank so the change branch
     // costs more; the recurrence chooses max(stay, change).
-    let mut data = alloc::vec![-100.0_f32; t * v];
+    let mut data = vec![-100.0_f32; t * v];
     for ti in 0..t {
       data[ti * v] = -1.0; // blank
       data[ti * v + 1] = -2.0; // token id 1
@@ -1121,7 +1122,7 @@ mod tests {
     let tokens = [1_i32, 2]; // tokens[0] = vocab id 1, tokens[1] = vocab id 2.
 
     // Baseline emission table. Column 0 = blank.
-    let mut base = alloc::vec![-2.0_f32; t * v];
+    let mut base = vec![-2.0_f32; t * v];
     for ti in 0..t {
       base[ti * v + blank] = -0.5;
     }
@@ -1161,7 +1162,7 @@ mod tests {
     // 1 frame, V=4. blank=0, vocab=[0, 1, 2, 3].
     // logprobs: [0, -2, -1, -3]. Max non-blank = -1 (vocab=2).
     let v = 4;
-    let log_probs = lp(1, v, alloc::vec![0.0, -2.0, -1.0, -3.0]);
+    let log_probs = lp(1, v, vec![0.0, -2.0, -1.0, -3.0]);
     let m = max_non_blank_logprob(&log_probs, 0, 0);
     assert!((m - (-1.0)).abs() < 1e-6);
   }
@@ -1196,7 +1197,7 @@ mod tests {
     // regardless of how `p_emission` shifts the relative scores.
     let v = 3;
     let t = 3;
-    let mut data = alloc::vec![-100.0_f32; t * v];
+    let mut data = vec![-100.0_f32; t * v];
     data[0] = -0.5; // frame 0 blank
     data[1] = -0.4; // frame 0 token 1
     data[3] = -0.5; // frame 1 blank
@@ -1222,7 +1223,7 @@ mod tests {
     // comparator produces. Adding `p_emission` to the rank would
     // shift this sequence and break parity, which the docblock
     // documents.
-    let token_seq: alloc::vec::Vec<usize> = path.iter().map(|p| p.token_index).collect();
+    let token_seq: Vec<usize> = path.iter().map(|p| p.token_index).collect();
     // First frame must seed at token 0 (the leading blank slot).
     // Last frame must reach the final token.
     assert_eq!(token_seq[0], 0, "leading blank invariant");
@@ -1241,7 +1242,7 @@ mod tests {
     // every frame and ends at token 1 (the LAST token).
     let v = 3;
     let t = 3;
-    let mut data = alloc::vec![-100.0_f32; t * v];
+    let mut data = vec![-100.0_f32; t * v];
     data[1] = -0.1; // frame 0: token 1
     data[3] = -0.1; // frame 1: blank
     data[8] = -0.1; // frame 2: token 2
@@ -1270,7 +1271,7 @@ mod tests {
 
   #[test]
   fn merge_repeats_groups_by_token_index() {
-    let path = alloc::vec![
+    let path = vec![
       PathPointPublic {
         token_index: 0,
         time_index: 0,
@@ -1348,7 +1349,7 @@ mod tests {
     // Two chars: char 0 length 1, score 0.5; char 1 length 3,
     // score 1.0. Duration-weighted mean = (0.5*1 + 1.0*3) /
     // (1+3) = 3.5/4 = 0.875.
-    let segs = alloc::vec![
+    let segs = vec![
       CharSegment {
         token_index: 0,
         start_frame: 0,
@@ -1379,7 +1380,7 @@ mod tests {
   /// transition between adjacent chars.
   #[test]
   fn merge_words_no_separator_splits_by_word_idx() {
-    let segs = alloc::vec![
+    let segs = vec![
       CharSegment {
         token_index: 0,
         start_frame: 0,
@@ -1426,7 +1427,7 @@ mod tests {
   /// third to word 1. Two `WordSegment`s expected.
   #[test]
   fn merge_words_no_separator_groups_same_word_idx_across_chars() {
-    let segs = alloc::vec![
+    let segs = vec![
       CharSegment {
         token_index: 0,
         start_frame: 0,
@@ -1472,7 +1473,7 @@ mod tests {
   /// first via `is_separator`).
   #[test]
   fn merge_words_separator_still_works() {
-    let segs = alloc::vec![
+    let segs = vec![
       CharSegment {
         token_index: 0,
         start_frame: 0,
@@ -1535,7 +1536,7 @@ mod tests {
     let v = 4;
     let t = 4;
     // Default to a strong blank, weak everything else.
-    let mut data = alloc::vec![-100.0_f32; t * v];
+    let mut data = vec![-100.0_f32; t * v];
     // Frame 0: token 1 wins (path: at j=0, change to j=1).
     data[0] = -10.0; // blank
     data[1] = -0.1; // token 1
@@ -1552,7 +1553,7 @@ mod tests {
     data[15] = -0.1;
 
     let log_probs = lp(t, v, data);
-    let tokens = alloc::vec![1_i32, 2_i32, 3_i32];
+    let tokens = vec![1_i32, 2_i32, 3_i32];
     let abort = AtomicBool::new(false);
     let trellis = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En).expect("trellis builds");
 
@@ -1571,7 +1572,7 @@ mod tests {
     // from frame 0 forward. We assert the (token_index,
     // time_index) sequence — the path may include the implicit
     // initial point at frame 0 + the trailing blank at the end.
-    let coords: alloc::vec::Vec<(usize, usize)> =
+    let coords: Vec<(usize, usize)> =
       path.iter().map(|p| (p.token_index, p.time_index)).collect();
 
     // The transition-scored backtrack must pick a path that
@@ -1582,7 +1583,7 @@ mod tests {
     // sequence, which the predecessor-only ranking would NOT
     // guarantee on this construction (it would skip token 2
     // entirely in some construction variants).
-    let visited: alloc::collections::BTreeSet<usize> = coords.iter().map(|(j, _)| *j).collect();
+    let visited: std::collections::BTreeSet<usize> = coords.iter().map(|(j, _)| *j).collect();
     assert!(
       visited.contains(&0) && visited.contains(&1) && visited.contains(&2),
       "transition-scored backtrack must visit every token; got {:?}",
@@ -1598,7 +1599,7 @@ mod tests {
     // to word 0 (no separator).
     let v = 3;
     let t = 4;
-    let mut data = alloc::vec![-100.0_f32; t * v];
+    let mut data = vec![-100.0_f32; t * v];
     data[1] = -0.1;
     data[3] = -0.1;
     data[8] = -0.1;
@@ -1633,7 +1634,7 @@ mod tests {
     // the local cell value; beam keeps both and re-evaluates.
     let v = 3;
     let t = 4;
-    let mut data = alloc::vec![-1.0_f32; t * v];
+    let mut data = vec![-1.0_f32; t * v];
     // Frame 0: blank cheap.
     data[0] = -0.1;
     data[1] = -1.0;
@@ -1656,14 +1657,14 @@ mod tests {
       backtrack_beam(&trellis, &log_probs, &[1, 2], 0, 2, never(), &Lang::En).expect("path");
     assert_eq!(path.len(), t);
     // The path should include both token 0 and token 1.
-    let tokens: alloc::vec::Vec<usize> = path.iter().map(|p| p.token_index).collect();
+    let tokens: Vec<usize> = path.iter().map(|p| p.token_index).collect();
     assert!(tokens.iter().any(|&j| j == 0));
     assert!(tokens.iter().any(|&j| j == 1));
   }
 
   #[test]
   fn empty_token_sequence_returns_no_alignment_path() {
-    let log_probs = lp(3, 3, alloc::vec![0.0_f32; 9]);
+    let log_probs = lp(3, 3, vec![0.0_f32; 9]);
     let err = get_trellis(&log_probs, &[], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
@@ -1677,7 +1678,7 @@ mod tests {
   #[test]
   fn audio_too_short_t_lt_num_tokens_errors() {
     // tokens=[1, 2, 3] needs T >= 3; T=2 fails.
-    let log_probs = lp(2, 4, alloc::vec![0.0_f32; 8]);
+    let log_probs = lp(2, 4, vec![0.0_f32; 8]);
     let err = get_trellis(&log_probs, &[1, 2, 3], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
@@ -1690,7 +1691,7 @@ mod tests {
 
   #[test]
   fn out_of_vocab_real_token_id_errors() {
-    let log_probs = lp(3, 3, alloc::vec![0.0_f32; 9]);
+    let log_probs = lp(3, 3, vec![0.0_f32; 9]);
     let err = get_trellis(&log_probs, &[1, 99], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
@@ -1705,14 +1706,14 @@ mod tests {
   fn wildcard_token_id_minus_one_passes_validation() {
     // Wildcards bypass the vocab-bound check; they're synthesised
     // by the tokeniser, not produced by the model.
-    let log_probs = lp(3, 4, alloc::vec![-0.5_f32; 12]);
+    let log_probs = lp(3, 4, vec![-0.5_f32; 12]);
     let trellis = get_trellis(&log_probs, &[1, WILDCARD_TOKEN_ID], 0, never(), &Lang::En);
     assert!(trellis.is_ok(), "wildcard tokens must pass validation");
   }
 
   #[test]
   fn negative_real_token_id_other_than_wildcard_errors() {
-    let log_probs = lp(3, 3, alloc::vec![0.0_f32; 9]);
+    let log_probs = lp(3, 3, vec![0.0_f32; 9]);
     let err = get_trellis(&log_probs, &[1, -2], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
@@ -1725,7 +1726,7 @@ mod tests {
 
   #[test]
   fn aborted_trellis_returns_worker_hang_timeout() {
-    let log_probs = lp(2_000, 4, alloc::vec![-0.1_f32; 2_000 * 4]);
+    let log_probs = lp(2_000, 4, vec![-0.1_f32; 2_000 * 4]);
     // Token list of 200 distinct entries to give the DP enough
     // work that the row-loop abort check fires.
     let tokens: Vec<i32> = (0..200).map(|i| 1 + (i % 3)).collect();
@@ -1744,7 +1745,7 @@ mod tests {
   fn budget_exceeded_returns_no_alignment_path() {
     // T=8000 × num_tokens=5000 = 40M cells > 32M budget.
     // intentionally undersized
-    let log_probs = LogProbsTV::new(8_000, 8, alloc::vec![0.0_f32; 1]);
+    let log_probs = LogProbsTV::new(8_000, 8, vec![0.0_f32; 1]);
     let tokens: Vec<i32> = (0..5_000).map(|i| 1 + (i % 4)).collect();
     let err = get_trellis(&log_probs, &tokens, 0, never(), &Lang::En).unwrap_err();
     let WorkFailure::AlignmentFailed { kind, message, .. } = err else {

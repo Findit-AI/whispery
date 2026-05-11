@@ -7,7 +7,7 @@
 //! emitted [`Word`]s, applying whispery's silence-aware post-pass
 //! on top of WhisperX's bit-exact frame ranges.
 
-use alloc::{borrow::Cow, vec::Vec};
+use std::borrow::Cow;
 use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{TimeRange, Timebase};
@@ -113,9 +113,9 @@ pub(crate) fn build_speech_frames(
   // `encoder_n_samples` for the single `n_samples` slot.
   real_n_samples: u64,
   sub_segments: &[mediatime::TimeRange],
-) -> alloc::vec::Vec<bool> {
+) -> Vec<bool> {
   if !samples_per_frame.is_finite() || samples_per_frame <= 0.0 {
-    return alloc::vec![false; n_frames];
+    return vec![false; n_frames];
   }
   // A frame is marked "speech" only if at least half its
   // `samples_per_frame` samples are inside some VAD sub-segment.
@@ -179,7 +179,7 @@ pub(crate) fn build_speech_frames(
   // overshoot here lets `compose_words` keep CTC word spans
   // over silence/padding. this clamped to
   // `n_samples_i64` (encoder length).
-  let mut clamped_segs: alloc::vec::Vec<(i64, i64)> = sub_segments
+  let mut clamped_segs: Vec<(i64, i64)> = sub_segments
     .iter()
     .map(|s| {
       (
@@ -190,8 +190,8 @@ pub(crate) fn build_speech_frames(
     .filter(|(s, e)| e > s)
     .collect();
   clamped_segs.sort_by_key(|&(s, _)| s);
-  let mut merged_segs: alloc::vec::Vec<(i64, i64)> =
-    alloc::vec::Vec::with_capacity(clamped_segs.len());
+  let mut merged_segs: Vec<(i64, i64)> =
+    Vec::with_capacity(clamped_segs.len());
   for (s, e) in clamped_segs {
     match merged_segs.last_mut() {
       // Touching (`s == last.1`) or overlapping (`s < last.1`)
@@ -205,7 +205,7 @@ pub(crate) fn build_speech_frames(
     }
   }
 
-  let mut overlap_per_frame = alloc::vec![0_i64; n_frames];
+  let mut overlap_per_frame = vec![0_i64; n_frames];
   for &(seg_start, seg_end) in &merged_segs {
     // Iterate every frame that touches the (now non-overlapping)
     // segment and accumulate the per-frame overlap.
@@ -454,8 +454,8 @@ mod tests {
     // collapse to anchor; a 5-frame * 320-sample window adds
     // 1600 samples.
     let anchor = u64::MAX - 100;
-    let original = alloc::vec![Cow::Borrowed("hi")];
-    let speech_frames = alloc::vec![true; 5];
+    let original = vec![Cow::Borrowed("hi")];
+    let speech_frames = vec![true; 5];
     // Even with a tiny offset the saturating add lands at
     // `u64::MAX`; `chunk_end_sample` (real_n_samples added to
     // anchor by `Aligner::align`) also saturates, so the
@@ -488,8 +488,8 @@ mod tests {
 
   #[test]
   fn empty_word_segments_yields_empty_alignment() {
-    let original = alloc::vec![Cow::Borrowed("hello")];
-    let speech_frames = alloc::vec![true; 5];
+    let original = vec![Cow::Borrowed("hello")];
+    let speech_frames = vec![true; 5];
     let result = compose_words(
       &[],
       &original,
@@ -508,8 +508,8 @@ mod tests {
 
   #[test]
   fn surface_form_preserved_not_normalized() {
-    let original = alloc::vec![Cow::Borrowed("Hello!")];
-    let speech_frames = alloc::vec![true; 3];
+    let original = vec![Cow::Borrowed("Hello!")];
+    let speech_frames = vec![true; 3];
     let result = compose_words(
       &[one_word(0, 3, 0.8, 0)],
       &original,
@@ -528,8 +528,8 @@ mod tests {
 
   #[test]
   fn out_of_range_word_index_is_dropped() {
-    let original = alloc::vec![Cow::Borrowed("hi")];
-    let speech_frames = alloc::vec![true; 3];
+    let original = vec![Cow::Borrowed("hi")];
+    let speech_frames = vec![true; 3];
     // word_index=5 doesn't exist in original_words.
     let result = compose_words(
       &[one_word(0, 3, 0.5, 5)],
@@ -553,8 +553,8 @@ mod tests {
     // samples_per_frame = 480_000 / 1499 ≈ 320.2135. Frame 100
     // maps to ≈ 32021 samples (NOT 32 000 as nominal `100 * 320`
     // would give).
-    let original = alloc::vec![Cow::Borrowed("ratio")];
-    let speech_frames = alloc::vec![true; 1500];
+    let original = vec![Cow::Borrowed("ratio")];
+    let speech_frames = vec![true; 1500];
     let result = compose_words(
       &[one_word(100, 110, 0.9, 0)],
       &original,
@@ -580,8 +580,8 @@ mod tests {
 
   #[test]
   fn word_in_silence_drops() {
-    let original = alloc::vec![Cow::Borrowed("hi")];
-    let speech_frames = alloc::vec![false; 5];
+    let original = vec![Cow::Borrowed("hi")];
+    let speech_frames = vec![false; 5];
     let result = compose_words(
       &[one_word(0, 5, 0.9, 0)],
       &original,
@@ -601,8 +601,8 @@ mod tests {
   #[test]
   fn word_with_brief_silent_gap_is_kept() {
     // 5 frames; speech at 0,1,3,4; silence at 2. coverage=4/5
-    let original = alloc::vec![Cow::Borrowed("hello")];
-    let speech_frames = alloc::vec![true, true, false, true, true];
+    let original = vec![Cow::Borrowed("hello")];
+    let speech_frames = vec![true, true, false, true, true];
     let result = compose_words(
       &[one_word(0, 5, 0.9, 0)],
       &original,
@@ -622,8 +622,8 @@ mod tests {
   #[test]
   fn word_spanning_long_silent_gap_drops() {
     // 21 frames; speech only at 0 and 20. coverage=2/21.
-    let original = alloc::vec![Cow::Borrowed("split")];
-    let mut speech_frames = alloc::vec![false; 21];
+    let original = vec![Cow::Borrowed("split")];
+    let mut speech_frames = vec![false; 21];
     speech_frames[0] = true;
     speech_frames[20] = true;
     let result = compose_words(
@@ -645,8 +645,8 @@ mod tests {
   #[test]
   fn fragmented_word_with_minority_speech_drops() {
     // 5 frames; only frame 0 speech. coverage=1/5=0.2 < 0.5.
-    let original = alloc::vec![Cow::Borrowed("missed")];
-    let speech_frames = alloc::vec![true, false, false, false, false];
+    let original = vec![Cow::Borrowed("missed")];
+    let speech_frames = vec![true, false, false, false, false];
     let result = compose_words(
       &[one_word(0, 5, 0.9, 0)],
       &original,
@@ -667,8 +667,8 @@ mod tests {
   fn ranges_clamped_to_chunk_bounds() {
     // 4 frames; word at [0,4); n_samples=1000 (well under the
     // 4*320=1280 nominal). Must clamp end to 1000.
-    let original = alloc::vec![Cow::Borrowed("ok")];
-    let speech_frames = alloc::vec![true; 4];
+    let original = vec![Cow::Borrowed("ok")];
+    let speech_frames = vec![true; 4];
     let result = compose_words(
       &[one_word(0, 4, 0.9, 0)],
       &original,
@@ -691,8 +691,8 @@ mod tests {
     // n_samples=900 → effective ratio 900/3 = 300. Word at
     // frames [3,4); raw_start = 3 * 300 = 900 = chunk_end. So
     // the start is exactly at the chunk_end — must drop.
-    let original = alloc::vec![Cow::Borrowed("late")];
-    let speech_frames = alloc::vec![true; 4];
+    let original = vec![Cow::Borrowed("late")];
+    let speech_frames = vec![true; 4];
     let result = compose_words(
       &[one_word(3, 4, 0.9, 0)],
       &original,
@@ -715,24 +715,24 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let segs = alloc::vec![TimeRange::new(320, 960, tb_16k)];
+    let segs = vec![TimeRange::new(320, 960, tb_16k)];
     let mask = build_speech_frames(
       /* n_frames: */ 5, /* samples_per_frame: */ 320.0, /* n_samples: */ 1600,
       /* real_n_samples: */ 1600, &segs,
     );
-    assert_eq!(mask, alloc::vec![false, true, true, false, false]);
+    assert_eq!(mask, vec![false, true, true, false, false]);
   }
 
   #[test]
   fn build_speech_frames_handles_no_segments() {
     let mask = build_speech_frames(4, 320.0, 1280, 1280, &[]);
-    assert_eq!(mask, alloc::vec![false; 4]);
+    assert_eq!(mask, vec![false; 4]);
   }
 
   #[test]
   fn build_speech_frames_hop_one_with_no_segments_is_all_silence() {
     let mask = build_speech_frames(8, 1.0, 8, 8, &[]);
-    assert_eq!(mask, alloc::vec![false; 8]);
+    assert_eq!(mask, vec![false; 8]);
   }
 
   /// a 100-sample all-speech
@@ -750,14 +750,14 @@ mod tests {
     // Encoder length 400 (padded), real audio length 100,
     // single 320-sample-per-frame frame, sub-segment covers
     // the entire real audio [0, 100).
-    let segs = alloc::vec![mediatime::TimeRange::new(0, 100, tb_16k)];
+    let segs = vec![mediatime::TimeRange::new(0, 100, tb_16k)];
     let mask = build_speech_frames(
       /* n_frames: */ 1, /* samples_per_frame: */ 320.0, /* n_samples: */ 400,
       /* real_n_samples: */ 100, &segs,
     );
     assert_eq!(
       mask,
-      alloc::vec![true],
+      vec![true],
       "all-speech 100-sample run padded to 400 must classify frame 0 as speech",
     );
   }
@@ -784,14 +784,14 @@ mod tests {
     // clamped to [0, 100] before overlap math → frame 0 is
     // speech (100 samples ≥ 50-sample real-window threshold),
     // frames 1 and 2 stay silent (real_width=0).
-    let segs = alloc::vec![mediatime::TimeRange::new(0, 600, tb_16k)];
+    let segs = vec![mediatime::TimeRange::new(0, 600, tb_16k)];
     let mask = build_speech_frames(
       /* n_frames: */ 3, /* samples_per_frame: */ 320.0, /* n_samples: */ 960,
       /* real_n_samples: */ 100, &segs,
     );
     assert_eq!(
       mask,
-      alloc::vec![true, false, false],
+      vec![true, false, false],
       "overshooting VAD must clamp to real audio; only frame 0 should be speech",
     );
   }
@@ -809,14 +809,14 @@ mod tests {
     // for frame 0. Frame 0's real_width is 50 → threshold is
     // ceil(50/2)=25; 10 < 25 → silent. Frame 1 has
     // real_width=0 → silent.
-    let segs = alloc::vec![mediatime::TimeRange::new(40, 320, tb_16k)];
+    let segs = vec![mediatime::TimeRange::new(40, 320, tb_16k)];
     let mask = build_speech_frames(
       /* n_frames: */ 2, /* samples_per_frame: */ 320.0, /* n_samples: */ 640,
       /* real_n_samples: */ 50, &segs,
     );
     assert_eq!(
       mask,
-      alloc::vec![false, false],
+      vec![false, false],
       "partial overshoot must not credit padded samples; \
  real overlap (10) is below real-window threshold (25)",
     );
@@ -836,14 +836,14 @@ mod tests {
     // real_width=0). Sub-segment covers only padded territory
     // (clamped to [0, 100] so it ends up [0, 100], frame 0 is
     // speech, frame 1 stays silent).
-    let segs = alloc::vec![mediatime::TimeRange::new(0, 100, tb_16k)];
+    let segs = vec![mediatime::TimeRange::new(0, 100, tb_16k)];
     let mask = build_speech_frames(
       /* n_frames: */ 2, /* samples_per_frame: */ 320.0, /* n_samples: */ 640,
       /* real_n_samples: */ 100, &segs,
     );
     assert_eq!(
       mask,
-      alloc::vec![true, false],
+      vec![true, false],
       "frame 1 covers only padding; even with a sub-segment in [0,100] only frame 0 should be speech",
     );
   }
@@ -854,11 +854,11 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let segs = alloc::vec![TimeRange::new(0, 1, tb_16k)];
+    let segs = vec![TimeRange::new(0, 1, tb_16k)];
     let mask = build_speech_frames(4, 3.0, 12, 12, &segs);
-    assert_eq!(mask, alloc::vec![false; 4]);
+    assert_eq!(mask, vec![false; 4]);
 
-    let segs_at = alloc::vec![TimeRange::new(0, 2, tb_16k)];
+    let segs_at = vec![TimeRange::new(0, 2, tb_16k)];
     let mask_at = build_speech_frames(4, 3.0, 12, 12, &segs_at);
     assert!(mask_at[0]);
   }
@@ -869,15 +869,15 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let segs_at = alloc::vec![TimeRange::new(0, 160, tb_16k)];
+    let segs_at = vec![TimeRange::new(0, 160, tb_16k)];
     assert_eq!(
       build_speech_frames(2, 320.0, 640, 640, &segs_at),
-      alloc::vec![true, false]
+      vec![true, false]
     );
-    let segs_under = alloc::vec![TimeRange::new(0, 159, tb_16k)];
+    let segs_under = vec![TimeRange::new(0, 159, tb_16k)];
     assert_eq!(
       build_speech_frames(2, 320.0, 640, 640, &segs_under),
-      alloc::vec![false, false]
+      vec![false, false]
     );
   }
 
@@ -887,13 +887,13 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
 
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let segs = alloc::vec![
+    let segs = vec![
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(160, 240, tb_16k),
     ];
     assert_eq!(
       build_speech_frames(2, 320.0, 640, 640, &segs),
-      alloc::vec![true, false]
+      vec![true, false]
     );
   }
 
@@ -917,14 +917,14 @@ mod tests {
     // = 160 samples (=min_overlap_samples threshold), marking
     // it as speech. With clamping, seg becomes [320, 320] →
     // empty, no overlap, frame 1 stays silent.
-    let segs = alloc::vec![TimeRange::new(320, 480, tb_16k)];
+    let segs = vec![TimeRange::new(320, 480, tb_16k)];
     let mask = build_speech_frames(
       /* n_frames: */ 2, 320.0, /* n_samples: */ 320, /* real_n_samples: */ 320,
       &segs,
     );
     assert_eq!(
       mask,
-      alloc::vec![false, false],
+      vec![false, false],
       "out-of-range seg must not credit phantom samples"
     );
 
@@ -934,7 +934,7 @@ mod tests {
     // threshold → still silent. Without clamping, the unclamped
     // seg would let frame 1 inherit phantom overlap from
     // [320, 480) and might trip the threshold.
-    let partial = alloc::vec![TimeRange::new(200, 480, tb_16k)];
+    let partial = vec![TimeRange::new(200, 480, tb_16k)];
     let mask_partial = build_speech_frames(2, 320.0, 320, 320, &partial);
     assert!(
       !mask_partial[1],
@@ -959,7 +959,7 @@ mod tests {
     use mediatime::{TimeRange, Timebase};
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
 
-    let overlapping = alloc::vec![
+    let overlapping = vec![
       TimeRange::new(0, 100, tb_16k),
       TimeRange::new(50, 150, tb_16k),
     ];
@@ -972,23 +972,23 @@ mod tests {
     );
     assert_eq!(
       mask,
-      alloc::vec![false],
+      vec![false],
       "overlapping segs must be coalesced to their union; sum 200 vs union 150 (< 160 threshold)"
     );
 
     // Sanity counter-test: two segs whose UNION crosses the
     // threshold MUST classify speech. Picks ranges that
     // overlap but whose merged extent comfortably exceeds 160.
-    let union_speech = alloc::vec![
+    let union_speech = vec![
       TimeRange::new(0, 100, tb_16k),
       TimeRange::new(80, 200, tb_16k), // union = [0, 200] = 200 samples
     ];
     let mask_speech = build_speech_frames(1, 320.0, 320, 320, &union_speech);
-    assert_eq!(mask_speech, alloc::vec![true]);
+    assert_eq!(mask_speech, vec![true]);
 
     // Triple-overlap stress: three segs all overlapping the
     // same prefix. Sum can be ≥ 3× union; union must still win.
-    let triple = alloc::vec![
+    let triple = vec![
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(20, 100, tb_16k),
       TimeRange::new(40, 120, tb_16k),
@@ -997,7 +997,7 @@ mod tests {
     // Union = [0, 120] = 120 < 160 → silent.
     assert_eq!(
       mask_triple,
-      alloc::vec![false],
+      vec![false],
       "triple-overlap union (120) < threshold (160) must classify silent regardless of summed sum"
     );
   }
@@ -1012,12 +1012,12 @@ mod tests {
     use core::num::NonZeroU32;
     use mediatime::{TimeRange, Timebase};
     let tb_16k = Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let touching = alloc::vec![
+    let touching = vec![
       TimeRange::new(0, 80, tb_16k),
       TimeRange::new(80, 160, tb_16k),
     ];
     let mask = build_speech_frames(1, 320.0, 320, 320, &touching);
-    assert_eq!(mask, alloc::vec![true]);
+    assert_eq!(mask, vec![true]);
   }
 
   #[test]
@@ -1071,7 +1071,7 @@ mod tests {
     // Pick a VAD segment in the middle of the chunk so the
     // small per-frame drift across many frames can shift
     // boundary frames between the two mappings.
-    let mid_segment = alloc::vec![TimeRange::new(240_000, 240_640, tb_16k)];
+    let mid_segment = vec![TimeRange::new(240_000, 240_640, tb_16k)];
     let mask_eff = build_speech_frames(
       total_frames,
       samples_per_frame,
@@ -1126,8 +1126,8 @@ mod tests {
   /// adjacent script-dispatch runs.
   #[test]
   fn padded_short_slice_clamps_to_real_n_samples_not_encoder_n_samples() {
-    let original = alloc::vec![Cow::Borrowed("hi")];
-    let speech_frames = alloc::vec![true; 3];
+    let original = vec![Cow::Borrowed("hi")];
+    let speech_frames = vec![true; 3];
     // encoder_n_samples = 400 (padded receptive field), but the
     // real audio is only 200 samples. Word at frames [0, 3) maps
     // (via 400 / (3-1) = 200 spf) to [0, 600) raw — which the
@@ -1157,8 +1157,8 @@ mod tests {
 
   #[test]
   fn score_is_clamped_to_unit_interval() {
-    let original = alloc::vec![Cow::Borrowed("hi")];
-    let speech_frames = alloc::vec![true; 3];
+    let original = vec![Cow::Borrowed("hi")];
+    let speech_frames = vec![true; 3];
     let result = compose_words(
       &[one_word(0, 3, 1.5, 0)], // out of [0,1]
       &original,
@@ -1186,8 +1186,8 @@ mod tests {
   /// failure mode.
   #[test]
   fn longer_max_intra_silent_run_keeps_word_default_would_drop() {
-    let original = alloc::vec![Cow::Borrowed("ok")];
-    let speech_frames = alloc::vec![
+    let original = vec![Cow::Borrowed("ok")];
+    let speech_frames = vec![
       true, true, false, false, false, false, false, true, true, true, true, true,
     ];
     let default_result = compose_words(
@@ -1232,8 +1232,8 @@ mod tests {
   /// supported (coverage 0.8). The default 0.5 keeps it.
   #[test]
   fn stricter_min_speech_coverage_drops_word_default_would_keep() {
-    let original = alloc::vec![Cow::Borrowed("ok")];
-    let speech_frames = alloc::vec![true, true, false, true, true];
+    let original = vec![Cow::Borrowed("ok")];
+    let speech_frames = vec![true, true, false, true, true];
     let default_result = compose_words(
       &[one_word(0, 5, 0.9, 0)],
       &original,

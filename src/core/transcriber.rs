@@ -595,7 +595,7 @@ impl Transcriber {
   pub fn chunk_samples_to_output_range_fn(
     &self,
     chunk_id: ChunkId,
-  ) -> Option<alloc::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync>> {
+  ) -> Option<std::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync>> {
     self.dispatch.chunk_samples_to_output_range_fn(chunk_id)
   }
 
@@ -629,7 +629,7 @@ impl Transcriber {
   pub fn chunk_sub_segments_samples(
     &self,
     chunk_id: ChunkId,
-  ) -> Option<alloc::vec::Vec<(u64, u64)>> {
+  ) -> Option<Vec<(u64, u64)>> {
     self.dispatch.chunk_sub_segments_samples(chunk_id)
   }
 
@@ -1697,7 +1697,7 @@ mod tests {
     // additional Asr commands (without lock) for the drained
     // chunks 1, 2, 3.
     let mut run_asr_count = 0;
-    let mut hints = alloc::vec::Vec::new();
+    let mut hints = Vec::new();
     while let Some(cmd) = t.poll_command() {
       if let Command::Asr {
         params, chunk_id, ..
@@ -1764,7 +1764,7 @@ mod tests {
       .unwrap();
     t.handle_eof().unwrap();
 
-    let mut chunk_starts = alloc::vec::Vec::new();
+    let mut chunk_starts = Vec::new();
     while let Some(cmd) = t.poll_command() {
       if let crate::core::command::Command::Asr { chunk_id, .. } = cmd {
         chunk_starts.push(chunk_id.as_u64());

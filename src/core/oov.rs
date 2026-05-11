@@ -301,7 +301,7 @@ impl ResolvedOov {
 /// per-deployment policy should write their own loop over
 /// `events`.
 #[must_use]
-pub fn default_oov_decisions(events: &[OovEvent]) -> alloc::vec::Vec<ResolvedOov> {
+pub fn default_oov_decisions(events: &[OovEvent]) -> Vec<ResolvedOov> {
   events
     .iter()
     .map(|ev| {
@@ -329,7 +329,7 @@ pub fn default_oov_decisions(events: &[OovEvent]) -> alloc::vec::Vec<ResolvedOov
 /// callers that want WhisperX-1:1 outputs and accept the
 /// silent-misalignment risk on pronounced symbols.
 #[must_use]
-pub fn wildcard_all_decisions(events: &[OovEvent]) -> alloc::vec::Vec<ResolvedOov> {
+pub fn wildcard_all_decisions(events: &[OovEvent]) -> Vec<ResolvedOov> {
   events
     .iter()
     .map(|ev| ResolvedOov {
@@ -343,7 +343,7 @@ pub fn wildcard_all_decisions(events: &[OovEvent]) -> alloc::vec::Vec<ResolvedOo
 /// even one wildcard alignment is too much (e.g. legal /
 /// medical transcription pipelines that read PII aloud).
 #[must_use]
-pub fn fail_closed_all_decisions(events: &[OovEvent]) -> alloc::vec::Vec<ResolvedOov> {
+pub fn fail_closed_all_decisions(events: &[OovEvent]) -> Vec<ResolvedOov> {
   events
     .iter()
     .map(|ev| ResolvedOov {
@@ -384,17 +384,17 @@ mod tests {
     }
   }
 
-  fn decisions_only(resolved: &[ResolvedOov]) -> alloc::vec::Vec<OovDecision> {
+  fn decisions_only(resolved: &[ResolvedOov]) -> Vec<OovDecision> {
     resolved.iter().map(|r| r.decision).collect()
   }
 
   #[test]
   fn default_wildcards_alphanumeric() {
-    let events = alloc::vec![ev('4'), ev('a'), ev('Z')];
+    let events = vec![ev('4'), ev('a'), ev('Z')];
     let resolved = default_oov_decisions(&events);
     assert_eq!(
       decisions_only(&resolved),
-      alloc::vec![
+      vec![
         OovDecision::Wildcard,
         OovDecision::Wildcard,
         OovDecision::Wildcard,
@@ -408,19 +408,19 @@ mod tests {
 
   #[test]
   fn default_wildcards_apostrophes() {
-    let events = alloc::vec![ev('\''), ev('\u{2019}')];
+    let events = vec![ev('\''), ev('\u{2019}')];
     assert_eq!(
       decisions_only(&default_oov_decisions(&events)),
-      alloc::vec![OovDecision::Wildcard, OovDecision::Wildcard]
+      vec![OovDecision::Wildcard, OovDecision::Wildcard]
     );
   }
 
   #[test]
   fn default_fails_closed_on_pronounced_symbols() {
-    let events = alloc::vec![ev('&'), ev('@'), ev('%'), ev(',')];
+    let events = vec![ev('&'), ev('@'), ev('%'), ev(',')];
     assert_eq!(
       decisions_only(&default_oov_decisions(&events)),
-      alloc::vec![
+      vec![
         OovDecision::FailClosed,
         OovDecision::FailClosed,
         OovDecision::FailClosed,
@@ -431,10 +431,10 @@ mod tests {
 
   #[test]
   fn wildcard_all_does_what_it_says() {
-    let events = alloc::vec![ev('a'), ev('&'), ev(',')];
+    let events = vec![ev('a'), ev('&'), ev(',')];
     assert_eq!(
       decisions_only(&wildcard_all_decisions(&events)),
-      alloc::vec![
+      vec![
         OovDecision::Wildcard,
         OovDecision::Wildcard,
         OovDecision::Wildcard,
@@ -444,10 +444,10 @@ mod tests {
 
   #[test]
   fn fail_closed_all_does_what_it_says() {
-    let events = alloc::vec![ev('a'), ev('&'), ev(',')];
+    let events = vec![ev('a'), ev('&'), ev(',')];
     assert_eq!(
       decisions_only(&fail_closed_all_decisions(&events)),
-      alloc::vec![
+      vec![
         OovDecision::FailClosed,
         OovDecision::FailClosed,
         OovDecision::FailClosed,
@@ -460,10 +460,10 @@ mod tests {
   /// under the default policy — matches historical behaviour.
   #[test]
   fn default_wildcards_structural_kinds() {
-    let events = alloc::vec![boundary_ev(), internal_ev('.')];
+    let events = vec![boundary_ev(), internal_ev('.')];
     assert_eq!(
       decisions_only(&default_oov_decisions(&events)),
-      alloc::vec![OovDecision::Wildcard, OovDecision::Wildcard],
+      vec![OovDecision::Wildcard, OovDecision::Wildcard],
     );
   }
 
@@ -473,10 +473,10 @@ mod tests {
   /// wildcard alignment is unacceptable.
   #[test]
   fn fail_closed_all_includes_structural_wildcards() {
-    let events = alloc::vec![ev('a'), boundary_ev(), internal_ev('.')];
+    let events = vec![ev('a'), boundary_ev(), internal_ev('.')];
     assert_eq!(
       decisions_only(&fail_closed_all_decisions(&events)),
-      alloc::vec![
+      vec![
         OovDecision::FailClosed,
         OovDecision::FailClosed,
         OovDecision::FailClosed,

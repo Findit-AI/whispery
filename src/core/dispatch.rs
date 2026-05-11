@@ -1,10 +1,6 @@
 //! Dispatch state machine — per-chunk lifecycle, in-order emission.
 
-use alloc::{
-  collections::{BTreeMap, VecDeque},
-  sync::Arc,
-  vec::Vec,
-};
+use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
 
 use mediatime::TimeRange;
 
@@ -238,7 +234,7 @@ pub(crate) struct Dispatch {
   /// last-observed language at threshold. For `n > 1` that
   /// diverged from the "most-frequent" contract — a noisy
   /// `En, En, Zh` sequence would have locked to Zh.
-  pub auto_lock_observations: alloc::vec::Vec<Lang>,
+  pub auto_lock_observations: Vec<Lang>,
   /// Per-ChunkId resolution status for AutoLockAfter ordering. An
   /// entry's value is `Some(lang)` for a non-empty ASR result and
   /// `None` for either an empty-text result or an ASR-stage
@@ -303,7 +299,7 @@ impl Dispatch {
       asr_params,
       language_policy,
       locked_language,
-      auto_lock_observations: alloc::vec::Vec::new(),
+      auto_lock_observations: Vec::new(),
       auto_lock_pending: BTreeMap::new(),
       auto_lock_cursor: ChunkId::from_raw(0),
       parked_command: None,
@@ -768,7 +764,7 @@ impl Dispatch {
   pub(crate) fn chunk_sub_segments_samples(
     &self,
     chunk_id: ChunkId,
-  ) -> Option<alloc::vec::Vec<(u64, u64)>> {
+  ) -> Option<Vec<(u64, u64)>> {
     let record = self.in_flight.get(&chunk_id)?;
     Some(record.sub_segments_samples.clone())
   }
@@ -785,7 +781,7 @@ impl Dispatch {
   pub(crate) fn chunk_samples_to_output_range_fn(
     &self,
     chunk_id: ChunkId,
-  ) -> Option<alloc::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync>> {
+  ) -> Option<std::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync>> {
     let record = self.in_flight.get(&chunk_id)?;
     Some(
       crate::core::buffer::SampleBuffer::samples_to_output_range_fn_at(
@@ -850,7 +846,7 @@ mod tests {
   fn fake_chunk(start: u64, end: u64) -> MergedChunk {
     MergedChunk {
       range: SampleRange::new(start, end),
-      subs: alloc::vec![SubRange {
+      subs: vec![SubRange {
         range: SampleRange::new(start, end),
         origin: SubOrigin::Vad { vad_seq: 0 },
       }],
@@ -903,7 +899,7 @@ mod tests {
         Event::Error { chunk_id, .. } => chunk_id.as_u64(),
       })
       .collect();
-    assert_eq!(ids, alloc::vec![0, 1, 2]);
+    assert_eq!(ids, vec![0, 1, 2]);
   }
 
   /// Adversarial regression for the per-packet override binding
@@ -1208,7 +1204,7 @@ mod tests {
     // Phase is AwaitingAsr.
     let r = d.handle_alignment(
       ChunkId::from_raw(0),
-      crate::core::command::AlignmentResult::new(alloc::vec::Vec::new()),
+      crate::core::command::AlignmentResult::new(Vec::new()),
     );
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
   }
@@ -1229,7 +1225,7 @@ mod tests {
       ChunkId::from_raw(1),
       WorkFailure::AsrFailed {
         kind: crate::types::AsrFailureKind::AllTemperaturesFailed,
-        message: alloc::string::String::from("late failure"),
+        message: SmolStr::from("late failure"),
       },
     );
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));

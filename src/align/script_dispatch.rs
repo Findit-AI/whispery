@@ -16,7 +16,7 @@
 //! `runner`-feature [`dispatch`] entry point wraps real whispercpp
 //! segments through the trait; tests build mock segments directly.
 
-use alloc::vec::Vec;
+use Vec;
 
 use smol_str::SmolStr;
 
@@ -872,7 +872,7 @@ fn compute_bounds(
 mod runner_glue {
   //! Bridge `whispercpp::Segment<'_>` onto [`super::SegmentLike`].
 
-  use alloc::vec::Vec;
+  use Vec;
 
   use super::{SegmentLike, TokenInfo};
 
@@ -927,7 +927,7 @@ mod runner_glue {
       let segment_text = self.seg.text().unwrap_or("");
       let mut out = Vec::new();
       let mut offset: usize = 0;
-      let mut accumulated: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(segment_text.len());
+      let mut accumulated: Vec<u8> = Vec::with_capacity(segment_text.len());
       let mut tokens_iter = self.seg.tokens_iter();
       let mut any_token_seen = false;
       for tok in tokens_iter.by_ref() {
@@ -996,7 +996,7 @@ pub fn dispatch(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use alloc::{string::String, vec};
+  use std::vec;
 
   /// Minimal mock implementing [`SegmentLike`] for unit tests.
   /// Times are in centiseconds (matches whisper.cpp's native unit

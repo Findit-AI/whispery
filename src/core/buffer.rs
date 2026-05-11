@@ -10,7 +10,7 @@
 //! in-flight chunks already hold their audio in their own
 //! `Arc<[f32]>` (decoupled from the live buffer).
 
-use alloc::vec::Vec;
+use Vec;
 
 use mediatime::{Timebase, Timestamp};
 
@@ -250,7 +250,7 @@ impl SampleBuffer {
   /// Extract a chunk's samples as a fresh `Arc<[f32]>` without
   /// mutating the buffer. The range is in stream-relative 16 kHz
   /// indices (i.e., absolute, not relative to the live buffer).
-  pub(crate) fn extract(&self, range: crate::core::cut::SampleRange) -> alloc::sync::Arc<[f32]> {
+  pub(crate) fn extract(&self, range: crate::core::cut::SampleRange) -> std::sync::Arc<[f32]> {
     let lo = (range.start - self.buffer_drop_offset) as usize;
     let hi = (range.end - self.buffer_drop_offset) as usize;
     let slice = &self.samples[lo..hi];
@@ -291,8 +291,8 @@ impl SampleBuffer {
   pub(crate) fn samples_to_output_range_fn_at(
     tb: Timebase,
     base_pts_out_anchor: i64,
-  ) -> alloc::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync> {
-    alloc::sync::Arc::new(
+  ) -> std::sync::Arc<dyn Fn(u64, u64) -> mediatime::TimeRange + Send + Sync> {
+    std::sync::Arc::new(
       move |start_sample: u64, end_sample: u64| -> mediatime::TimeRange {
         let s_pts =
           base_pts_out_anchor + Timebase::rescale_pts(start_sample as i64, ANALYSIS_TIMEBASE, tb);
