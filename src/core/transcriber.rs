@@ -18,7 +18,10 @@ use crate::{
     dispatch::Dispatch,
     event::Event,
   },
-  types::{Backpressure, ChunkId, GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang, PtsRegression, PushKind, TranscriberError, VadAheadOfAudio, VadSegment, WorkFailure},
+  types::{
+    Backpressure, ChunkId, GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang,
+    PtsRegression, PushKind, TranscriberError, VadAheadOfAudio, VadSegment, WorkFailure,
+  },
 };
 
 /// Language-detection / locking strategy.
@@ -626,10 +629,7 @@ impl Transcriber {
   /// bumped from `pub(crate)`
   /// alongside the rest of the alignment-context helpers.
   #[cfg(feature = "alignment")]
-  pub fn chunk_sub_segments_samples(
-    &self,
-    chunk_id: ChunkId,
-  ) -> Option<Vec<(u64, u64)>> {
+  pub fn chunk_sub_segments_samples(&self, chunk_id: ChunkId) -> Option<Vec<(u64, u64)>> {
     self.dispatch.chunk_sub_segments_samples(chunk_id)
   }
 
@@ -726,7 +726,10 @@ impl Transcriber {
     // tries to slice past the tail.
     let high_water = self.buffer.absolute_sample_offset();
     if seg.end_sample() > high_water {
-      return Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(seg.end_sample(), high_water)));
+      return Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(
+        seg.end_sample(),
+        high_water,
+      )));
     }
     // Strict-monotonic check against the VAD watermark. The
     // watermark advances with every handle_vad_segment AND every
@@ -734,7 +737,10 @@ impl Transcriber {
     // contradict an explicit silence declaration is also caught
     // here.
     if seg.start_sample() < self.vad_watermark {
-      return Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::VadSegment, seg.start_sample() as i64 - self.vad_watermark as i64)));
+      return Err(TranscriberError::PtsRegression(PtsRegression::new(
+        crate::types::PushKind::VadSegment,
+        seg.start_sample() as i64 - self.vad_watermark as i64,
+      )));
     }
 
     let merged_chunks = self
@@ -818,10 +824,16 @@ impl Transcriber {
 
     for seg in vad_segments {
       if seg.end_sample() > projected_high_water {
-        return Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(seg.end_sample(), projected_high_water)));
+        return Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(
+          seg.end_sample(),
+          projected_high_water,
+        )));
       }
       if seg.start_sample() < running_watermark {
-        return Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::VadSegment, seg.start_sample() as i64 - running_watermark as i64)));
+        return Err(TranscriberError::PtsRegression(PtsRegression::new(
+          crate::types::PushKind::VadSegment,
+          seg.start_sample() as i64 - running_watermark as i64,
+        )));
       }
       running_watermark = seg.end_sample();
     }
@@ -1116,10 +1128,7 @@ mod tests {
     t.handle_samples(ts(0), &[0.0; 10_000]).unwrap();
     t.handle_vad_segment(VadSegment::new(100, 200)).unwrap();
     let r = t.handle_vad_segment(VadSegment::new(150, 250)); // overlaps
-    assert!(matches!(
-      r,
-      Err(TranscriberError::PtsRegression(_))
-    ));
+    assert!(matches!(r, Err(TranscriberError::PtsRegression(_))));
   }
 
   #[test]
@@ -1866,10 +1875,7 @@ mod tests {
     t.handle_samples(ts(0), &[0.0; 50_000]).unwrap();
     t.handle_no_speech_through(10_000).unwrap();
     let r = t.handle_vad_segment(VadSegment::new(5_000, 8_000));
-    assert!(matches!(
-      r,
-      Err(TranscriberError::PtsRegression(_))
-    ));
+    assert!(matches!(r, Err(TranscriberError::PtsRegression(_))));
   }
 
   /// A regression on the no-speech watermark itself (calling it
@@ -1880,10 +1886,7 @@ mod tests {
     t.handle_samples(ts(0), &[0.0; 50_000]).unwrap();
     t.handle_no_speech_through(20_000).unwrap();
     let r = t.handle_no_speech_through(10_000);
-    assert!(matches!(
-      r,
-      Err(TranscriberError::PtsRegression(_))
-    ));
+    assert!(matches!(r, Err(TranscriberError::PtsRegression(_))));
   }
 
   /// handle_no_speech_through before any push returns
@@ -1910,10 +1913,7 @@ mod tests {
     // are buffered. Must reject; watermark must stay unchanged.
     let r = t.handle_no_speech_through(5_000);
     assert!(
-      matches!(
-        r,
-        Err(TranscriberError::VadAheadOfAudio(_))
-      ),
+      matches!(r, Err(TranscriberError::VadAheadOfAudio(_))),
       "expected VadAheadOfAudio, got {:?}",
       r
     );
@@ -1953,10 +1953,7 @@ mod tests {
     // only has 1000 samples.
     let r = t.handle_vad_segment(VadSegment::new(0, 2000));
     assert!(
-      matches!(
-        r,
-        Err(TranscriberError::VadAheadOfAudio(_))
-      ),
+      matches!(r, Err(TranscriberError::VadAheadOfAudio(_))),
       "expected VadAheadOfAudio, got {:?}",
       r
     );
@@ -2089,7 +2086,9 @@ mod tests {
     let r2 = t.precheck_vad_segments(&segs2, 1_000);
     assert!(matches!(
       r2,
-      Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio(VadAheadOfAudio::new(5_000, 1_000))))
+      Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio(
+        VadAheadOfAudio::new(5_000, 1_000)
+      )))
     ));
   }
 

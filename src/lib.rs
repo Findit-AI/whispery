@@ -37,9 +37,9 @@ pub use mediatime::{TimeRange, Timebase, Timestamp};
 
 pub use types::{
   AlignmentError, AlignmentFailure, AsrError, AsrFailure, Backpressure, ChunkId,
-  GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang, LanguageUnsupportedForAlignment,
-  PtsRegression, PushKind, TranscriberError, Transcript, VadAheadOfAudio, VadSegment, Word,
-  WorkFailure, WorkerHangTimeout, WorkerKind,
+  GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang,
+  LanguageUnsupportedForAlignment, PtsRegression, PushKind, TranscriberError, Transcript,
+  VadAheadOfAudio, VadSegment, Word, WorkFailure, WorkerHangTimeout, WorkerKind,
 };
 
 pub use core::{

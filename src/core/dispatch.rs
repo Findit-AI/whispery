@@ -1,6 +1,9 @@
 //! Dispatch state machine — per-chunk lifecycle, in-order emission.
 
-use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
+use std::{
+  collections::{BTreeMap, VecDeque},
+  sync::Arc,
+};
 
 use mediatime::TimeRange;
 
@@ -761,10 +764,7 @@ impl Dispatch {
   /// sample-indexed sub_segments the alignment worker consumes
   /// for its silence mask.
   #[cfg(feature = "alignment")]
-  pub(crate) fn chunk_sub_segments_samples(
-    &self,
-    chunk_id: ChunkId,
-  ) -> Option<Vec<(u64, u64)>> {
+  pub(crate) fn chunk_sub_segments_samples(&self, chunk_id: ChunkId) -> Option<Vec<(u64, u64)>> {
     let record = self.in_flight.get(&chunk_id)?;
     Some(record.sub_segments_samples.clone())
   }
@@ -993,7 +993,9 @@ mod tests {
     d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
     d.handle_failure(
       ChunkId::from_raw(0),
-      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new("x".into()))),
+      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new(
+        "x".into(),
+      ))),
     )
     .unwrap();
     d.after_inject(&mut b, None, u64::MAX);
@@ -1220,7 +1222,9 @@ mod tests {
       .unwrap();
     let r = d.handle_failure(
       ChunkId::from_raw(1),
-      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new(SmolStr::from("late failure")))),
+      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new(
+        SmolStr::from("late failure"),
+      ))),
     );
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
   }
@@ -1361,7 +1365,9 @@ mod tests {
     // Chunk 0 fails ASR.
     d.handle_failure(
       ChunkId::from_raw(0),
-      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new("fail".into()))),
+      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new(
+        "fail".into(),
+      ))),
     )
     .unwrap();
     d.after_inject(&mut b, Some(0), u64::MAX);

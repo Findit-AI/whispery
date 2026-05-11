@@ -196,7 +196,12 @@ impl Aligner {
         return Ok(Vec::new());
       }
       Err(e) => {
-        return Err(crate::types::WorkFailure::Alignment(AlignmentError::Normalization(AlignmentFailure::new(format_smolstr!("normalize failed: {e}"), self.language.clone()))));
+        return Err(crate::types::WorkFailure::Alignment(
+          AlignmentError::Normalization(AlignmentFailure::new(
+            format_smolstr!("normalize failed: {e}"),
+            self.language.clone(),
+          )),
+        ));
       }
     };
     let n_words = normalized.normalized().split_whitespace().count();
@@ -352,9 +357,13 @@ impl Aligner {
   where
     F: Fn(u64, u64) -> TimeRange,
   {
-
     let abort_flag = core::sync::atomic::AtomicBool::new(false);
-    let run_options = RunOptions::new().map_err(|e| WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("RunOptions::new failed: {e:?}"), self.language.clone()))))?;
+    let run_options = RunOptions::new().map_err(|e| {
+      WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(
+        format_smolstr!("RunOptions::new failed: {e:?}"),
+        self.language.clone(),
+      )))
+    })?;
     // Default OOV policy for the no-abort entrypoint:
     // detect events first, apply the historical default
     // (`alphanumeric → wildcard, pronounced → fail-closed`).
@@ -499,13 +508,11 @@ impl Aligner {
   {
     use core::sync::atomic::Ordering;
 
-    use crate::{
-      runner::aligner::algorithm::{
-        compose::{build_speech_frames, compose_words},
-        encode::encode_log_softmax,
-        tokenize::tokenize_with_word_map,
-        trellis_beam::align_to_word_segments,
-      },
+    use crate::runner::aligner::algorithm::{
+      compose::{build_speech_frames, compose_words},
+      encode::encode_log_softmax,
+      tokenize::tokenize_with_word_map,
+      trellis_beam::align_to_word_segments,
     };
 
     // Helper: produce a WorkerHangTimeout when the watchdog has
@@ -518,7 +525,10 @@ impl Aligner {
     // next stage boundary instead of compounding the hang by
     // running CTC + Viterbi + compose on probably-bogus data.
     let timed_out = || -> WorkFailure {
-      WorkFailure::WorkerHang(WorkerHangTimeout::new(crate::types::WorkerKind::Alignment, core::time::Duration::ZERO))
+      WorkFailure::WorkerHang(WorkerHangTimeout::new(
+        crate::types::WorkerKind::Alignment,
+        core::time::Duration::ZERO,
+      ))
     };
 
     if abort_flag.load(Ordering::Relaxed) {
@@ -578,10 +588,15 @@ impl Aligner {
       .enumerate()
       .find(|(_, s)| !s.is_finite())
     {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
-          "non-finite sample at index {idx} (value {val:?}); upstream audio corruption — \
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "non-finite sample at index {idx} (value {val:?}); upstream audio corruption — \
  refuse to encode, masking-as-silence would only hide the bug"
-        ), self.language.clone()))));
+          ),
+          self.language.clone(),
+        ),
+      )));
     }
     let speech_mask = build_speech_mask(samples.len(), sub_segments, &self.language)?;
 
@@ -605,7 +620,9 @@ impl Aligner {
         return Ok(AlignmentResult::new(Vec::new()));
       }
       Err(crate::runner::aligner::normalizer::NormalizationError::RuleFailed { detail }) => {
-        return Err(WorkFailure::Alignment(AlignmentError::Normalization(AlignmentFailure::new(detail, self.language.clone()))));
+        return Err(WorkFailure::Alignment(AlignmentError::Normalization(
+          AlignmentFailure::new(detail, self.language.clone()),
+        )));
       }
     };
 
@@ -961,14 +978,19 @@ fn validate_direct_decision_languages(
 ) -> Result<(), WorkFailure> {
   for (i, resolved) in oov_decisions.iter().enumerate() {
     if resolved.event().language() != expected_lang {
-      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-          "align_chunk_with_abort: oov_decisions[{i}].event.language = {:?} \
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "align_chunk_with_abort: oov_decisions[{i}].event.language = {:?} \
  but this aligner's language is {:?}. Direct callers must pass \
  ResolvedOov produced for THIS aligner's language. Recompute via \
  `Self::detect_oov(text)` + a policy helper from `crate::core::oov`.",
-          resolved.event().language(),
-          expected_lang,
-        ), expected_lang.clone()))));
+            resolved.event().language(),
+            expected_lang,
+          ),
+          expected_lang.clone(),
+        ),
+      )));
     }
   }
   Ok(())
@@ -996,7 +1018,10 @@ fn classify_encode_abort(
 ) -> WorkFailure {
   use core::sync::atomic::Ordering;
   if abort_flag.load(Ordering::Relaxed) {
-    WorkFailure::WorkerHang(WorkerHangTimeout::new(crate::types::WorkerKind::Alignment, core::time::Duration::ZERO))
+    WorkFailure::WorkerHang(WorkerHangTimeout::new(
+      crate::types::WorkerKind::Alignment,
+      core::time::Duration::ZERO,
+    ))
   } else {
     err
   }
@@ -1034,14 +1059,19 @@ fn build_speech_mask(
   let n_samples_i64 = n_samples as i64;
   for &seg in sub_segments {
     if seg.timebase().num() != 1 || seg.timebase().den().get() != SAMPLE_RATE_HZ {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
-          "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
  got {}/{}; caller passed sub_segments in the wrong timebase \
  (samples will not match audio if we proceed).",
-          SAMPLE_RATE_HZ,
-          seg.timebase().num(),
-          seg.timebase().den().get(),
-        ), language.clone()))));
+            SAMPLE_RATE_HZ,
+            seg.timebase().num(),
+            seg.timebase().den().get(),
+          ),
+          language.clone(),
+        ),
+      )));
     }
     let start = seg.start_pts().clamp(0, n_samples_i64) as usize;
     let end = seg.end_pts().clamp(0, n_samples_i64) as usize;
@@ -1405,10 +1435,13 @@ mod tests {
   fn classify_encode_abort_promotes_to_timeout_when_aborted() {
     use core::sync::atomic::AtomicBool;
     let aborted = AtomicBool::new(true);
-    let original = WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new("ort terminate".into(), Lang::En)));
+    let original = WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(
+      "ort terminate".into(),
+      Lang::En,
+    )));
     let classified = classify_encode_abort(&aborted, original);
     match classified {
-      WorkFailure::WorkerHang(WorkerHangTimeout::new(crate::types::WorkerKind::Alignment, )) => {}
+      WorkFailure::WorkerHang(WorkerHangTimeout::new(crate::types::WorkerKind::Alignment)) => {}
       other => {
         panic!("aborted-encode error must surface as WorkerHangTimeout(Alignment); got {other:?}",)
       }
@@ -1468,7 +1501,10 @@ mod tests {
   fn classify_encode_abort_passes_through_when_not_aborted() {
     use core::sync::atomic::AtomicBool;
     let not_aborted = AtomicBool::new(false);
-    let original = WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new("ort genuine error".into(), Lang::En)));
+    let original = WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(
+      "ort genuine error".into(),
+      Lang::En,
+    )));
     let classified = classify_encode_abort(&not_aborted, original);
     match classified {
       WorkFailure::Alignment(AlignmentError::ModelInference(_)) => {}

@@ -1,8 +1,6 @@
 //! Step 1-2 of the alignment algorithm: tokenisation + per-token
 //! word-index map.
 
-
-
 use smol_str::{SmolStr, format_smolstr};
 use tokenizers::Tokenizer;
 
@@ -148,11 +146,16 @@ fn consume_oov_decision(
   let decision = oov_decisions
     .get(*oov_consumed)
     .map(|r| r.decision())
-    .ok_or_else(|| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-        "oov_decisions ran out at index {} ({site_label}); call detect_oov_events \
+    .ok_or_else(|| {
+      WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+        format_smolstr!(
+          "oov_decisions ran out at index {} ({site_label}); call detect_oov_events \
  first to size the decisions vec correctly",
-        *oov_consumed,
-      ), language.clone()))))?;
+          *oov_consumed,
+        ),
+        language.clone(),
+      )))
+    })?;
   *oov_consumed += 1;
   Ok(decision)
 }
@@ -160,10 +163,13 @@ fn consume_oov_decision(
 /// Build a `SemanticOutOfVocab` failure for a boundary-punct
 /// wildcard the caller refused via `OovDecision::FailClosed`.
 fn boundary_fail_closed(language: &Lang, position: &str) -> WorkFailure {
-  WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(AlignmentFailure::new(format_smolstr!(
+  WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(AlignmentFailure::new(
+    format_smolstr!(
       "BoundaryPunct ({position}) resolved as FailClosed by caller policy; \
  chunk word alignment dropped (ASR text preserved)."
-    ), language.clone())))
+    ),
+    language.clone(),
+  )))
 }
 
 // `allow_wildcard` was deleted in the Sans-I/O OOV refactor
@@ -238,21 +244,31 @@ pub fn detect_oov_events(
   let mut events: Vec<OovEvent> = Vec::new();
   let words: Vec<&str> = normalized.split_whitespace().collect();
   if words.len() != word_count {
-    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-        "word_count mismatch: caller={}, normalized has {}",
-        word_count,
-        words.len(),
-      ), language.clone()))));
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "word_count mismatch: caller={}, normalized has {}",
+          word_count,
+          words.len(),
+        ),
+        language.clone(),
+      ),
+    )));
   }
   // Boundary-per-word slice MUST be either empty or
   // word_count-long; surface a hard error otherwise rather
   // than risk indexing-skew between detect + tokenize.
   if !wildcard_boundary_per_word.is_empty() && wildcard_boundary_per_word.len() != word_count {
-    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-        "wildcard_boundary_per_word.len() = {} != word_count = {}",
-        wildcard_boundary_per_word.len(),
-        word_count,
-      ), language.clone()))));
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "wildcard_boundary_per_word.len() = {} != word_count = {}",
+          wildcard_boundary_per_word.len(),
+          word_count,
+        ),
+        language.clone(),
+      ),
+    )));
   }
   let mut tmp_buf = String::with_capacity(8);
   let mut char_index: usize = 0;
@@ -294,7 +310,12 @@ pub fn detect_oov_events(
       tmp_buf.push(projected);
       let encoding = tokenizer
         .encode(tmp_buf.as_str(), /* add_special_tokens = */ false)
-        .map_err(|e| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!("encode({:?}) failed: {e:?}", projected), language.clone()))))?;
+        .map_err(|e| {
+          WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+            format_smolstr!("encode({:?}) failed: {e:?}", projected),
+            language.clone(),
+          )))
+        })?;
       let ids = encoding.get_ids();
       let is_unk_or_empty = ids.is_empty()
         || match unk_token_id {
@@ -426,14 +447,19 @@ pub fn tokenize_with_word_map(
     wildcard_boundary_per_word,
   )?;
   if pre_events.len() != oov_decisions.len() {
-    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-        "oov_decisions length {} does not match the {} OOV events detected for this \
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "oov_decisions length {} does not match the {} OOV events detected for this \
  text; this typically means the caller passed decisions from a different \
  chunk's text. Re-run `detect_oov_events` for the chunk's normalised text \
  and re-decide before calling `tokenize_with_word_map`.",
-        oov_decisions.len(),
-        pre_events.len(),
-      ), language.clone()))));
+          oov_decisions.len(),
+          pre_events.len(),
+        ),
+        language.clone(),
+      ),
+    )));
   }
   // identity
   // equality must compare POSITIONAL fields only (kind,
@@ -449,15 +475,20 @@ pub fn tokenize_with_word_map(
   // not positional identity.
   for (i, (pre, resolved)) in pre_events.iter().zip(oov_decisions.iter()).enumerate() {
     if !resolved.event().matches_position(pre) {
-      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-          "oov_decisions[{i}] was produced for a different OOV event than the one \
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "oov_decisions[{i}] was produced for a different OOV event than the one \
  this chunk's text actually has at position {i}: supplied={:?} but \
  detected={:?}. This typically means the caller reused decisions from a \
  previous chunk whose OOV count happened to match. Re-run \
  `detect_oov_events` for THIS chunk's normalised text and re-decide.",
-          resolved.event(),
-          pre,
-        ), language.clone()))));
+            resolved.event(),
+            pre,
+          ),
+          language.clone(),
+        ),
+      )));
     }
   }
 
@@ -470,18 +501,28 @@ pub fn tokenize_with_word_map(
     // Sanity: caller's claimed word_count must match the
     // normalised text. Off-by-one here would mis-index Word
     // emission in step 9.
-    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-        "word_count mismatch: caller={}, normalized has {}",
-        word_count,
-        words.len()
-      ), language.clone()))));
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "word_count mismatch: caller={}, normalized has {}",
+          word_count,
+          words.len()
+        ),
+        language.clone(),
+      ),
+    )));
   }
   if !wildcard_boundary_per_word.is_empty() && wildcard_boundary_per_word.len() != word_count {
-    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-        "wildcard_boundary_per_word.len() = {} != word_count = {}",
-        wildcard_boundary_per_word.len(),
-        word_count
-      ), language.clone()))));
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "wildcard_boundary_per_word.len() = {} != word_count = {}",
+          wildcard_boundary_per_word.len(),
+          word_count
+        ),
+        language.clone(),
+      ),
+    )));
   }
 
   // Per-char tokenisation. We can't encode the whole word at
@@ -541,10 +582,15 @@ pub fn tokenize_with_word_map(
         match decision {
           crate::core::OovDecision::Wildcard => word_tokens.push(WILDCARD_TOKEN_ID),
           crate::core::OovDecision::FailClosed => {
-            return Err(WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(AlignmentFailure::new(format_smolstr!(
-                "InternalPunct {ch:?} resolved as FailClosed by caller policy; \
+            return Err(WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(
+              AlignmentFailure::new(
+                format_smolstr!(
+                  "InternalPunct {ch:?} resolved as FailClosed by caller policy; \
  chunk word alignment dropped (ASR text preserved)."
-              ), language.clone()))));
+                ),
+                language.clone(),
+              ),
+            )));
           }
         }
         continue;
@@ -558,7 +604,12 @@ pub fn tokenize_with_word_map(
       tmp_buf.push(projected);
       let encoding = tokenizer
         .encode(tmp_buf.as_str(), /* add_special_tokens = */ false)
-        .map_err(|e| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!("encode({:?}) failed: {e:?}", projected), language.clone()))))?;
+        .map_err(|e| {
+          WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+            format_smolstr!("encode({:?}) failed: {e:?}", projected),
+            language.clone(),
+          )))
+        })?;
       let ids = encoding.get_ids();
       // Single-char encode usually yields exactly one token.
       // If for some reason it doesn't (a tokenizer with
@@ -585,10 +636,15 @@ pub fn tokenize_with_word_map(
             // transcript while making the drop observable.
             // introduced this
             // kind; the Sans-I/O OOV refactor preserves it.
-            return Err(WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(AlignmentFailure::new(format_smolstr!(
-                "OOV {ch:?} resolved as FailClosed by caller policy; \
+            return Err(WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(
+              AlignmentFailure::new(
+                format_smolstr!(
+                  "OOV {ch:?} resolved as FailClosed by caller policy; \
  chunk word alignment dropped (ASR text preserved)."
-              ), language.clone()))));
+                ),
+                language.clone(),
+              ),
+            )));
           }
         }
       } else {
@@ -602,18 +658,28 @@ pub fn tokenize_with_word_map(
         // out-of-range case as a `TokenizationFailed` so the
         // caller learns about the tokenizer/model mismatch.
         for &id in ids {
-          let signed_id = i32::try_from(id).map_err(|_| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-              "tokenizer returned id {} which exceeds i32::MAX or aliases the wildcard \
+          let signed_id = i32::try_from(id).map_err(|_| {
+            WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+              format_smolstr!(
+                "tokenizer returned id {} which exceeds i32::MAX or aliases the wildcard \
  sentinel; tokenizer / model mismatch?",
-              id
-            ), language.clone()))))?;
-          if signed_id < 0 {
-            return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-                "tokenizer returned negative-after-cast id {} (raw {}); refusing to alias \
- wildcard sentinel",
-                signed_id,
                 id
-              ), language.clone()))));
+              ),
+              language.clone(),
+            )))
+          })?;
+          if signed_id < 0 {
+            return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+              AlignmentFailure::new(
+                format_smolstr!(
+                  "tokenizer returned negative-after-cast id {} (raw {}); refusing to alias \
+ wildcard sentinel",
+                  signed_id,
+                  id
+                ),
+                language.clone(),
+              ),
+            )));
           }
           word_tokens.push(signed_id);
         }
@@ -663,16 +729,26 @@ pub fn tokenize_with_word_map(
     {
       // Same overflow / sentinel-alias guard as the per-char
       // path above ([high]).
-      let signed_d = i32::try_from(d).map_err(|_| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-          "tokenizer returned `|` delimiter id {} which exceeds i32::MAX",
-          d
-        ), language.clone()))))?;
-      if signed_d < 0 {
-        return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-            "tokenizer returned negative-after-cast `|` delimiter id {} (raw {})",
-            signed_d,
+      let signed_d = i32::try_from(d).map_err(|_| {
+        WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+          format_smolstr!(
+            "tokenizer returned `|` delimiter id {} which exceeds i32::MAX",
             d
-          ), language.clone()))));
+          ),
+          language.clone(),
+        )))
+      })?;
+      if signed_d < 0 {
+        return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+          AlignmentFailure::new(
+            format_smolstr!(
+              "tokenizer returned negative-after-cast `|` delimiter id {} (raw {})",
+              signed_d,
+              d
+            ),
+            language.clone(),
+          ),
+        )));
       }
       token_ids.push(signed_d);
       word_idx_per_token.push(None);
@@ -695,14 +771,19 @@ pub fn tokenize_with_word_map(
   // wildcard the `&` instead of fail-closing). Reject the
   // mismatch loudly.
   if oov_consumed != oov_decisions.len() {
-    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-        "oov_decisions length {} does not match the {} OOV chars actually \
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "oov_decisions length {} does not match the {} OOV chars actually \
  encountered; this typically means the caller passed decisions \
  from a different chunk's text. Re-run `detect_oov_events` for \
  the chunk's normalised text and re-decide.",
-        oov_decisions.len(),
-        oov_consumed,
-      ), language.clone()))));
+          oov_decisions.len(),
+          oov_consumed,
+        ),
+        language.clone(),
+      ),
+    )));
   }
 
   // An empty token list is *not* an error. A chunk like `"...."`
@@ -935,7 +1016,7 @@ mod tests {
     assert_eq!(stale_for_digit.len(), 1);
     let stale_resolved = vec![crate::core::ResolvedOov::new(
       stale_for_digit[0].clone(),
-      crate::core::OovDecision::Wildcard
+      crate::core::OovDecision::Wildcard,
     )];
     // Apply against `"AT&T"` (one OOV but it's `&` at
     // char_index=2, word_index=0) — same length, different
@@ -996,7 +1077,7 @@ mod tests {
         pre.kind().clone(),
         pre.char_index(),
         pre.word_index(),
-        Lang::Ko
+        Lang::Ko,
       ),
       crate::core::OovDecision::Wildcard,
     )];
@@ -1035,8 +1116,7 @@ mod tests {
     // punct wildcards are now surfaced as `OovKind::InternalPunct`
     // events so strict policies (`fail_closed_all_decisions`)
     // can refuse them. `U.S.A` has two `.` chars.
-    let kinds: Vec<crate::core::OovKind> =
-      events.iter().map(|e| e.kind().clone()).collect();
+    let kinds: Vec<crate::core::OovKind> = events.iter().map(|e| e.kind().clone()).collect();
     assert_eq!(
       kinds,
       vec![

@@ -33,7 +33,10 @@ use crate::{
   align::Run,
   core::{AlignmentResult, ResolvedOov},
   runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet},
-  types::{AlignmentError, AlignmentFailure, AsrError, AsrFailure, ChunkId, Lang, LanguageUnsupportedForAlignment, Word, WorkFailure, WorkerHangTimeout, WorkerKind},
+  types::{
+    AlignmentError, AlignmentFailure, AsrError, AsrFailure, ChunkId, Lang,
+    LanguageUnsupportedForAlignment, Word, WorkFailure, WorkerHangTimeout, WorkerKind,
+  },
 };
 
 /// One unit of alignment work — the bundle of caller inputs
@@ -365,19 +368,24 @@ pub fn run_one_alignment(
   // tokenizer surfaces `TokenizationFailed` if a chunk hits
   // OOV anyway). Any other size mismatch is rejected.
   if outer != 0 && outer != expected {
-    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-        "AlignWorkItem::oov_decisions outer shape mismatch: \
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+      AlignmentFailure::new(
+        format_smolstr!(
+          "AlignWorkItem::oov_decisions outer shape mismatch: \
  expected 0 (no OOV) or {expected} ({}), got {outer}. \
  This typically means stale per-run decisions are being \
  applied to a whole-chunk job (or vice versa). Recompute \
  decisions for this chunk's text via \
  `AlignmentSet::detect_oov` / `detect_oov_per_run`.",
-        if job.runs.is_empty() {
-          "exactly one whole-chunk vec"
-        } else {
-          "one inner vec per run"
-        },
-      ), job.language.clone()))));
+          if job.runs.is_empty() {
+            "exactly one whole-chunk vec"
+          } else {
+            "one inner vec per run"
+          },
+        ),
+        job.language.clone(),
+      ),
+    )));
   }
 
   // positional
@@ -418,7 +426,9 @@ pub fn run_one_alignment(
       }
       AlignmentLookup::Miss { fallback } => match fallback {
         AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(Vec::new())),
-        AlignmentFallback::Error => Err(WorkFailure::LanguageUnsupported(LanguageUnsupportedForAlignment::new(job.language.clone()))),
+        AlignmentFallback::Error => Err(WorkFailure::LanguageUnsupported(
+          LanguageUnsupportedForAlignment::new(job.language.clone()),
+        )),
       },
     }
   } else {
@@ -485,9 +495,10 @@ pub fn run_one_alignment(
     // metrics for real cancellations. The abort-cancel
     // path surfaced as `WorkerHangTimeout { elapsed: 0 }`,
     // breaking any recovery / alert logic keyed on duration.
-    Err(WorkFailure::WorkerHang(timeout)) => Err(WorkFailure::WorkerHang(
-      WorkerHangTimeout::new(timeout.kind(), started_at.elapsed()),
-    )),
+    Err(WorkFailure::WorkerHang(timeout)) => Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(
+      timeout.kind(),
+      started_at.elapsed(),
+    ))),
     Err(_) => outcome,
   }
 }
@@ -523,15 +534,20 @@ fn validate_oov_decision_languages(
     if let Some(chunk_decisions) = oov_decisions.first() {
       for (i, resolved) in chunk_decisions.iter().enumerate() {
         if resolved.event().language() != job_language {
-          return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-              "AlignWorkItem::oov_decisions[0][{i}].event.language = {:?} but \
+          return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+            AlignmentFailure::new(
+              format_smolstr!(
+                "AlignWorkItem::oov_decisions[0][{i}].event.language = {:?} but \
  job.language = {:?}. This typically means stale decisions from a \
  previous chunk's run leaked into a whole-chunk job; the caller's \
  language-conditional policy would run against the wrong key. \
  Recompute via `AlignmentSet::detect_oov` for THIS chunk.",
-              resolved.event().language(),
-              job_language,
-            ), job_language.clone()))));
+                resolved.event().language(),
+                job_language,
+              ),
+              job_language.clone(),
+            ),
+          )));
         }
       }
     }
@@ -550,16 +566,21 @@ fn validate_oov_decision_languages(
     let expected_lang = run.language();
     for (i, resolved) in run_decisions.iter().enumerate() {
       if resolved.event().language() != expected_lang {
-        return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
-            "AlignWorkItem::oov_decisions[{run_idx}][{i}].event.language = {} \
+        return Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+          AlignmentFailure::new(
+            format_smolstr!(
+              "AlignWorkItem::oov_decisions[{run_idx}][{i}].event.language = {} \
  but runs[{run_idx}].language() = {}. This typically means stale \
  decisions from a previous chunk leaked into a per-run dispatch; \
  the caller's language-conditional policy would run against the \
  wrong key. Recompute via `AlignmentSet::detect_oov_per_run` for \
  THIS chunk's runs.",
-            resolved.event().language(),
-            expected_lang,
-          ), expected_lang.clone()))));
+              resolved.event().language(),
+              expected_lang,
+            ),
+            expected_lang.clone(),
+          ),
+        )));
       }
     }
   }
@@ -822,7 +843,9 @@ fn dispatch_runs(
         }
         AlignmentFallback::Error => {
           emit_telemetry(job.chunk_id, &counters);
-          return Err(WorkFailure::LanguageUnsupported(LanguageUnsupportedForAlignment::new(run.language().clone())));
+          return Err(WorkFailure::LanguageUnsupported(
+            LanguageUnsupportedForAlignment::new(run.language().clone()),
+          ));
         }
       },
     };
@@ -1094,13 +1117,18 @@ fn clip_sub_segments(
   for sub in subs {
     let actual_tb = sub.timebase();
     if actual_tb.num() != 1 || actual_tb.den().get() != 16_000 {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
-          "sub_segments must be in 1/16000 (chunk-local sample-index) timebase; got \
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(
+        AlignmentFailure::new(
+          format_smolstr!(
+            "sub_segments must be in 1/16000 (chunk-local sample-index) timebase; got \
  {}/{}. Convert via `Transcriber::chunk_first_sample` + a 1/16000 timebase \
  before passing to the aligner.",
-          actual_tb.num(),
-          actual_tb.den().get(),
-        ), language.clone()))));
+            actual_tb.num(),
+            actual_tb.den().get(),
+          ),
+          language.clone(),
+        ),
+      )));
     }
     let s = sub.start_pts().max(lo_i);
     let e = sub.end_pts().min(hi_i);
@@ -1182,10 +1210,7 @@ mod tests {
   /// `Event::Error` so the caller can detect a broken setup.
   #[test]
   fn data_dependent_failures_are_recoverable() {
-    let recoverable = [
-      ::NoAlignmentPath,
-      ::EmptyText,
-    ];
+    let recoverable = [::NoAlignmentPath, ::EmptyText];
     for kind in recoverable {
       let f = WorkFailure::AlignmentFailed {
         kind,
@@ -1231,15 +1256,17 @@ mod tests {
 
     use crate::types::{Lang, WorkerKind};
 
-    assert!(!alignment_failure_is_recoverable(
-      &WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment, Duration::from_secs(30)))
-    ));
+    assert!(!alignment_failure_is_recoverable(&WorkFailure::WorkerHang(
+      WorkerHangTimeout::new(WorkerKind::Alignment, Duration::from_secs(30))
+    )));
     assert!(!alignment_failure_is_recoverable(
       &WorkFailure::LanguageUnsupported(LanguageUnsupportedForAlignment::new(Lang::En))
     ));
     // Logically impossible on the alignment path, but if it
     // ever shows up we surface it rather than swallow it.
-    assert!(!alignment_failure_is_recoverable(&WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new(SmolStr::new(""))))));
+    assert!(!alignment_failure_is_recoverable(&WorkFailure::Asr(
+      AsrError::AllTemperaturesExhausted(AsrFailure::new(SmolStr::new("")))
+    )));
   }
 
   /// `BoundsSourceCounters` accumulates the dispatcher's
@@ -1508,10 +1535,7 @@ mod tests {
     let flag = AtomicBool::new(true);
     let result = check_abort_between_runs(&flag, started);
     assert!(
-      matches!(
-        result,
-        Err(WorkFailure::WorkerHang(_))
-      ),
+      matches!(result, Err(WorkFailure::WorkerHang(_))),
       "abort flag set → expected WorkerHangTimeout(Alignment); got {result:?}",
     );
   }
@@ -1524,8 +1548,11 @@ mod tests {
   /// the diagnostic surfaces in telemetry.
   #[test]
   fn semantic_oov_is_recoverable() {
-    use crate::types::{Lang};
-    let f = WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(AlignmentFailure::new(SmolStr::new("pronounced symbol"), Lang::En)));
+    use crate::types::Lang;
+    let f = WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(AlignmentFailure::new(
+      SmolStr::new("pronounced symbol"),
+      Lang::En,
+    )));
     assert!(
       alignment_failure_is_recoverable(&f),
       "SemanticOutOfVocab must recover so ASR text isn't lost",
@@ -1536,8 +1563,11 @@ mod tests {
   /// stays fatal so a broken setup is loud.
   #[test]
   fn tokenization_failed_stays_fatal() {
-    use crate::types::{Lang};
-    let f = WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(SmolStr::new(""), Lang::En)));
+    use crate::types::Lang;
+    let f = WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(
+      SmolStr::new(""),
+      Lang::En,
+    )));
     assert!(
       !alignment_failure_is_recoverable(&f),
       "TokenizationFailed signals a tokenizer/model mismatch; must stay fatal",

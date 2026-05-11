@@ -7,8 +7,8 @@
 //! emitted [`Word`]s, applying whispery's silence-aware post-pass
 //! on top of WhisperX's bit-exact frame ranges.
 
-use std::borrow::Cow;
 use core::{num::NonZeroU32, time::Duration};
+use std::borrow::Cow;
 
 use mediatime::{TimeRange, Timebase};
 use smol_str::SmolStr;
@@ -190,8 +190,7 @@ pub(crate) fn build_speech_frames(
     .filter(|(s, e)| e > s)
     .collect();
   clamped_segs.sort_by_key(|&(s, _)| s);
-  let mut merged_segs: Vec<(i64, i64)> =
-    Vec::with_capacity(clamped_segs.len());
+  let mut merged_segs: Vec<(i64, i64)> = Vec::with_capacity(clamped_segs.len());
   for (s, e) in clamped_segs {
     match merged_segs.last_mut() {
       // Touching (`s == last.1`) or overlapping (`s < last.1`)

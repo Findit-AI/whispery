@@ -388,10 +388,7 @@ mod tests {
     let mut b = SampleBuffer::new(1_000_000, 3200);
     b.append(ts_at_48k(48_000), &[0.0; 100], 0).unwrap();
     let result = b.append(ts_at_48k(47_000), &[0.0; 100], 0);
-    assert!(matches!(
-      result,
-      Err(TranscriberError::PtsRegression(_))
-    ));
+    assert!(matches!(result, Err(TranscriberError::PtsRegression(_))));
   }
 
   #[test]
@@ -411,19 +408,14 @@ mod tests {
     b.append(ts_at_48k(0), &[0.0; 100], 0).unwrap();
     // 1300 PTS at 1/48000 = 1300 * 16 / 48 ≈ 433 samples > 100.
     let r = b.append(ts_at_48k(1300), &[0.0; 100], 0);
-    assert!(matches!(
-      r,
-      Err(TranscriberError::GapExceedsTolerance(_))
-    ));
+    assert!(matches!(r, Err(TranscriberError::GapExceedsTolerance(_))));
   }
 
   #[test]
   fn backpressure_at_cap() {
     let mut b = SampleBuffer::new(150, 3200);
     let r = b.append(ts_at_48k(0), &[0.0; 200], 0);
-    assert!(
-      matches!(r, Err(TranscriberError::Backpressure(_)) if buffered == 200 && cap == 150)
-    );
+    assert!(matches!(r, Err(TranscriberError::Backpressure(_)) if buffered == 200 && cap == 150));
     // Backpressure must NOT mutate state. The buffer should be
     // empty and absolute_sample_offset should still be 0 — the
     // caller can retry the same packet later (e.g., after the
@@ -506,10 +498,7 @@ mod tests {
     b.append(ts_at_48k(0), &[0.0; 100], 0).unwrap();
     let other_tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
     let r = b.append(Timestamp::new(0, other_tb), &[0.0; 100], 0);
-    assert!(matches!(
-      r,
-      Err(TranscriberError::InconsistentTimebase(_))
-    ));
+    assert!(matches!(r, Err(TranscriberError::InconsistentTimebase(_))));
   }
 
   #[test]
