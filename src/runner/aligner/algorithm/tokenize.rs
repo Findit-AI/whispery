@@ -1,7 +1,7 @@
 //! Step 1-2 of the alignment algorithm: tokenisation + per-token
 //! word-index map.
 
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::format_smolstr;
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -319,7 +319,7 @@ pub fn detect_oov_events(
       let ids = encoding.get_ids();
       let is_unk_or_empty = ids.is_empty()
         || match unk_token_id {
-          Some(unk) => ids.iter().any(|&id| id == unk),
+          Some(unk) => ids.contains(&unk),
           None => false,
         };
       if is_unk_or_empty {
@@ -620,7 +620,7 @@ pub fn tokenize_with_word_map(
       // entirely; we treat that as if it produced an `<unk>`.
       let is_unk_or_empty = ids.is_empty()
         || match unk_token_id {
-          Some(unk) => ids.iter().any(|&id| id == unk),
+          Some(unk) => ids.contains(&unk),
           None => false,
         };
       if is_unk_or_empty {
@@ -945,10 +945,12 @@ mod tests {
     let result =
       tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => {
         assert!(
-          err.to_string().contains("oov_decisions length 2") && err.to_string().contains("1 OOV events detected"),
-          "diagnostic should cite the length mismatch; got {message}", message = err.to_string(),
+          payload.message().contains("oov_decisions length 2")
+            && payload.message().contains("1 OOV events detected"),
+          "diagnostic should cite the length mismatch; got {message}",
+          message = payload.message(),
         );
       }
       other => panic!("expected TokenizationFailed mismatch; got {other:?}"),
@@ -981,12 +983,12 @@ mod tests {
     let result =
       tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => {
         // Correct: stale-payload mismatch surfaces as
         // TokenizationFailed (loud), not SemanticOutOfVocab
         // (silent recoverable empty-words drop).
       }
-      Err(WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(_))) => panic!(
+      Err(WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(payload))) => panic!(
         "stale too-long decisions starting with FailClosed must surface as \
  TokenizationFailed (the loud diagnostic); SemanticOutOfVocab is the \
  silent recoverable path that masks the bug"
@@ -1033,10 +1035,11 @@ mod tests {
       &stale_resolved,
     );
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => {
         assert!(
-          err.to_string().contains("different OOV event"),
-          "diagnostic should cite the per-position identity mismatch; got {message}", message = err.to_string(),
+          payload.message().contains("different OOV event"),
+          "diagnostic should cite the per-position identity mismatch; got {message}",
+          message = payload.message(),
         );
       }
       other => panic!("expected TokenizationFailed identity mismatch; got {other:?}"),
@@ -1136,7 +1139,9 @@ mod tests {
     let result = detect_oov_events(&tok, "hello world", 1, true, unk, &Lang::En, &[]);
     assert!(matches!(
       result,
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_)))
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(
+        payload
+      )))
     ));
   }
 
@@ -1319,11 +1324,12 @@ mod tests {
 
     let outcome = tokenize_with_default_oov(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En);
     match outcome {
-      Err(crate::types::WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(_))) => {
-        assert_eq!(language, &Lang::En);
+      Err(crate::types::WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(payload))) => {
+        assert_eq!(payload.language(), &Lang::En);
+        let message = payload.message();
         assert!(
-          err.to_string().contains("'&'") || err.to_string().contains("\"&\""),
-          "diagnostic should cite the offending char; got {message}", message = err.to_string(),
+          message.contains("'&'") || message.contains("\"&\""),
+          "diagnostic should cite the offending char; got {message}",
         );
       }
       other => panic!("expected SemanticOutOfVocab AlignmentFailed; got {other:?}"),

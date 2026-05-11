@@ -1,7 +1,7 @@
 //! `Aligner` — per-language wav2vec2 forced-alignment engine.
 
 use core::time::Duration;
-use std::{borrow::Cow, path::Path, string::String};
+use std::{borrow::Cow, path::Path};
 
 use mediatime::TimeRange;
 use ort::session::{RunOptions, Session};
@@ -1441,7 +1441,7 @@ mod tests {
     )));
     let classified = classify_encode_abort(&aborted, original);
     match classified {
-      WorkFailure::WorkerHang(WorkerHangTimeout::new(crate::types::WorkerKind::Alignment)) => {}
+      WorkFailure::WorkerHang(ref t) if t.kind() == crate::types::WorkerKind::Alignment => {}
       other => {
         panic!("aborted-encode error must surface as WorkerHangTimeout(Alignment); got {other:?}",)
       }
@@ -1465,11 +1465,14 @@ mod tests {
     )];
     let result = validate_direct_decision_languages(&stale, &Lang::En);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => assert!(
-        err.to_string().contains("oov_decisions[0].event.language")
-          && err.to_string().contains("Ko")
-          && err.to_string().contains("En"),
-        "diagnostic should cite the offending index + the languages; got {message}", message = err.to_string(),
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
+        payload
+          .message()
+          .contains("oov_decisions[0].event.language")
+          && payload.message().contains("Ko")
+          && payload.message().contains("En"),
+        "diagnostic should cite the offending index + the languages; got {message}",
+        message = payload.message(),
       ),
       other => panic!("expected TokenizationFailed cross-language; got {other:?}"),
     }
@@ -1798,8 +1801,8 @@ mod tests {
       panic!("expected AlignerLoad");
     };
     assert!(
-      err.to_string().contains("`|` word-delimiter"),
-      "must call out the missing delimiter; got {message}", message = err.to_string()
+      message.contains("`|` word-delimiter"),
+      "must call out the missing delimiter; got {message}"
     );
   }
 
@@ -1984,13 +1987,13 @@ mod tests {
     let err = build_speech_mask(16_000, &segs, &Lang::En).expect_err("must error");
     match err {
       WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
-        
+        let message = payload.message();
         assert!(
-          payload.message().contains("chunk-local 1/16000 timebase"),
+          message.contains("chunk-local 1/16000 timebase"),
           "error message must cite the contract; got: {message}"
         );
         assert!(
-          err.to_string().contains("1/1000"),
+          message.contains("1/1000"),
           "error message must cite the offending timebase; got: {message}"
         );
       }

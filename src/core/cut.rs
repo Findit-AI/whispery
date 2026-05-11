@@ -209,10 +209,10 @@ impl Cut {
       return true;
     }
     // Silence-gap flush.
-    if let Some(threshold) = self.silence_flush_samples {
-      if sample_index.saturating_sub(self.current_end) > threshold {
-        return true;
-      }
+    if let Some(threshold) = self.silence_flush_samples
+      && sample_index.saturating_sub(self.current_end) > threshold
+    {
+      return true;
     }
     false
   }

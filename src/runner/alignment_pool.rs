@@ -34,8 +34,8 @@ use crate::{
   core::{AlignmentResult, ResolvedOov},
   runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet},
   types::{
-    AlignmentError, AlignmentFailure, AsrError, AsrFailure, ChunkId, Lang,
-    LanguageUnsupportedForAlignment, Word, WorkFailure, WorkerHangTimeout, WorkerKind,
+    AlignmentError, AlignmentFailure, ChunkId, Lang, LanguageUnsupportedForAlignment, Word,
+    WorkFailure, WorkerHangTimeout, WorkerKind,
   },
 };
 
@@ -631,7 +631,11 @@ fn validate_oov_decision_languages(
 fn alignment_failure_is_recoverable(failure: &WorkFailure) -> bool {
   matches!(
     failure,
-    WorkFailure::Alignment(AlignmentError::NoAlignmentPath(_))
+    WorkFailure::Alignment(
+      AlignmentError::NoAlignmentPath(_)
+        | AlignmentError::EmptyText(_)
+        | AlignmentError::SemanticOutOfVocab(_)
+    )
   )
 }
 
@@ -858,9 +862,8 @@ fn dispatch_runs(
     // window. The aligner clamps out-of-range PTS internally,
     // but pre-filtering keeps the silence mask sharp.
     let run_subs = clip_sub_segments(&job.sub_segments, slice_lo, slice_hi, run.language())
-      .map_err(|e| {
+      .inspect_err(|_| {
         emit_telemetry(job.chunk_id, &counters);
-        e
       })?;
     let run_samples = &job.samples[slice_lo..slice_hi];
 
@@ -1258,7 +1261,7 @@ mod tests {
   fn liveness_and_registry_failures_stay_fatal() {
     use core::time::Duration;
 
-    use crate::types::{Lang, WorkerKind};
+    use crate::types::{AsrError, AsrFailure, Lang, WorkerKind};
 
     assert!(!alignment_failure_is_recoverable(&WorkFailure::WorkerHang(
       WorkerHangTimeout::new(WorkerKind::Alignment, Duration::from_secs(30))
@@ -1705,9 +1708,13 @@ mod tests {
     )]];
     let result = validate_oov_decision_languages(&[], &Lang::Ko, &resolved);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => assert!(
-        err.to_string().contains("oov_decisions[0][0].event.language") && err.to_string().contains("job.language"),
-        "diagnostic should cite the whole-chunk mismatch; got {message}", message = err.to_string(),
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
+        payload
+          .message()
+          .contains("oov_decisions[0][0].event.language")
+          && payload.message().contains("job.language"),
+        "diagnostic should cite the whole-chunk mismatch; got {message}",
+        message = payload.message(),
       ),
       other => panic!("expected TokenizationFailed; got {other:?}"),
     }
@@ -1752,9 +1759,11 @@ mod tests {
     ];
     let result = validate_oov_decision_languages(&runs, &Lang::En, &resolved);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => assert!(
-        err.to_string().contains("oov_decisions[1][0]") && err.to_string().contains("runs[1].language()"),
-        "diagnostic should cite the run index of the mismatch; got {message}", message = err.to_string(),
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => assert!(
+        payload.message().contains("oov_decisions[1][0]")
+          && payload.message().contains("runs[1].language()"),
+        "diagnostic should cite the run index of the mismatch; got {message}",
+        message = payload.message(),
       ),
       other => panic!("expected TokenizationFailed; got {other:?}"),
     }
@@ -1779,10 +1788,11 @@ mod tests {
     let result = clip_sub_segments(&subs, 1_600, 4_800, &Lang::En);
     match result {
       Err(WorkFailure::Alignment(AlignmentError::ModelInference(payload))) => {
-        let message = err.to_string();
+        let message = payload.message();
         assert!(
-          err.to_string().contains("1/16000") && err.to_string().contains("48000"),
-          "expected diagnostic citing both timebases; got {message}", message = err.to_string(),
+          payload.message().contains("1/16000") && payload.message().contains("48000"),
+          "expected diagnostic citing both timebases; got {message}",
+          message = payload.message(),
         );
       }
       other => panic!("expected ModelInferenceFailed, got {other:?}"),

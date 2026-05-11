@@ -484,10 +484,10 @@ pub(super) fn compute_compression_ratio(state: &WhisperState) -> f32 {
   }
   let mut text = String::new();
   for i in 0..n {
-    if let Some(segment) = state.segment(i) {
-      if let Ok(s) = segment.text() {
-        text.push_str(s);
-      }
+    if let Some(segment) = state.segment(i)
+      && let Ok(s) = segment.text()
+    {
+      text.push_str(s);
     }
   }
   compression_ratio_for_text(&text)
@@ -907,8 +907,9 @@ mod tests {
     match res {
       Err(WorkFailure::Asr(AsrError::Backend(payload))) => {
         assert!(
-          err.to_string().contains("set_language") && err.to_string().contains("zzzz"),
-          "expected set_language diagnostic mentioning the offending code; got {message}", message = err.to_string()
+          payload.message().contains("set_language") && payload.message().contains("zzzz"),
+          "expected set_language diagnostic mentioning the offending code; got {message}",
+          message = payload.message()
         );
       }
       other => panic!("expected AsrFailed/BackendError for unknown language; got {other:?}"),
@@ -934,8 +935,10 @@ mod tests {
     match res {
       Err(WorkFailure::Asr(AsrError::Backend(payload))) => {
         assert!(
-          err.to_string().contains("language hint") && err.to_string().contains("lowercase ASCII"),
-          "expected charset-violation diagnostic; got {message}", message = err.to_string()
+          payload.message().contains("language hint")
+            && payload.message().contains("lowercase ASCII"),
+          "expected charset-violation diagnostic; got {message}",
+          message = payload.message()
         );
       }
       other => panic!("expected AsrFailed/BackendError; got {other:?}"),
@@ -1027,8 +1030,9 @@ mod tests {
     match res {
       Err(WorkFailure::Asr(AsrError::Backend(payload))) => {
         assert!(
-          err.to_string().contains("initial_prompt") && err.to_string().contains("NUL"),
-          "expected NUL diagnostic; got {message}", message = err.to_string()
+          payload.message().contains("initial_prompt") && payload.message().contains("NUL"),
+          "expected NUL diagnostic; got {message}",
+          message = payload.message()
         );
       }
       other => panic!("expected AsrFailed/BackendError; got {other:?}"),
@@ -1105,8 +1109,11 @@ mod tests {
     let err = validate_for_whisper_ffi(&p).unwrap_err();
     match err {
       WorkFailure::Asr(AsrError::Backend(payload)) => {
-        
-        assert!(payload.message().contains("best_of"), "got {message}", message = err.to_string());
+        assert!(
+          payload.message().contains("best_of"),
+          "got {message}",
+          message = payload.message()
+        );
       }
       other => panic!("expected AsrError::Backend, got {other:?}"),
     }
@@ -1120,8 +1127,9 @@ mod tests {
     });
     let err = validate_for_whisper_ffi(&p).unwrap_err();
     match err {
-      WorkFailure::Asr(err) => {
-        assert!(err.to_string().contains("beam_size"), "got {message}", message = err.to_string());
+      WorkFailure::Asr(asr) => {
+        let message = asr.to_string();
+        assert!(message.contains("beam_size"), "got {message}");
       }
       other => panic!("expected AsrFailed, got {other:?}"),
     }

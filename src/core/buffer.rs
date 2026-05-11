@@ -16,7 +16,7 @@ use crate::{
   time::ANALYSIS_TIMEBASE,
   types::{
     Backpressure, GapExceedsTolerance, InconsistentTimebase, PtsRegression, PushKind,
-    TranscriberError, VadAheadOfAudio,
+    TranscriberError,
   },
 };
 
@@ -413,7 +413,9 @@ mod tests {
   fn backpressure_at_cap() {
     let mut b = SampleBuffer::new(150, 3200);
     let r = b.append(ts_at_48k(0), &[0.0; 200], 0);
-    assert!(matches!(r, Err(TranscriberError::Backpressure(_)) if buffered == 200 && cap == 150));
+    assert!(
+      matches!(r, Err(TranscriberError::Backpressure(ref p)) if p.buffered() == 200 && p.cap() == 150)
+    );
     // Backpressure must NOT mutate state. The buffer should be
     // empty and absolute_sample_offset should still be 0 — the
     // caller can retry the same packet later (e.g., after the

@@ -557,7 +557,7 @@ pub fn backtrack_beam(
   let mut iters = 0_usize;
   while !active.is_empty() && arena[active[0] as usize].token_index > 0 {
     iters += 1;
-    if iters % 64 == 0 && abort_flag.load(Ordering::Relaxed) {
+    if iters.is_multiple_of(64) && abort_flag.load(Ordering::Relaxed) {
       return Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(
         WorkerKind::Alignment,
         core::time::Duration::ZERO,
@@ -1725,7 +1725,7 @@ mod tests {
     let err = get_trellis(&log_probs, &tokens, 0, &abort, &Lang::En).unwrap_err();
     assert!(matches!(
       err,
-      WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment,))
+      WorkFailure::WorkerHang(ref t) if t.kind() == WorkerKind::Alignment
     ));
   }
 
@@ -1739,10 +1739,11 @@ mod tests {
     let WorkFailure::Alignment(AlignmentError::NoAlignmentPath(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
-    let message = err.to_string();
+    let message = payload.message();
     assert!(
-      err.to_string().contains("trellis exceeds"),
-      "message must call out the budget; got {message}", message = err.to_string()
+      payload.message().contains("trellis exceeds"),
+      "message must call out the budget; got {message}",
+      message = payload.message()
     );
   }
 }

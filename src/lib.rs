@@ -6,6 +6,13 @@
 // don't gate substantive docs on indentation conventions for
 // continuation lines after list items.
 #![allow(clippy::doc_lazy_continuation)]
+// Pre-existing style choices we don't enforce crate-wide.
+#![allow(
+  clippy::too_many_arguments,
+  clippy::needless_range_loop,
+  clippy::module_inception,
+  clippy::collapsible_if
+)]
 // Crate default: no unsafe. Modules that need `core::arch` SIMD
 // intrinsics opt in locally via `#![allow(unsafe_code)]`. This is
 // `deny` rather than `forbid` so an explicit per-module override is

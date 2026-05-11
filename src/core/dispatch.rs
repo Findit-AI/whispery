@@ -15,7 +15,7 @@ use crate::{
     event::Event,
     transcriber::LanguagePolicy,
   },
-  types::{AsrError, AsrFailure, ChunkId, Lang, TranscriberError, Transcript, WorkFailure},
+  types::{ChunkId, Lang, TranscriberError, Transcript, WorkFailure},
 };
 
 /// Pick the most-frequent language in `observations`, with
@@ -395,12 +395,12 @@ impl Dispatch {
     if self.in_flight.len() >= self.max_in_flight {
       return false;
     }
-    if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
-      if self.locked_language.is_none() {
-        let slack = n.saturating_sub(self.auto_lock_observations.len());
-        let threshold = self.auto_lock_cursor.as_u64() + slack as u64;
-        return chunk_id.as_u64() < threshold;
-      }
+    if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy
+      && self.locked_language.is_none()
+    {
+      let slack = n.saturating_sub(self.auto_lock_observations.len());
+      let threshold = self.auto_lock_cursor.as_u64() + slack as u64;
+      return chunk_id.as_u64() < threshold;
     }
     true
   }
@@ -586,17 +586,17 @@ impl Dispatch {
     // results and ASR failures don't add an observation, but
     // they DO advance the cursor so a single empty/failed chunk
     // doesn't block auto-lock forever.
-    if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
-      if self.locked_language.is_none() {
-        let entry = if result.text().is_empty() {
-          None
-        } else {
-          Some(result.language().clone())
-        };
-        self.auto_lock_pending.insert(chunk_id, entry);
-        let n = *n;
-        self.advance_auto_lock_cursor(n);
-      }
+    if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy
+      && self.locked_language.is_none()
+    {
+      let entry = if result.text().is_empty() {
+        None
+      } else {
+        Some(result.language().clone())
+      };
+      self.auto_lock_pending.insert(chunk_id, entry);
+      let n = *n;
+      self.advance_auto_lock_cursor(n);
     }
 
     let record = self
@@ -704,14 +704,13 @@ impl Dispatch {
     // past it. An alignment-stage failure has already had its
     // language observed at ASR-result time, so we don't touch
     // auto_lock_pending for those.
-    if was_awaiting_asr {
-      if let LanguagePolicy::AutoLockAfter(n) = &self.language_policy {
-        if self.locked_language.is_none() {
-          self.auto_lock_pending.insert(chunk_id, None);
-          let n = *n;
-          self.advance_auto_lock_cursor(n);
-        }
-      }
+    if was_awaiting_asr
+      && let LanguagePolicy::AutoLockAfter(n) = &self.language_policy
+      && self.locked_language.is_none()
+    {
+      self.auto_lock_pending.insert(chunk_id, None);
+      let n = *n;
+      self.advance_auto_lock_cursor(n);
     }
 
     self
@@ -813,7 +812,7 @@ mod tests {
       buffer::SampleBuffer,
       cut::{MergedChunk, SampleRange, SubOrigin, SubRange},
     },
-    types::Lang,
+    types::{AsrError, AsrFailure, Lang},
   };
   use core::num::NonZeroU32;
   use mediatime::{Timebase, Timestamp};

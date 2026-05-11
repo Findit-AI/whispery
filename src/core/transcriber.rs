@@ -19,8 +19,8 @@ use crate::{
     event::Event,
   },
   types::{
-    Backpressure, ChunkId, GapExceedsTolerance, InconsistentTimebase, InvalidTimebase, Lang,
-    PtsRegression, PushKind, TranscriberError, VadAheadOfAudio, VadSegment, WorkFailure,
+    ChunkId, InconsistentTimebase, InvalidTimebase, Lang, PtsRegression, PushKind,
+    TranscriberError, VadAheadOfAudio, VadSegment, WorkFailure,
   },
 };
 
@@ -902,12 +902,12 @@ impl Transcriber {
     // the configured `flush_on_silence_gap` threshold. Without
     // this, a partial chunk would sit until chunk_size or EOF,
     // defeating utterance-boundary mode.
-    if self.cut.would_flush_at(sample_index) {
-      if let Some(chunk) = self.cut.flush() {
-        let chunk_id = ChunkId::from_raw(self.next_chunk_id);
-        self.next_chunk_id += 1;
-        self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
-      }
+    if self.cut.would_flush_at(sample_index)
+      && let Some(chunk) = self.cut.flush()
+    {
+      let chunk_id = ChunkId::from_raw(self.next_chunk_id);
+      self.next_chunk_id += 1;
+      self.dispatch.on_emit(chunk, chunk_id, &self.buffer);
     }
 
     // Run the standard post-mutation drain so trim drops audio
@@ -1055,12 +1055,12 @@ impl Transcriber {
         tb.num(),
       )));
     }
-    if let Some(expected_tb) = self.buffer.output_timebase() {
-      if starts_at.timebase() != expected_tb {
-        return Err(TranscriberError::InconsistentTimebase(
-          InconsistentTimebase::new(expected_tb, starts_at.timebase()),
-        ));
-      }
+    if let Some(expected_tb) = self.buffer.output_timebase()
+      && starts_at.timebase() != expected_tb
+    {
+      return Err(TranscriberError::InconsistentTimebase(
+        InconsistentTimebase::new(expected_tb, starts_at.timebase()),
+      ));
     }
 
     // Step 1: flush the cut accumulator's partial chunk. on_emit
@@ -1444,7 +1444,7 @@ mod tests {
     let other_tb = Timebase::new(1, NonZeroU32::new(1000).unwrap());
     let r = t.handle_restart(Timestamp::new(0, other_tb));
     assert!(
-      matches!(r, Err(TranscriberError::InconsistentTimebase(_)) if expected == tb_48k() && got == other_tb),
+      matches!(r, Err(TranscriberError::InconsistentTimebase(ref p)) if p.expected() == tb_48k() && p.got() == other_tb),
       "expected InconsistentTimebase, got {:?}",
       r
     );
@@ -1638,8 +1638,8 @@ mod tests {
     let next = t.next_expected_starts_at().unwrap();
     let r = t.handle_samples(next, &[0.0; 6_000]);
     assert!(
-      matches!(r, Err(TranscriberError::Backpressure(_))
- if buffered == 14_000 && cap == 12_000),
+      matches!(r, Err(TranscriberError::Backpressure(ref p))
+ if p.buffered() == 14_000 && p.cap() == 12_000),
       "expected Backpressure {{ buffered: 14_000, cap: 12_000 }}, got {:?}",
       r
     );
@@ -2086,9 +2086,7 @@ mod tests {
     let r2 = t.precheck_vad_segments(&segs2, 1_000);
     assert!(matches!(
       r2,
-      Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio(
-        VadAheadOfAudio::new(5_000, 1_000)
-      )))
+      Err(TranscriberError::VadAheadOfAudio(ref p)) if p.vad_end() == 2_000 && p.buffered() == 1_000
     ));
   }
 
