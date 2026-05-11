@@ -43,12 +43,12 @@
 //! while let Some(cmd) = transcriber.poll_command() {
 //!   match cmd {
 //!     Command::Asr { chunk_id, samples, params, .. } => {
-//!       let result = asr_source.run_chunk(AsrChunkContext {
-//!         samples: &samples,
-//!         params: &params,
-//!         abort_flag: &abort_flag,
+//!       let result = asr_source.run_chunk(AsrChunkContext::new(
+//!         &samples,
+//!         &params,
+//!         &abort_flag,
 //!         chunk_id,
-//!       })?;
+//!       ))?;
 //!       transcriber.handle_asr(chunk_id, result)?;
 //!     }
 //!     Command::Alignment { chunk_id, samples, sub_segments: _,

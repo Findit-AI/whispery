@@ -284,18 +284,46 @@ pub trait SegmentLike {
 pub struct TokenInfo {
   /// Byte offset where this token's text starts inside
   /// [`SegmentLike::text`].
-  pub byte_offset: usize,
+  byte_offset: usize,
   /// Length in bytes of this token's text inside
   /// [`SegmentLike::text`]. Zero is valid (special / non-text
   /// tokens), in which case the token is dropped from per-run
   /// slicing.
-  pub byte_len: usize,
+  byte_len: usize,
   /// DTW timestamp in centiseconds, or `None` when DTW is
   /// disabled / unavailable for this token.
-  pub t_dtw_cs: Option<i64>,
+  t_dtw_cs: Option<i64>,
 }
 
 impl TokenInfo {
+  /// Construct from the three positional fields.
+  #[must_use]
+  pub const fn new(byte_offset: usize, byte_len: usize, t_dtw_cs: Option<i64>) -> Self {
+    Self {
+      byte_offset,
+      byte_len,
+      t_dtw_cs,
+    }
+  }
+
+  /// Byte offset of this token's text in [`SegmentLike::text`].
+  #[must_use]
+  pub const fn byte_offset(&self) -> usize {
+    self.byte_offset
+  }
+
+  /// Length in bytes of this token's text.
+  #[must_use]
+  pub const fn byte_len(&self) -> usize {
+    self.byte_len
+  }
+
+  /// DTW timestamp in centiseconds, or `None` when unavailable.
+  #[must_use]
+  pub const fn t_dtw_cs(&self) -> Option<i64> {
+    self.t_dtw_cs
+  }
+
   /// Half-open byte range `[byte_offset, byte_offset + byte_len)`.
   pub const fn byte_range(&self) -> core::ops::Range<usize> {
     self.byte_offset..self.byte_offset + self.byte_len

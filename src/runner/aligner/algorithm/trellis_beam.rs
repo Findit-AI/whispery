@@ -124,15 +124,52 @@ impl CharSegment {
 #[derive(Debug, Clone)]
 pub struct WordSegment {
   /// Word index in `original_words` / `word_idx_per_token`.
-  pub word_index: usize,
+  word_index: usize,
   /// First frame the word covers (inclusive).
-  pub start_frame: usize,
+  start_frame: usize,
   /// One past the last frame the word covers (exclusive).
-  pub end_frame: usize,
+  end_frame: usize,
   /// Duration-weighted mean per-frame probability over the
   /// word's chars. Matches WhisperX `merge_words`'s
   /// `sum(seg.score * seg.length) / sum(seg.length)` formula.
-  pub score: f32,
+  score: f32,
+}
+
+impl WordSegment {
+  /// Construct from word index + frame range + mean score.
+  #[must_use]
+  pub const fn new(word_index: usize, start_frame: usize, end_frame: usize, score: f32) -> Self {
+    Self {
+      word_index,
+      start_frame,
+      end_frame,
+      score,
+    }
+  }
+
+  /// Word index in `original_words` / `word_idx_per_token`.
+  #[must_use]
+  pub const fn word_index(&self) -> usize {
+    self.word_index
+  }
+
+  /// First frame the word covers (inclusive).
+  #[must_use]
+  pub const fn start_frame(&self) -> usize {
+    self.start_frame
+  }
+
+  /// One past the last frame the word covers (exclusive).
+  #[must_use]
+  pub const fn end_frame(&self) -> usize {
+    self.end_frame
+  }
+
+  /// Duration-weighted mean per-frame probability.
+  #[must_use]
+  pub const fn score(&self) -> f32 {
+    self.score
+  }
 }
 
 /// Build the WhisperX-shape `(T, num_tokens)` trellis.
@@ -161,7 +198,7 @@ pub fn get_trellis(
   abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<Vec<f32>, WorkFailure> {
-  let t = log_probs.t;
+  let t = log_probs.t();
   let num_tokens = tokens.len();
   if num_tokens == 0 {
     return Err(WorkFailure::AlignmentFailed {
@@ -170,7 +207,7 @@ pub fn get_trellis(
       language: language.clone(),
     });
   }
-  let v = log_probs.v;
+  let v = log_probs.v();
   if (blank_id as usize) >= v {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
@@ -387,13 +424,13 @@ pub fn get_trellis(
 /// wildcard tokens (the model's best non-blank guess at that
 /// frame, regardless of which char the transcript expects).
 fn max_non_blank_logprob(log_probs: &LogProbsTV, t_idx: usize, blank_v: usize) -> f32 {
-  let row_start = t_idx * log_probs.v;
+  let row_start = t_idx * log_probs.v();
   let mut best = f32::NEG_INFINITY;
-  for v in 0..log_probs.v {
+  for v in 0..log_probs.v() {
     if v == blank_v {
       continue;
     }
-    let lp = log_probs.data[row_start + v];
+    let lp = log_probs.data()[row_start + v];
     if lp > best {
       best = lp;
     }
@@ -447,7 +484,7 @@ pub fn backtrack_beam(
   abort_flag: &AtomicBool,
   language: &Lang,
 ) -> Result<Vec<PathPointPublic>, WorkFailure> {
-  let t = log_probs.t;
+  let t = log_probs.t();
   let num_tokens = tokens.len();
   if num_tokens == 0 {
     return Err(WorkFailure::AlignmentFailed {
@@ -722,11 +759,41 @@ pub fn backtrack_beam(
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathPointPublic {
   /// Index into `tokens` / `text_clean`.
-  pub token_index: usize,
+  token_index: usize,
   /// Frame index this point covers.
-  pub time_index: usize,
+  time_index: usize,
   /// Linear-space probability emitted at this frame.
-  pub score: f32,
+  score: f32,
+}
+
+impl PathPointPublic {
+  /// Construct from token index + frame + emission probability.
+  #[must_use]
+  pub const fn new(token_index: usize, time_index: usize, score: f32) -> Self {
+    Self {
+      token_index,
+      time_index,
+      score,
+    }
+  }
+
+  /// Index into `tokens` / `text_clean`.
+  #[must_use]
+  pub const fn token_index(&self) -> usize {
+    self.token_index
+  }
+
+  /// Frame index this point covers.
+  #[must_use]
+  pub const fn time_index(&self) -> usize {
+    self.time_index
+  }
+
+  /// Linear-space probability emitted at this frame.
+  #[must_use]
+  pub const fn score(&self) -> f32 {
+    self.score
+  }
 }
 
 /// Group consecutive path points with the same `token_index` into
@@ -950,7 +1017,7 @@ mod tests {
 
   fn lp(t: usize, v: usize, vals: alloc::vec::Vec<f32>) -> LogProbsTV {
     assert_eq!(vals.len(), t * v);
-    LogProbsTV { t, v, data: vals }
+    LogProbsTV::new(t, v, vals)
   }
 
   fn never() -> &'static AtomicBool {
@@ -1676,11 +1743,8 @@ mod tests {
   #[test]
   fn budget_exceeded_returns_no_alignment_path() {
     // T=8000 × num_tokens=5000 = 40M cells > 32M budget.
-    let log_probs = LogProbsTV {
-      t: 8_000,
-      v: 8,
-      data: alloc::vec![0.0_f32; 1], // intentionally undersized
-    };
+    // intentionally undersized
+    let log_probs = LogProbsTV::new(8_000, 8, alloc::vec![0.0_f32; 1]);
     let tokens: Vec<i32> = (0..5_000).map(|i| 1 + ((i as i32) % 4)).collect();
     let err = get_trellis(&log_probs, &tokens, 0, never(), &Lang::En).unwrap_err();
     let WorkFailure::AlignmentFailed { kind, message, .. } = err else {

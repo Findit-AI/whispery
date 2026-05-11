@@ -102,27 +102,69 @@ pub enum OovKind {
 /// (in the same order) and threads it into the alignment work
 /// item via `AlignWorkItem.oov_decisions`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct OovEvent {
   /// What kind of wildcard-generating position this is —
   /// semantic OOV vs. structural (boundary / internal-punct).
-  pub kind: OovKind,
+  kind: OovKind,
   /// Zero-based char index in the chunk's normalised text.
   /// Boundary-punct events index the word's leading/trailing
   /// position (post-normalisation); internal-punct events
   /// index the source position of the punct char.
-  pub char_index: usize,
+  char_index: usize,
   /// Zero-based word index (separator-counted) the position
   /// belongs to. Useful for callers that want per-word
   /// policy.
-  pub word_index: usize,
+  word_index: usize,
   /// The language being aligned. Caller policy can switch on
   /// this (e.g. wildcard-all under `Lang::En` but fail-closed
   /// under `Lang::Ko`).
-  pub language: Lang,
+  language: Lang,
 }
 
 impl OovEvent {
+  /// Construct from positional fields + language stamp.
+  #[must_use]
+  pub const fn new(kind: OovKind, char_index: usize, word_index: usize, language: Lang) -> Self {
+    Self {
+      kind,
+      char_index,
+      word_index,
+      language,
+    }
+  }
+
+  /// What kind of wildcard-generating position this is.
+  #[must_use]
+  pub const fn kind(&self) -> &OovKind {
+    &self.kind
+  }
+
+  /// Zero-based char index in the chunk's normalised text.
+  #[must_use]
+  pub const fn char_index(&self) -> usize {
+    self.char_index
+  }
+
+  /// Zero-based word index (separator-counted).
+  #[must_use]
+  pub const fn word_index(&self) -> usize {
+    self.word_index
+  }
+
+  /// Language being aligned for this position.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+
+  /// Replace the language stamp. Used by
+  /// `AlignmentSet::detect_oov` under `AlignerKey::Any`
+  /// fallback so caller policy sees the requested language
+  /// rather than the fallback aligner's construction lang.
+  pub fn set_language(&mut self, language: Lang) {
+    self.language = language;
+  }
+
   /// Convenience accessor: the offending char when the kind
   /// is `Symbol` or `InternalPunct`. Returns `None` for
   /// `BoundaryPunct` (the original char was stripped during
@@ -218,9 +260,29 @@ pub struct ResolvedOov {
   /// The OOV event the decision was made for. Must match the
   /// freshly-detected event at the same position or the
   /// dispatcher rejects the payload.
-  pub event: OovEvent,
+  event: OovEvent,
   /// What to do with this position.
-  pub decision: OovDecision,
+  decision: OovDecision,
+}
+
+impl ResolvedOov {
+  /// Pair an event with the caller's decision.
+  #[must_use]
+  pub const fn new(event: OovEvent, decision: OovDecision) -> Self {
+    Self { event, decision }
+  }
+
+  /// The OOV event this decision was made for.
+  #[must_use]
+  pub const fn event(&self) -> &OovEvent {
+    &self.event
+  }
+
+  /// The caller's decision for this position.
+  #[must_use]
+  pub const fn decision(&self) -> OovDecision {
+    self.decision
+  }
 }
 
 /// Default Sans-I/O policy:

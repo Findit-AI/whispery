@@ -346,11 +346,11 @@ where
   let mut words: Vec<Word> = Vec::with_capacity(word_segments.len());
 
   for seg in word_segments {
-    let Some(surface) = original_words.get(seg.word_index) else {
+    let Some(surface) = original_words.get(seg.word_index()) else {
       // word_index out of range — caller / tokenizer bug.
       continue;
     };
-    if seg.end_frame <= seg.start_frame {
+    if seg.end_frame() <= seg.start_frame() {
       continue;
     }
 
@@ -360,8 +360,8 @@ where
     // both default to the values described in
     // [`DEFAULT_MIN_SPEECH_COVERAGE`] /
     // [`DEFAULT_MAX_INTRA_SILENT_RUN`].
-    let span_start = seg.start_frame.min(speech_frames.len());
-    let span_end = seg.end_frame.min(speech_frames.len());
+    let span_start = seg.start_frame().min(speech_frames.len());
+    let span_end = seg.end_frame().min(speech_frames.len());
     let span_len = span_end.saturating_sub(span_start);
     if span_len == 0 {
       continue;
@@ -400,8 +400,8 @@ where
     // Use `saturating_add` and skip any word whose start
     // saturates past the chunk end, or whose start >= end after
     // saturation.
-    let start_offset = (seg.start_frame as f64 * samples_per_frame).round() as u64;
-    let end_offset = (seg.end_frame as f64 * samples_per_frame).round() as u64;
+    let start_offset = (seg.start_frame() as f64 * samples_per_frame).round() as u64;
+    let end_offset = (seg.end_frame() as f64 * samples_per_frame).round() as u64;
     let raw_start = chunk_first_sample_in_stream.saturating_add(start_offset);
     let raw_end = chunk_first_sample_in_stream.saturating_add(end_offset);
 
@@ -413,7 +413,7 @@ where
       continue;
     }
     let range = samples_to_output_range(raw_start, clamped_end);
-    let score = seg.score.clamp(0.0, 1.0);
+    let score = seg.score().clamp(0.0, 1.0);
     words.push(Word::new(SmolStr::new(surface.as_ref()), range, score));
   }
 
@@ -436,12 +436,7 @@ mod tests {
 
   /// Helper: build a single-word `WordSegment`.
   fn one_word(start: usize, end: usize, score: f32, idx: usize) -> WordSegment {
-    WordSegment {
-      word_index: idx,
-      start_frame: start,
-      end_frame: end,
-      score,
-    }
+    WordSegment::new(idx, start, end, score)
   }
 
   /// a chunk anchor near

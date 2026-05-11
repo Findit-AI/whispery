@@ -127,7 +127,7 @@ impl AlignmentSet {
     // policy decides on the run/chunk language, not the
     // aligner's construction-time tag.
     for ev in &mut events {
-      ev.language = language.clone();
+      ev.set_language(language.clone());
     }
     Ok(events)
   }

@@ -667,7 +667,7 @@ impl Aligner {
     // emit the cached ASR transcript with `words: []` instead
     // of converting it into `Event::Error` — alignment becoming
     // optional, not a data-loss path.
-    if tokenized.token_ids.is_empty() {
+    if tokenized.token_ids().is_empty() {
       return Ok(AlignmentResult::new(alloc::vec::Vec::new()));
     }
 
@@ -762,8 +762,8 @@ impl Aligner {
         let em_path = dir_path.join(alloc::format!("wy_seg{n}.emission.bin"));
         if let Ok(mut f) = std::fs::File::create(&em_path) {
           use std::io::Write;
-          let _ = f.write_all(&(log_probs.t as u32).to_le_bytes());
-          let _ = f.write_all(&(log_probs.v as u32).to_le_bytes());
+          let _ = f.write_all(&(log_probs.t() as u32).to_le_bytes());
+          let _ = f.write_all(&(log_probs.v() as u32).to_le_bytes());
           // Write as f32 LE one cell at a time. The dump path is
           // diagnostic-only; the per-cell `to_le_bytes` is acceptable
           // overhead for the few-K-cells * once-per-segment frequency.
@@ -779,7 +779,7 @@ impl Aligner {
           use std::io::Write;
           // Hand-format JSON to avoid the serde_json prod dep.
           let mut payload = alloc::format!("{{\"blank_id\":{},\"tokens\":[", self.blank_token_id);
-          for (i, t) in tokenized.token_ids.iter().enumerate() {
+          for (i, t) in tokenized.token_ids().iter().enumerate() {
             if i > 0 {
               payload.push(',');
             }
@@ -788,8 +788,8 @@ impl Aligner {
           payload.push_str(&alloc::format!(
             "],\"n_samples\":{},\"T\":{},\"V\":{}}}",
             padded_samples.len(),
-            log_probs.t,
-            log_probs.v
+            log_probs.t(),
+            log_probs.v()
           ));
           let _ = f.write_all(payload.as_bytes());
         }
@@ -805,7 +805,7 @@ impl Aligner {
     // chunk). Fatal: the only recovery is fixing the model /
     // `hop_samples` config, not retrying.
     crate::runner::aligner::algorithm::encode::validate_stride_extent(
-      log_probs.t,
+      log_probs.t(),
       self.hop_samples,
       samples.len(),
       &self.language,
@@ -821,7 +821,7 @@ impl Aligner {
     // tokenizer's tokens — emitting plausible but corrupt
     // timings.
     crate::runner::aligner::algorithm::encode::validate_vocab_dim(
-      log_probs.v,
+      log_probs.v(),
       self.tokenizer_vocab_size,
       &self.language,
     )?;
@@ -840,9 +840,9 @@ impl Aligner {
     // every chunk queued behind it on the single worker.
     let word_segments = align_to_word_segments(
       &log_probs,
-      &tokenized.token_ids,
-      &tokenized.word_idx_per_token,
-      tokenized.separator_token_id,
+      tokenized.token_ids(),
+      tokenized.word_idx_per_token(),
+      tokenized.separator_token_id(),
       self.blank_token_id,
       abort_flag,
       &self.language,
@@ -862,7 +862,7 @@ impl Aligner {
         let dir_path = std::path::PathBuf::from(dir);
         let trellis = crate::runner::aligner::algorithm::trellis_beam::get_trellis(
           &log_probs,
-          &tokenized.token_ids,
+          &tokenized.token_ids(),
           self.blank_token_id,
           abort_flag,
           &self.language,
@@ -871,8 +871,8 @@ impl Aligner {
           let path = dir_path.join(alloc::format!("wy_seg{n}.trellis.bin"));
           if let Ok(mut f) = std::fs::File::create(&path) {
             use std::io::Write;
-            let _ = f.write_all(&(log_probs.t as u32).to_le_bytes());
-            let _ = f.write_all(&(tokenized.token_ids.len() as u32).to_le_bytes());
+            let _ = f.write_all(&(log_probs.t() as u32).to_le_bytes());
+            let _ = f.write_all(&(tokenized.token_ids().len() as u32).to_le_bytes());
             let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(trellis.len() * 4);
             for v in &trellis {
               buf.extend_from_slice(&v.to_le_bytes());
@@ -919,7 +919,7 @@ impl Aligner {
     let encoder_n_samples = padded_samples.len() as u64;
     let samples_per_frame = crate::runner::aligner::algorithm::compose::effective_samples_per_frame(
       encoder_n_samples,
-      log_probs.t,
+      log_probs.t(),
       self.hop_samples,
     );
     // Real chunk length for word-range clamping AND for the
@@ -930,7 +930,7 @@ impl Aligner {
     // silent and `compose_words` drops every word).
     let real_n_samples = samples.len() as u64;
     let speech_frames = build_speech_frames(
-      log_probs.t,
+      log_probs.t(),
       samples_per_frame,
       encoder_n_samples,
       real_n_samples,
@@ -949,7 +949,7 @@ impl Aligner {
       self.hop_samples,
       encoder_n_samples,
       real_n_samples,
-      log_probs.t,
+      log_probs.t(),
       samples_to_output_range,
       self.min_speech_coverage,
       self.max_intra_silent_run,
@@ -981,7 +981,7 @@ fn validate_direct_decision_languages(
   expected_lang: &Lang,
 ) -> Result<(), WorkFailure> {
   for (i, resolved) in oov_decisions.iter().enumerate() {
-    if &resolved.event.language != expected_lang {
+    if resolved.event().language() != expected_lang {
       return Err(WorkFailure::AlignmentFailed {
         kind: crate::types::AlignmentFailureKind::TokenizationFailed,
         message: alloc::format!(
@@ -989,7 +989,7 @@ fn validate_direct_decision_languages(
  but this aligner's language is {:?}. Direct callers must pass \
  ResolvedOov produced for THIS aligner's language. Recompute via \
  `Self::detect_oov(text)` + a policy helper from `crate::core::oov`.",
-          resolved.event.language,
+          resolved.event().language(),
           expected_lang,
         ),
         language: expected_lang.clone(),
@@ -1465,15 +1465,11 @@ mod tests {
   #[test]
   fn validate_direct_decision_languages_rejects_cross_language_payload() {
     use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-    let stale = alloc::vec![ResolvedOov {
-      event: OovEvent {
-        kind: OovKind::Symbol('&'),
-        char_index: 2,
-        word_index: 0,
-        language: Lang::Ko, // payload was made for Korean
-      },
-      decision: OovDecision::Wildcard,
-    }];
+    // Payload was made for Korean.
+    let stale = alloc::vec![ResolvedOov::new(
+      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::Ko),
+      OovDecision::Wildcard,
+    )];
     let result = validate_direct_decision_languages(&stale, &Lang::En);
     match result {
       Err(WorkFailure::AlignmentFailed {
@@ -1494,15 +1490,10 @@ mod tests {
   #[test]
   fn validate_direct_decision_languages_accepts_matching_payload() {
     use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-    let ok = alloc::vec![ResolvedOov {
-      event: OovEvent {
-        kind: OovKind::Symbol('&'),
-        char_index: 2,
-        word_index: 0,
-        language: Lang::En,
-      },
-      decision: OovDecision::Wildcard,
-    }];
+    let ok = alloc::vec![ResolvedOov::new(
+      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
+      OovDecision::Wildcard,
+    )];
     assert!(validate_direct_decision_languages(&ok, &Lang::En).is_ok());
   }
 

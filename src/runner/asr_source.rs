@@ -63,19 +63,61 @@ pub trait AsrSource: Send {
 /// references so the impl can hold them on the stack.
 pub struct AsrChunkContext<'a> {
   /// 16 kHz f32 mono audio.
-  pub samples: &'a [f32],
+  samples: &'a [f32],
   /// ASR knobs (language hint, temperature ladder,
   /// thresholds, etc.).
-  pub params: &'a AsrParams,
+  params: &'a AsrParams,
   /// Cooperative-cancellation flag the impl polls at coarse
   /// boundaries. Flipping this from the caller's runtime
   /// unwinds in-flight inference (whisper.cpp re-checks via
   /// the abort callback wired into `Params`).
-  pub abort_flag: &'a Arc<AtomicBool>,
+  abort_flag: &'a Arc<AtomicBool>,
   /// Caller-supplied chunk identity — surfaces back into
   /// [`WorkFailure::AsrFailed`] / `WorkerHangTimeout`
   /// telemetry. Whispery does not assign chunk ids itself.
-  pub chunk_id: ChunkId,
+  chunk_id: ChunkId,
+}
+
+impl<'a> AsrChunkContext<'a> {
+  /// Construct from the four per-chunk inputs.
+  #[must_use]
+  pub const fn new(
+    samples: &'a [f32],
+    params: &'a AsrParams,
+    abort_flag: &'a Arc<AtomicBool>,
+    chunk_id: ChunkId,
+  ) -> Self {
+    Self {
+      samples,
+      params,
+      abort_flag,
+      chunk_id,
+    }
+  }
+
+  /// 16 kHz f32 mono audio.
+  #[must_use]
+  pub const fn samples(&self) -> &'a [f32] {
+    self.samples
+  }
+
+  /// ASR knobs for this chunk.
+  #[must_use]
+  pub const fn params(&self) -> &'a AsrParams {
+    self.params
+  }
+
+  /// Cooperative-cancellation flag for this chunk.
+  #[must_use]
+  pub const fn abort_flag(&self) -> &'a Arc<AtomicBool> {
+    self.abort_flag
+  }
+
+  /// Caller-supplied chunk identity.
+  #[must_use]
+  pub const fn chunk_id(&self) -> ChunkId {
+    self.chunk_id
+  }
 }
 
 /// Default [`AsrSource`] impl backed by whisper.cpp via the
@@ -125,7 +167,7 @@ impl AsrSource for WhisperAsrSource {
       AsrWorkItem, run_with_temperature_ladder, validate_for_whisper_ffi,
     };
 
-    validate_for_whisper_ffi(chunk.params)?;
+    validate_for_whisper_ffi(chunk.params())?;
     // scan samples for
     // finiteness before they reach `state.full`. Without this
     // a single NaN/Inf in public audio poisons the encoder's
@@ -140,7 +182,7 @@ impl AsrSource for WhisperAsrSource {
     // floats are not user-content but the index is enough to
     // localise the bug.
     if let Some((idx, val)) = chunk
-      .samples
+      .samples()
       .iter()
       .copied()
       .enumerate()
@@ -155,9 +197,9 @@ impl AsrSource for WhisperAsrSource {
       });
     }
     let job = AsrWorkItem {
-      chunk_id: chunk.chunk_id,
-      samples: Arc::<[f32]>::from(chunk.samples.to_vec()),
-      params: chunk.params.clone(),
+      chunk_id: chunk.chunk_id(),
+      samples: Arc::<[f32]>::from(chunk.samples().to_vec()),
+      params: chunk.params().clone(),
       // No internal watchdog — caller drives cancellation via
       // `abort_flag`. The legacy worker watchdog used this
       // field to prefer `WorkerHangTimeout` over `BackendError`
@@ -165,7 +207,7 @@ impl AsrSource for WhisperAsrSource {
       // distinction. Stamp a sentinel duration; downstream
       // code only consults this when the legacy worker
       // wraps it (and that path is going away).
-      abort_flag: chunk.abort_flag.clone(),
+      abort_flag: chunk.abort_flag().clone(),
     };
     let started_at = std::time::Instant::now();
     run_with_temperature_ladder(&mut self.state, &job, started_at)

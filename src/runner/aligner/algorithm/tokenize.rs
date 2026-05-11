@@ -23,16 +23,50 @@ pub struct TokenizedText {
   /// the model dictionary doesn't know becomes a wildcard, and
   /// the trellis emits `max(non_blank_logprobs)` for that frame.
   /// All non-wildcard ids are non-negative and fit in `u32`.
-  pub token_ids: Vec<i32>,
+  token_ids: Vec<i32>,
   /// Per-token mapping back to the normalised-word index. `None`
   /// for tokens that have no natural word index (word-delimiter
   /// `|`, special tokens like `<s>`, `<pad>`, `<unk>`).
-  pub word_idx_per_token: Vec<Option<usize>>,
+  word_idx_per_token: Vec<Option<usize>>,
   /// The wav2vec2 word-delimiter `|` token id, when the
   /// tokenizer exposes one and the normaliser opted in. The
   /// trellis-beam orchestrator uses this to recognise
   /// separators in `merge_words`.
-  pub separator_token_id: Option<u32>,
+  separator_token_id: Option<u32>,
+}
+
+impl TokenizedText {
+  /// Construct from the three component vectors.
+  #[must_use]
+  pub const fn new(
+    token_ids: Vec<i32>,
+    word_idx_per_token: Vec<Option<usize>>,
+    separator_token_id: Option<u32>,
+  ) -> Self {
+    Self {
+      token_ids,
+      word_idx_per_token,
+      separator_token_id,
+    }
+  }
+
+  /// Vocab indices in tokenisation order.
+  #[must_use]
+  pub fn token_ids(&self) -> &[i32] {
+    &self.token_ids
+  }
+
+  /// Per-token mapping back to the normalised-word index.
+  #[must_use]
+  pub fn word_idx_per_token(&self) -> &[Option<usize>] {
+    &self.word_idx_per_token
+  }
+
+  /// The wav2vec2 word-delimiter `|` token id, when present.
+  #[must_use]
+  pub const fn separator_token_id(&self) -> Option<u32> {
+    self.separator_token_id
+  }
 }
 
 /// Tokenise `normalized` against the wav2vec2 tokeniser, building a
@@ -112,7 +146,7 @@ fn consume_oov_decision(
 ) -> Result<crate::core::OovDecision, WorkFailure> {
   let decision = oov_decisions
     .get(*oov_consumed)
-    .map(|r| r.decision)
+    .map(|r| r.decision())
     .ok_or_else(|| WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::TokenizationFailed,
       message: alloc::format!(
@@ -238,32 +272,31 @@ pub fn detect_oov_events(
   let mut tmp_buf = alloc::string::String::with_capacity(8);
   let mut char_index: usize = 0;
   for (word_index, word) in words.iter().enumerate() {
-    let crate::runner::aligner::normalizer::WildcardBoundary {
-      prefix: prefix_wildcards,
-      suffix: suffix_wildcards,
-    } = wildcard_boundary_per_word
+    let boundary = wildcard_boundary_per_word
       .get(word_index)
       .copied()
       .unwrap_or(crate::runner::aligner::normalizer::WildcardBoundary::NONE);
+    let prefix_wildcards = boundary.prefix();
+    let suffix_wildcards = boundary.suffix();
     // Boundary-prefix wildcards: surface BEFORE the word's
     // chars so the event order matches `tokenize_with_word_map`'s
     // emit order exactly.
     for _ in 0..prefix_wildcards {
-      events.push(OovEvent {
-        kind: crate::core::OovKind::BoundaryPunct,
+      events.push(OovEvent::new(
+        crate::core::OovKind::BoundaryPunct,
         char_index,
         word_index,
-        language: language.clone(),
-      });
+        language.clone(),
+      ));
     }
     for ch in word.chars() {
       if is_skippable_internal_punct(ch) {
-        events.push(OovEvent {
-          kind: crate::core::OovKind::InternalPunct(ch),
+        events.push(OovEvent::new(
+          crate::core::OovKind::InternalPunct(ch),
           char_index,
           word_index,
-          language: language.clone(),
-        });
+          language.clone(),
+        ));
         char_index += 1;
         continue;
       }
@@ -288,24 +321,24 @@ pub fn detect_oov_events(
           None => false,
         };
       if is_unk_or_empty {
-        events.push(OovEvent {
-          kind: crate::core::OovKind::Symbol(ch),
+        events.push(OovEvent::new(
+          crate::core::OovKind::Symbol(ch),
           char_index,
           word_index,
-          language: language.clone(),
-        });
+          language.clone(),
+        ));
       }
       char_index += 1;
     }
     // Boundary-suffix wildcards: surface AFTER the word's
     // chars (mirrors tokenize order).
     for _ in 0..suffix_wildcards {
-      events.push(OovEvent {
-        kind: crate::core::OovKind::BoundaryPunct,
+      events.push(OovEvent::new(
+        crate::core::OovKind::BoundaryPunct,
         char_index,
         word_index,
-        language: language.clone(),
-      });
+        language.clone(),
+      ));
     }
     // Word separator counted as one char in the index space
     // so neighbouring words' char_index values stay
@@ -438,7 +471,7 @@ pub fn tokenize_with_word_map(
   // the position in the chunk; language is policy metadata,
   // not positional identity.
   for (i, (pre, resolved)) in pre_events.iter().zip(oov_decisions.iter()).enumerate() {
-    if !resolved.event.matches_position(pre) {
+    if !resolved.event().matches_position(pre) {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::TokenizationFailed,
         message: alloc::format!(
@@ -447,7 +480,7 @@ pub fn tokenize_with_word_map(
  detected={:?}. This typically means the caller reused decisions from a \
  previous chunk whose OOV count happened to match. Re-run \
  `detect_oov_events` for THIS chunk's normalised text and re-decide.",
-          resolved.event,
+          resolved.event(),
           pre,
         ),
         language: language.clone(),
@@ -493,13 +526,12 @@ pub fn tokenize_with_word_map(
   let mut per_word_tokens: Vec<Vec<i32>> = Vec::with_capacity(words.len());
   let mut tmp_buf = String::with_capacity(8);
   for (wi, word) in words.iter().enumerate() {
-    let crate::runner::aligner::normalizer::WildcardBoundary {
-      prefix: prefix_wildcards,
-      suffix: suffix_wildcards,
-    } = wildcard_boundary_per_word
+    let boundary = wildcard_boundary_per_word
       .get(wi)
       .copied()
       .unwrap_or(crate::runner::aligner::normalizer::WildcardBoundary::NONE);
+    let prefix_wildcards = boundary.prefix();
+    let suffix_wildcards = boundary.suffix();
     let mut word_tokens: Vec<i32> = Vec::with_capacity(word.len());
     // Push prefix wildcards BEFORE the encoded chars so leading
     // punctuation like `"hello` aligns its `*` placeholders
@@ -865,9 +897,9 @@ mod tests {
     let unk = tok.token_to_id("<unk>");
     let events = detect_oov_events(&tok, "AT&T", 1, true, unk, &Lang::En, &[]).expect("ok");
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, crate::core::OovKind::Symbol('&'));
-    assert_eq!(events[0].word_index, 0);
-    assert_eq!(events[0].language, Lang::En);
+    assert_eq!(events[0].kind(), &crate::core::OovKind::Symbol('&'));
+    assert_eq!(events[0].word_index(), 0);
+    assert_eq!(events[0].language(), &Lang::En);
   }
 
   /// a
@@ -890,21 +922,11 @@ mod tests {
       .expect("ok")
       .pop()
       .expect("AT&T has one OOV");
-    let extra_event = crate::core::OovEvent {
-      kind: crate::core::OovKind::Symbol('?'),
-      char_index: 99,
-      word_index: 99,
-      language: Lang::En,
-    };
+    let extra_event =
+      crate::core::OovEvent::new(crate::core::OovKind::Symbol('?'), 99, 99, Lang::En);
     let too_long = alloc::vec![
-      crate::core::ResolvedOov {
-        event: real_event,
-        decision: crate::core::OovDecision::Wildcard,
-      },
-      crate::core::ResolvedOov {
-        event: extra_event,
-        decision: crate::core::OovDecision::Wildcard,
-      },
+      crate::core::ResolvedOov::new(real_event, crate::core::OovDecision::Wildcard),
+      crate::core::ResolvedOov::new(extra_event, crate::core::OovDecision::Wildcard),
     ];
     let result =
       tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
@@ -940,21 +962,11 @@ mod tests {
       .expect("ok")
       .pop()
       .expect("AT&T has one OOV");
-    let extra_event = crate::core::OovEvent {
-      kind: crate::core::OovKind::Symbol('?'),
-      char_index: 99,
-      word_index: 99,
-      language: Lang::En,
-    };
+    let extra_event =
+      crate::core::OovEvent::new(crate::core::OovKind::Symbol('?'), 99, 99, Lang::En);
     let too_long = alloc::vec![
-      crate::core::ResolvedOov {
-        event: real_event,
-        decision: crate::core::OovDecision::FailClosed,
-      },
-      crate::core::ResolvedOov {
-        event: extra_event,
-        decision: crate::core::OovDecision::Wildcard,
-      },
+      crate::core::ResolvedOov::new(real_event, crate::core::OovDecision::FailClosed),
+      crate::core::ResolvedOov::new(extra_event, crate::core::OovDecision::Wildcard),
     ];
     let result =
       tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
@@ -998,10 +1010,10 @@ mod tests {
     // Decisions produced for `"4"` (digit OOV at char_index=0).
     let stale_for_digit = detect_oov_events(&tok, "4", 1, true, unk, &Lang::En, &[]).expect("ok");
     assert_eq!(stale_for_digit.len(), 1);
-    let stale_resolved = alloc::vec![crate::core::ResolvedOov {
-      event: stale_for_digit[0].clone(),
-      decision: crate::core::OovDecision::Wildcard,
-    }];
+    let stale_resolved = alloc::vec![crate::core::ResolvedOov::new(
+      stale_for_digit[0].clone(),
+      crate::core::OovDecision::Wildcard
+    )];
     // Apply against `"AT&T"` (one OOV but it's `&` at
     // char_index=2, word_index=0) — same length, different
     // event.
@@ -1056,19 +1068,19 @@ mod tests {
       .expect("ok")
       .pop()
       .expect("AT&T has one OOV");
-    assert_eq!(pre.language, Lang::En);
+    assert_eq!(pre.language(), &Lang::En);
     // Caller's payload was produced via `AlignmentSet::detect_oov`
     // for a Korean-tagged run; the event language stamp is `Ko`
     // but the positional fields match the En detection above.
-    let resolved = alloc::vec![crate::core::ResolvedOov {
-      event: crate::core::OovEvent {
-        kind: pre.kind.clone(),
-        char_index: pre.char_index,
-        word_index: pre.word_index,
-        language: Lang::Ko,
-      },
-      decision: crate::core::OovDecision::Wildcard,
-    }];
+    let resolved = alloc::vec![crate::core::ResolvedOov::new(
+      crate::core::OovEvent::new(
+        pre.kind().clone(),
+        pre.char_index(),
+        pre.word_index(),
+        Lang::Ko
+      ),
+      crate::core::OovDecision::Wildcard,
+    )];
     let result =
       tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &resolved);
     assert!(
@@ -1087,7 +1099,7 @@ mod tests {
     let unk = tok.token_to_id("<unk>");
     let events = detect_oov_events(&tok, "AT&T cost 43", 3, true, unk, &Lang::En, &[]).expect("ok");
     let chars: alloc::vec::Vec<Option<char>> = events.iter().map(|e| e.char()).collect();
-    let words: alloc::vec::Vec<usize> = events.iter().map(|e| e.word_index).collect();
+    let words: alloc::vec::Vec<usize> = events.iter().map(|e| e.word_index()).collect();
     assert_eq!(chars, alloc::vec![Some('&'), Some('4'), Some('3')]);
     assert_eq!(words, alloc::vec![0, 2, 2]);
   }
@@ -1105,7 +1117,7 @@ mod tests {
     // events so strict policies (`fail_closed_all_decisions`)
     // can refuse them. `U.S.A` has two `.` chars.
     let kinds: alloc::vec::Vec<crate::core::OovKind> =
-      events.iter().map(|e| e.kind.clone()).collect();
+      events.iter().map(|e| e.kind().clone()).collect();
     assert_eq!(
       kinds,
       alloc::vec![
@@ -1434,10 +1446,9 @@ mod tests {
       true,
       unk,
       /* wildcard_boundary_per_word: */
-      &[crate::runner::aligner::normalizer::WildcardBoundary {
-        prefix: 0,
-        suffix: 1,
-      }],
+      &[crate::runner::aligner::normalizer::WildcardBoundary::new(
+        0, 1,
+      )],
       &Lang::En,
     )
     .expect("ok");
@@ -1476,10 +1487,9 @@ mod tests {
       true,
       unk,
       /* wildcard_boundary_per_word: prefix=1, suffix=0: */
-      &[crate::runner::aligner::normalizer::WildcardBoundary {
-        prefix: 1,
-        suffix: 0,
-      }],
+      &[crate::runner::aligner::normalizer::WildcardBoundary::new(
+        1, 0,
+      )],
       &Lang::En,
     )
     .expect("ok");
@@ -1514,10 +1524,9 @@ mod tests {
       true,
       unk,
       /* wildcard_boundary_per_word: */
-      &[crate::runner::aligner::normalizer::WildcardBoundary {
-        prefix: 1,
-        suffix: 1,
-      }],
+      &[crate::runner::aligner::normalizer::WildcardBoundary::new(
+        1, 1,
+      )],
       &Lang::En,
     )
     .expect("ok");
@@ -1549,18 +1558,9 @@ mod tests {
       true,
       unk,
       &[
-        crate::runner::aligner::normalizer::WildcardBoundary {
-          prefix: 1,
-          suffix: 0,
-        },
-        crate::runner::aligner::normalizer::WildcardBoundary {
-          prefix: 2,
-          suffix: 1,
-        },
-        crate::runner::aligner::normalizer::WildcardBoundary {
-          prefix: 3,
-          suffix: 0,
-        },
+        crate::runner::aligner::normalizer::WildcardBoundary::new(1, 0),
+        crate::runner::aligner::normalizer::WildcardBoundary::new(2, 1),
+        crate::runner::aligner::normalizer::WildcardBoundary::new(3, 0),
       ], // length 3 but word_count = 2
       &Lang::En,
       &[],

@@ -112,10 +112,9 @@ let abort_flag = Arc::new(AtomicBool::new(false));
 while let Some(cmd) = transcriber.poll_command() {
   match cmd {
     Command::Asr { chunk_id, samples, params, .. } => {
-      let result = asr_source.run_chunk(AsrChunkContext {
-        samples: &samples, params: &params,
-        abort_flag: &abort_flag, chunk_id,
-      })?;
+      let result = asr_source.run_chunk(AsrChunkContext::new(
+        &samples, &params, &abort_flag, chunk_id,
+      ))?;
       transcriber.handle_asr(chunk_id, result)?;
     }
     Command::Alignment { chunk_id, samples, sub_segments: _, text, language, runs } => {

@@ -27,15 +27,43 @@ use crate::types::{AlignmentFailureKind, Lang, WorkFailure};
 /// consumers do not see it.
 pub struct LogProbsTV {
   /// Time dimension (number of wav2vec2 output frames).
-  pub t: usize,
+  t: usize,
   /// Vocab dimension.
-  pub v: usize,
+  v: usize,
   /// Flat row-major `(T, V)` log-probabilities. Index with
   /// `[t * v_dim + v_idx]`.
-  pub data: Vec<f32>,
+  data: Vec<f32>,
 }
 
 impl LogProbsTV {
+  /// Construct from explicit dimensions + flat row-major buffer.
+  ///
+  /// `data.len()` must equal `t * v`. The constructor itself
+  /// doesn't validate; callers (the encoder and the bench
+  /// harness) construct from already-validated shapes.
+  #[must_use]
+  pub const fn new(t: usize, v: usize, data: Vec<f32>) -> Self {
+    Self { t, v, data }
+  }
+
+  /// Time dimension (number of wav2vec2 output frames).
+  #[must_use]
+  pub const fn t(&self) -> usize {
+    self.t
+  }
+
+  /// Vocab dimension.
+  #[must_use]
+  pub const fn v(&self) -> usize {
+    self.v
+  }
+
+  /// Borrow the flat row-major `(T, V)` log-probability buffer.
+  #[must_use]
+  pub fn data(&self) -> &[f32] {
+    &self.data
+  }
+
   /// Read the log-probability of vocab index `v_idx` at frame `t_idx`.
   pub fn at(&self, t_idx: usize, v_idx: usize) -> f32 {
     self.data[t_idx * self.v + v_idx]

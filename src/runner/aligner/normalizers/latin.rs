@@ -353,8 +353,9 @@ impl TextNormalizer for LatinNormalizer {
             original_words.push(Cow::Owned(String::from(*piece_orig)));
             let prefix = if pi == 0 { prefix_stripped } else { 0 };
             let suffix = if pi == last_idx { suffix_stripped } else { 0 };
-            wildcards_per_word
-              .push(crate::runner::aligner::normalizer::WildcardBoundary { prefix, suffix });
+            wildcards_per_word.push(crate::runner::aligner::normalizer::WildcardBoundary::new(
+              prefix, suffix,
+            ));
           }
         } else {
           // No internal separator — the sub-token is one piece.
@@ -364,10 +365,10 @@ impl TextNormalizer for LatinNormalizer {
           }
           normalized.push_str(&lower);
           original_words.push(Cow::Borrowed(original_slice));
-          wildcards_per_word.push(crate::runner::aligner::normalizer::WildcardBoundary {
-            prefix: prefix_stripped,
-            suffix: suffix_stripped,
-          });
+          wildcards_per_word.push(crate::runner::aligner::normalizer::WildcardBoundary::new(
+            prefix_stripped,
+            suffix_stripped,
+          ));
         }
       }
     }

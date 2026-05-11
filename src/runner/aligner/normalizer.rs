@@ -79,12 +79,12 @@ pub struct WildcardBoundary {
   /// word's encoded letter chars so leading punctuation like
   /// `"hello` aligns its `*` placeholders ahead of `h, e, l,
   /// l, o`.
-  pub prefix: u32,
+  prefix: u32,
   /// Number of trailing-punctuation chars the normaliser
   /// stripped from this word's source form. Tokens emitted
   /// AFTER the encoded chars; mirrors the prefix story for
   /// trailing punct like `hello"`.
-  pub suffix: u32,
+  suffix: u32,
 }
 
 impl WildcardBoundary {
@@ -94,6 +94,24 @@ impl WildcardBoundary {
     prefix: 0,
     suffix: 0,
   };
+
+  /// Construct from leading + trailing wildcard counts.
+  #[must_use]
+  pub const fn new(prefix: u32, suffix: u32) -> Self {
+    Self { prefix, suffix }
+  }
+
+  /// Number of leading-punctuation wildcards.
+  #[must_use]
+  pub const fn prefix(&self) -> u32 {
+    self.prefix
+  }
+
+  /// Number of trailing-punctuation wildcards.
+  #[must_use]
+  pub const fn suffix(&self) -> u32 {
+    self.suffix
+  }
 }
 
 impl<'a> NormalizedText<'a> {

@@ -73,39 +73,39 @@ use crate::{
 /// timeout would fire.
 pub struct AlignWorkItem {
   /// Identity of the chunk this alignment fulfils.
-  pub chunk_id: ChunkId,
+  chunk_id: ChunkId,
   /// Chunk audio (16 kHz f32 mono); shared via `Arc` with the
   /// core.
-  pub samples: Arc<[f32]>,
+  samples: Arc<[f32]>,
   /// Sub-VAD-segments inside the chunk, in chunk-local 16 kHz
   /// sample-index space (encoded as TimeRanges with timebase
   /// 1/16000 so `start_pts() == start_sample`). The runner
   /// converts from output-timebase before enqueueing.
-  pub sub_segments: alloc::vec::Vec<TimeRange>,
+  sub_segments: alloc::vec::Vec<TimeRange>,
   /// Whisper's transcribed text for this chunk.
-  pub text: SmolStr,
+  text: SmolStr,
   /// Detected language for this chunk.
-  pub language: Lang,
+  language: Lang,
   /// Script-dispatcher per-language runs over the transcript,
   /// computed by the whisper worker just after `state.full(...)`.
   /// Empty when the dispatcher was not run (no segments, or a
   /// caller injecting `AsrResult` directly without populating
   /// `AsrResult::runs`); the worker then falls back to a single
   /// whole-chunk alignment keyed on [`Self::language`].
-  pub runs: alloc::vec::Vec<crate::align::Run>,
+  runs: alloc::vec::Vec<crate::align::Run>,
   /// Watchdog flag. The worker checks this between pipeline
   /// stages; if true, it returns
   /// [`WorkFailure::WorkerHangTimeout`] without continuing.
-  pub abort_flag: Arc<AtomicBool>,
+  abort_flag: Arc<AtomicBool>,
   /// Chunk's first 16 kHz sample index in stream coordinates.
   /// Used by the aligner to map wav2vec2 frame indices back
   /// into stream sample space; the runner converts further into
   /// output-timebase via the `samples_to_output_range` closure.
-  pub chunk_first_sample_in_stream: u64,
+  chunk_first_sample_in_stream: u64,
   /// Bridge from stream sample indices to output-timebase
   /// `TimeRange`s. Pre-bound by the runner to the core's
   /// `SampleBuffer::samples_to_output_range`.
-  pub samples_to_output_range: Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync>,
+  samples_to_output_range: Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync>,
   /// Caller-resolved OOV decisions, one inner vec per
   /// alignment unit:
   /// * If [`Self::runs`] is non-empty (script-dispatched
@@ -129,15 +129,12 @@ pub struct AlignWorkItem {
   /// `fail_closed_all_decisions` / a custom closure over the
   /// events). Sans-I/O OOV resolution: data in, no callbacks.
   ///
-  ///  /// this was a flat `Vec<OovDecision>` that only applied to
-  /// the whole-chunk path; the per-run path hard-coded
-  /// `default_oov_decisions`, silently ignoring the caller's
-  /// `wildcard_all_decisions` / `fail_closed_all_decisions`
-  /// opt-in for any chunk with `runs` populated (= every
-  /// chunk produced by `WhisperAsrSource`). The per-run
-  /// shape is now strict, so the caller's policy reaches
-  /// every alignment unit.
-  pub oov_decisions: alloc::vec::Vec<alloc::vec::Vec<crate::core::ResolvedOov>>,
+  /// The per-run shape is strict, so the caller's policy
+  /// reaches every alignment unit; a flat `Vec<OovDecision>`
+  /// would let the per-run path silently substitute the
+  /// default policy for any chunk with `runs` populated
+  /// (= every chunk produced by `WhisperAsrSource`).
+  oov_decisions: alloc::vec::Vec<alloc::vec::Vec<crate::core::ResolvedOov>>,
 }
 
 impl AlignWorkItem {
@@ -211,6 +208,70 @@ impl AlignWorkItem {
       samples_to_output_range: bridge,
       oov_decisions,
     })
+  }
+
+  /// Identity of the chunk this alignment fulfils.
+  #[must_use]
+  pub const fn chunk_id(&self) -> ChunkId {
+    self.chunk_id
+  }
+
+  /// Chunk audio (16 kHz f32 mono).
+  #[must_use]
+  pub fn samples(&self) -> &Arc<[f32]> {
+    &self.samples
+  }
+
+  /// Sub-VAD-segments inside the chunk, in chunk-local 16 kHz
+  /// sample-index space.
+  #[must_use]
+  pub fn sub_segments(&self) -> &[TimeRange] {
+    &self.sub_segments
+  }
+
+  /// Whisper's transcribed text for this chunk.
+  #[must_use]
+  pub fn text(&self) -> &SmolStr {
+    &self.text
+  }
+
+  /// Detected language for this chunk.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+
+  /// Script-dispatcher per-language runs over the transcript.
+  #[must_use]
+  pub fn runs(&self) -> &[crate::align::Run] {
+    &self.runs
+  }
+
+  /// Watchdog flag the worker checks between pipeline stages.
+  #[must_use]
+  pub fn abort_flag(&self) -> &Arc<AtomicBool> {
+    &self.abort_flag
+  }
+
+  /// Chunk's first 16 kHz sample index in stream coordinates.
+  #[must_use]
+  pub const fn chunk_first_sample_in_stream(&self) -> u64 {
+    self.chunk_first_sample_in_stream
+  }
+
+  /// Bridge from stream sample indices to output-timebase
+  /// `TimeRange`s.
+  #[must_use]
+  pub fn samples_to_output_range(&self) -> &Arc<dyn Fn(u64, u64) -> TimeRange + Send + Sync> {
+    &self.samples_to_output_range
+  }
+
+  /// Caller-resolved OOV decisions, one inner vec per
+  /// alignment unit. See the field doc on the struct for the
+  /// shape contract.
+  #[must_use]
+  pub fn oov_decisions(&self) -> &[alloc::vec::Vec<crate::core::ResolvedOov>] {
+    &self.oov_decisions
   }
 }
 
@@ -463,7 +524,7 @@ fn validate_oov_decision_languages(
     // must carry job.language.
     if let Some(chunk_decisions) = oov_decisions.first() {
       for (i, resolved) in chunk_decisions.iter().enumerate() {
-        if &resolved.event.language != job_language {
+        if resolved.event().language() != job_language {
           return Err(WorkFailure::AlignmentFailed {
             kind: AlignmentFailureKind::TokenizationFailed,
             message: alloc::format!(
@@ -472,7 +533,7 @@ fn validate_oov_decision_languages(
  previous chunk's run leaked into a whole-chunk job; the caller's \
  language-conditional policy would run against the wrong key. \
  Recompute via `AlignmentSet::detect_oov` for THIS chunk.",
-              resolved.event.language,
+              resolved.event().language(),
               job_language,
             ),
             language: job_language.clone(),
@@ -494,7 +555,7 @@ fn validate_oov_decision_languages(
     };
     let expected_lang = run.language();
     for (i, resolved) in run_decisions.iter().enumerate() {
-      if &resolved.event.language != expected_lang {
+      if resolved.event().language() != expected_lang {
         return Err(WorkFailure::AlignmentFailed {
           kind: AlignmentFailureKind::TokenizationFailed,
           message: alloc::format!(
@@ -504,7 +565,7 @@ fn validate_oov_decision_languages(
  the caller's language-conditional policy would run against the \
  wrong key. Recompute via `AlignmentSet::detect_oov_per_run` for \
  THIS chunk's runs.",
-            resolved.event.language,
+            resolved.event().language(),
             expected_lang,
           ),
           language: expected_lang.clone(),
@@ -1576,15 +1637,10 @@ mod tests {
   fn per_run_oov_decisions_are_indexed_by_run_idx() {
     use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
     fn synth(decision: OovDecision, char_idx: usize) -> ResolvedOov {
-      ResolvedOov {
-        event: OovEvent {
-          kind: OovKind::Symbol('?'),
-          char_index: char_idx,
-          word_index: 0,
-          language: Lang::En,
-        },
+      ResolvedOov::new(
+        OovEvent::new(OovKind::Symbol('?'), char_idx, 0, Lang::En),
         decision,
-      }
+      )
     }
     let oov_decisions: alloc::vec::Vec<alloc::vec::Vec<ResolvedOov>> = alloc::vec![
       // Run 0: caller chose `wildcard_all_decisions` — three Wildcards.
@@ -1610,12 +1666,12 @@ mod tests {
       match run_idx {
         0 => {
           assert_eq!(slice.len(), 3);
-          assert!(slice.iter().all(|r| r.decision == OovDecision::Wildcard));
+          assert!(slice.iter().all(|r| r.decision() == OovDecision::Wildcard));
         }
         1 => {
           assert_eq!(slice.len(), 2);
-          assert_eq!(slice[0].decision, OovDecision::Wildcard);
-          assert_eq!(slice[1].decision, OovDecision::FailClosed);
+          assert_eq!(slice[0].decision(), OovDecision::Wildcard);
+          assert_eq!(slice[1].decision(), OovDecision::FailClosed);
         }
         2 => assert!(slice.is_empty()),
         _ => unreachable!(),
@@ -1639,15 +1695,10 @@ mod tests {
   #[test]
   fn validate_oov_decision_languages_whole_chunk_match_passes() {
     use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-    let resolved = alloc::vec![alloc::vec![ResolvedOov {
-      event: OovEvent {
-        kind: OovKind::Symbol('&'),
-        char_index: 2,
-        word_index: 0,
-        language: Lang::En,
-      },
-      decision: OovDecision::Wildcard,
-    }]];
+    let resolved = alloc::vec![alloc::vec![ResolvedOov::new(
+      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
+      OovDecision::Wildcard,
+    )]];
     assert!(validate_oov_decision_languages(&[], &Lang::En, &resolved).is_ok());
   }
 
@@ -1657,15 +1708,10 @@ mod tests {
     // Job language is Korean; supplied decision was made for
     // English — language-conditional policy would run against
     // the wrong key.
-    let resolved = alloc::vec![alloc::vec![ResolvedOov {
-      event: OovEvent {
-        kind: OovKind::Symbol('&'),
-        char_index: 2,
-        word_index: 0,
-        language: Lang::En,
-      },
-      decision: OovDecision::Wildcard,
-    }]];
+    let resolved = alloc::vec![alloc::vec![ResolvedOov::new(
+      OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
+      OovDecision::Wildcard,
+    )]];
     let result = validate_oov_decision_languages(&[], &Lang::Ko, &resolved);
     match result {
       Err(WorkFailure::AlignmentFailed {
@@ -1707,24 +1753,15 @@ mod tests {
     ];
     // Run 1 (Korean) is wired with a stale English-stamped decision.
     let resolved = alloc::vec![
-      alloc::vec![ResolvedOov {
-        event: OovEvent {
-          kind: OovKind::Symbol('&'),
-          char_index: 2,
-          word_index: 0,
-          language: Lang::En,
-        },
-        decision: OovDecision::Wildcard,
-      }],
-      alloc::vec![ResolvedOov {
-        event: OovEvent {
-          kind: OovKind::Symbol('4'),
-          char_index: 0,
-          word_index: 0,
-          language: Lang::En, // BUG: should be Ko
-        },
-        decision: OovDecision::Wildcard,
-      }],
+      alloc::vec![ResolvedOov::new(
+        OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
+        OovDecision::Wildcard,
+      )],
+      // BUG: event language Lang::En but run language Lang::Ko.
+      alloc::vec![ResolvedOov::new(
+        OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::En),
+        OovDecision::Wildcard,
+      )],
     ];
     let result = validate_oov_decision_languages(&runs, &Lang::En, &resolved);
     match result {

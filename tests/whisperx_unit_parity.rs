@@ -138,11 +138,7 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
     data[ti * VOCAB_SIZE + BLANK_ID as usize] = -1.0;
   }
   if tokens.is_empty() {
-    return LogProbsTV {
-      t: num_frames,
-      v: VOCAB_SIZE,
-      data,
-    };
+    return LogProbsTV::new(num_frames, VOCAB_SIZE, data);
   }
   // We distribute over `tokens.len() + 1` slots so the first peak
   // doesn't sit at frame 0 (matches WhisperX's `+ 1` denominator).
@@ -151,11 +147,7 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
     // Pathological — fewer frames than tokens. The trellis would
     // reject it as `audio too short`. Leave blank-only and let the
     // caller see the error.
-    return LogProbsTV {
-      t: num_frames,
-      v: VOCAB_SIZE,
-      data,
-    };
+    return LogProbsTV::new(num_frames, VOCAB_SIZE, data);
   }
   // Donor vocab id used for wildcard peaks. Wildcard's emission is
   // max(non_blank logprobs); peaking this id at the wildcard's
@@ -181,11 +173,7 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
       data[t * VOCAB_SIZE + BLANK_ID as usize] = -3.0;
     }
   }
-  LogProbsTV {
-    t: num_frames,
-    v: VOCAB_SIZE,
-    data,
-  }
+  LogProbsTV::new(num_frames, VOCAB_SIZE, data)
 }
 
 /// Run align() end-to-end on `text` with `num_frames` frames over
@@ -252,18 +240,18 @@ fn run_align_with_policy(
 
   // Whispery's chunk-drop path returns empty token_ids. Mirror
   // WhisperX's "no word_segments" response by returning empty.
-  if tokenized.token_ids.is_empty() {
+  if tokenized.token_ids().is_empty() {
     return Vec::new();
   }
 
-  let log_probs = build_synthetic_emission(num_frames, &tokenized.token_ids);
+  let log_probs = build_synthetic_emission(num_frames, tokenized.token_ids());
 
   let abort = AtomicBool::new(false);
   let segs: Vec<WordSegment> = align_to_word_segments(
     &log_probs,
-    &tokenized.token_ids,
-    &tokenized.word_idx_per_token,
-    tokenized.separator_token_id,
+    tokenized.token_ids(),
+    tokenized.word_idx_per_token(),
+    tokenized.separator_token_id(),
     BLANK_ID,
     &abort,
     &Lang::En,
@@ -280,10 +268,10 @@ fn run_align_with_policy(
   segs
     .into_iter()
     .map(|seg| AlignedWord {
-      word: words[seg.word_index].to_string(),
-      start_s: frame_to_s(seg.start_frame),
-      end_s: frame_to_s(seg.end_frame),
-      score: seg.score,
+      word: words[seg.word_index()].to_string(),
+      start_s: frame_to_s(seg.start_frame()),
+      end_s: frame_to_s(seg.end_frame()),
+      score: seg.score(),
     })
     .collect()
 }

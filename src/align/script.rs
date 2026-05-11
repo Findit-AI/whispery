@@ -28,15 +28,37 @@ pub struct SegmentContext {
   /// `true` when the segment contains at least one Hiragana or
   /// Katakana character. Forces every Han ideograph in this
   /// segment to map to [`Lang::Ja`].
-  pub has_kana: bool,
+  has_kana: bool,
 
   /// `true` when the segment contains at least one Hangul
   /// character. Forces every Han ideograph in this segment to
   /// map to [`Lang::Ko`] (only when `has_kana` is `false`).
-  pub has_hangul: bool,
+  has_hangul: bool,
 }
 
 impl SegmentContext {
+  /// Construct from the two flags directly. Most callers prefer
+  /// [`Self::from_text`].
+  #[must_use]
+  pub const fn new(has_kana: bool, has_hangul: bool) -> Self {
+    Self {
+      has_kana,
+      has_hangul,
+    }
+  }
+
+  /// Whether the segment contains at least one kana character.
+  #[must_use]
+  pub const fn has_kana(&self) -> bool {
+    self.has_kana
+  }
+
+  /// Whether the segment contains at least one Hangul character.
+  #[must_use]
+  pub const fn has_hangul(&self) -> bool {
+    self.has_hangul
+  }
+
   /// Build the per-segment context flags by scanning every
   /// character of `text` once. Subsequent per-character mapping
   /// calls re-use the result.
