@@ -20,15 +20,19 @@
 //! or any `#![allow(unsafe_code)]` exemption. The `unsafe`
 //! surface lives entirely inside the `whisper-cpp` crate.
 
-use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
-use std::sync::atomic::AtomicBool;
+use std::{
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
+  vec::Vec,
+};
 
 use whispercpp::{
   Params as FullParams, SamplingStrategy as WhisperStrategy, State as WhisperState,
 };
 
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
   core::{AsrParams, AsrResult, SamplingStrategy},
@@ -97,7 +101,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
   {
     return Err(WorkFailure::AsrFailed {
       kind: AsrFailureKind::BackendError,
-      message: alloc::format!(
+      message: format_smolstr!(
         "language hint rejected: {reason}. Reject before FFI so callers see a stable \
  diagnostic; whispercpp's `Params::set_language` would otherwise return \
  `InputTooLong` / `UnknownLanguage` for the same input."
@@ -110,7 +114,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
   {
     return Err(WorkFailure::AsrFailed {
       kind: AsrFailureKind::BackendError,
-      message: alloc::format!(
+      message: format_smolstr!(
         "initial_prompt of len {} contains an interior NUL byte; whisper-rs's set_initial_prompt \
  would panic. Reject before FFI.",
         prompt.as_str().len()
@@ -121,7 +125,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
   if params.n_threads() < 1 {
     return Err(WorkFailure::AsrFailed {
       kind: AsrFailureKind::BackendError,
-      message: alloc::format!(
+      message: format_smolstr!(
         "n_threads must be >= 1 (got {}); whisper.cpp's std::vector<std::thread>({} - 1) \
  would underflow / abort. Reject before FFI.",
         params.n_threads(),
@@ -140,7 +144,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       if best_of < 1 {
         return Err(WorkFailure::AsrFailed {
           kind: AsrFailureKind::BackendError,
-          message: alloc::format!(
+          message: format_smolstr!(
             "SamplingStrategy::Greedy.best_of must be >= 1 (got {best_of}); \
  whisper.cpp would either abort or fall back to greedy=1 silently. \
  Reject before FFI."
@@ -155,7 +159,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       if beam_size < 1 {
         return Err(WorkFailure::AsrFailed {
           kind: AsrFailureKind::BackendError,
-          message: alloc::format!(
+          message: format_smolstr!(
             "SamplingStrategy::BeamSearch.beam_size must be >= 1 (got {beam_size}); \
  whisper.cpp's beam-search loop would underflow on a non-positive size. \
  Reject before FFI."
@@ -169,7 +173,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
       if !patience.is_finite() || (patience <= 0.0 && (patience - -1.0).abs() > f32::EPSILON) {
         return Err(WorkFailure::AsrFailed {
           kind: AsrFailureKind::BackendError,
-          message: alloc::format!(
+          message: format_smolstr!(
             "SamplingStrategy::BeamSearch.patience must be a finite positive value \
  (or the documented `-1.0` whisper.cpp default sentinel); got {patience}. \
  Reject before FFI."
@@ -199,7 +203,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
     if !value.is_finite() {
       return Err(WorkFailure::AsrFailed {
         kind: AsrFailureKind::BackendError,
-        message: alloc::format!(
+        message: format_smolstr!(
           "AsrParams::{name} must be finite (got {value}); non-finite values are \
  either undefined to whisper.cpp's sampler or make the post-decode \
  gates degenerate. Reject before FFI."
@@ -218,7 +222,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
   if !(0.0..=1.0).contains(&init_t) {
     return Err(WorkFailure::AsrFailed {
       kind: AsrFailureKind::BackendError,
-      message: alloc::format!(
+      message: format_smolstr!(
         "AsrParams::initial_temperature must be in [0.0, 1.0] (got {init_t}); \
  WhisperX sampling temperatures are probabilities."
       ),
@@ -228,7 +232,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
   if !(0.0..=1.0).contains(&step) {
     return Err(WorkFailure::AsrFailed {
       kind: AsrFailureKind::BackendError,
-      message: alloc::format!(
+      message: format_smolstr!(
         "AsrParams::temperature_increment must be in [0.0, 1.0] (got {step}); \
  a step outside this range either skips meaningful retries or wraps \
  past the [0, 1] sampler domain."
@@ -239,7 +243,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
   if !(0.0..=1.0).contains(&nsp) {
     return Err(WorkFailure::AsrFailed {
       kind: AsrFailureKind::BackendError,
-      message: alloc::format!(
+      message: format_smolstr!(
         "AsrParams::no_speech_threshold must be in [0.0, 1.0] (got {nsp}); \
  it gates against per-segment no-speech probabilities."
       ),
@@ -249,7 +253,7 @@ pub(in crate::runner) fn validate_for_whisper_ffi(params: &AsrParams) -> Result<
   if cratio <= 0.0 {
     return Err(WorkFailure::AsrFailed {
       kind: AsrFailureKind::BackendError,
-      message: alloc::format!(
+      message: format_smolstr!(
         "AsrParams::compression_ratio_threshold must be > 0 (got {cratio}); \
  WhisperX's gate compares `len(text) / len(zlib(text))` to a positive \
  ceiling — a non-positive ceiling rejects every transcript."
@@ -301,8 +305,8 @@ fn build_template(params: &AsrParams) -> Result<FullParams, WorkFailure> {
     p.set_language(lang.as_str())
       .map_err(|e| WorkFailure::AsrFailed {
         kind: AsrFailureKind::BackendError,
-        message: alloc::format!(
-          "set_language({:?}) rejected by whisper.cpp: {e:?}",
+        message: format_smolstr!(
+          "set_language({}) rejected by whisper.cpp: {e}",
           lang.as_str()
         ),
       })?;
@@ -608,7 +612,7 @@ pub(in crate::runner) fn run_with_temperature_ladder(
     if !temperature.is_finite() {
       return Err(WorkFailure::AsrFailed {
         kind: AsrFailureKind::BackendError,
-        message: alloc::format!(
+        message: format_smolstr!(
           "ladder temperature became non-finite ({temperature}) after starting from \
  initial={} step={}; refuse to forward into whisper.cpp's sampler",
           p.initial_temperature(),
@@ -629,7 +633,7 @@ pub(in crate::runner) fn run_with_temperature_ladder(
     if !(0.0..=1.0).contains(&temperature) {
       return Err(WorkFailure::AsrFailed {
         kind: AsrFailureKind::AllTemperaturesFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "temperature ladder exhausted at attempt-derived value {temperature} \
  outside [0.0, 1.0] (initial={}, step={}); WhisperX caps the \
  fallback ladder at 1.0",
@@ -665,7 +669,7 @@ pub(in crate::runner) fn run_with_temperature_ladder(
       // pre-Err check above already covered the abort case).
       return Err(WorkFailure::AsrFailed {
         kind: AsrFailureKind::BackendError,
-        message: format!("{e:?}"),
+        message: format_smolstr!("{e}"),
       });
     }
 
@@ -720,9 +724,10 @@ pub(in crate::runner) fn run_with_temperature_ladder(
 
   Err(WorkFailure::AsrFailed {
     kind: AsrFailureKind::AllTemperaturesFailed,
-    message: format!(
+    message: format_smolstr!(
       "all {} temperature attempts failed for chunk {:?}",
-      max, job.chunk_id,
+      max,
+      job.chunk_id,
     ),
   })
 }
@@ -789,7 +794,7 @@ fn build_asr_result(
   // `params.language_hint()` lets the dispatcher benefit from
   // whisper.cpp's own auto-detection in the auto-detect path
   // (`language_hint = None` originally).
-  let segments: alloc::vec::Vec<whispercpp::Segment<'_>> = state.segments_iter().collect();
+  let segments: Vec<whispercpp::Segment<'_>> = state.segments_iter().collect();
   // ctx for token-id → bytes resolution (per : the
   // dispatcher needs per-token byte offsets to slice DTW per run).
   let ctx_for_dispatch = state.context();
@@ -1107,12 +1112,11 @@ mod tests {
     assert_eq!(compression_ratio_of_text("ab"), 0.0);
   }
 
-  /// Sanity check: confirm `run_with_temperature_ladder` is callable
-  /// with the expected signature (and is pinned as `Send` so it can
-  /// run on a worker thread). End-to-end ladder behaviour and
-  /// layered-ladder suppression are exercised by other tests.
-  /// Here we only assert the type signature compiles.
-
+  // Sanity check: confirm `run_with_temperature_ladder` is callable
+  // with the expected signature (and is pinned as `Send` so it can
+  // run on a worker thread). End-to-end ladder behaviour and
+  // layered-ladder suppression are exercised by other tests.
+  // Here we only assert the type signature compiles.
   // FullParamsCache regression tests deleted alongside the cache
   // itself in the whisper-cpp migration. The cache existed only
   // to bound the whisper-rs `set_language` / `set_initial_prompt`

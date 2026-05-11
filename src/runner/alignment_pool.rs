@@ -16,11 +16,13 @@
 //! `thread::sleep`, so the worker can cancel it instantly when
 //! inference completes.
 
-use alloc::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::{
+  sync::{Arc, atomic::AtomicBool},
+  vec::Vec,
+};
 
 use mediatime::TimeRange;
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 
 use core::sync::atomic::Ordering;
 use std::{sync::Mutex, time::Instant};
@@ -28,9 +30,10 @@ use std::{sync::Mutex, time::Instant};
 use ort::session::RunOptions;
 
 use crate::{
-  core::AlignmentResult,
+  align::Run,
+  core::{AlignmentResult, ResolvedOov},
   runner::aligner::{Aligner, AlignmentFallback, AlignmentLookup, AlignmentSet},
-  types::{AlignmentFailureKind, ChunkId, Lang, WorkFailure, WorkerKind},
+  types::{AlignmentFailureKind, ChunkId, Lang, Word, WorkFailure, WorkerKind},
 };
 
 /// One unit of alignment work — the bundle of caller inputs
@@ -81,7 +84,7 @@ pub struct AlignWorkItem {
   /// sample-index space (encoded as TimeRanges with timebase
   /// 1/16000 so `start_pts() == start_sample`). The runner
   /// converts from output-timebase before enqueueing.
-  sub_segments: alloc::vec::Vec<TimeRange>,
+  sub_segments: Vec<TimeRange>,
   /// Whisper's transcribed text for this chunk.
   text: SmolStr,
   /// Detected language for this chunk.
@@ -92,7 +95,7 @@ pub struct AlignWorkItem {
   /// caller injecting `AsrResult` directly without populating
   /// `AsrResult::runs`); the worker then falls back to a single
   /// whole-chunk alignment keyed on [`Self::language`].
-  runs: alloc::vec::Vec<crate::align::Run>,
+  runs: Vec<Run>,
   /// Watchdog flag. The worker checks this between pipeline
   /// stages; if true, it returns
   /// [`WorkFailure::WorkerHangTimeout`] without continuing.
@@ -134,7 +137,7 @@ pub struct AlignWorkItem {
   /// would let the per-run path silently substitute the
   /// default policy for any chunk with `runs` populated
   /// (= every chunk produced by `WhisperAsrSource`).
-  oov_decisions: alloc::vec::Vec<alloc::vec::Vec<crate::core::ResolvedOov>>,
+  oov_decisions: Vec<Vec<ResolvedOov>>,
 }
 
 impl AlignWorkItem {
@@ -166,7 +169,7 @@ impl AlignWorkItem {
     samples: Arc<[f32]>,
     text: SmolStr,
     language: Lang,
-    runs: alloc::vec::Vec<crate::align::Run>,
+    runs: Vec<Run>,
     abort_flag: Arc<AtomicBool>,
     // Caller-resolved OOV decisions, one inner vec per
     // alignment unit. See the `Self::oov_decisions` field
@@ -179,14 +182,14 @@ impl AlignWorkItem {
     // Pass an empty outer vec only if the caller is sure
     // there are no OOV chars (encountering one anyway raises
     // `TokenizationFailed`).
-    oov_decisions: alloc::vec::Vec<alloc::vec::Vec<crate::core::ResolvedOov>>,
+    oov_decisions: Vec<Vec<ResolvedOov>>,
   ) -> Option<Self> {
     use core::num::NonZeroU32;
     let chunk_first = transcriber.chunk_first_sample(chunk_id)?;
     let raw_subs = transcriber.chunk_sub_segments_samples(chunk_id)?;
     let bridge = transcriber.chunk_samples_to_output_range_fn(chunk_id)?;
     let tb_16k = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let aligner_subs: alloc::vec::Vec<TimeRange> = raw_subs
+    let aligner_subs: Vec<TimeRange> = raw_subs
       .iter()
       .map(|(s, e)| {
         TimeRange::new(
@@ -243,7 +246,7 @@ impl AlignWorkItem {
 
   /// Script-dispatcher per-language runs over the transcript.
   #[must_use]
-  pub fn runs(&self) -> &[crate::align::Run] {
+  pub fn runs(&self) -> &[Run] {
     &self.runs
   }
 
@@ -270,18 +273,18 @@ impl AlignWorkItem {
   /// alignment unit. See the field doc on the struct for the
   /// shape contract.
   #[must_use]
-  pub fn oov_decisions(&self) -> &[alloc::vec::Vec<crate::core::ResolvedOov>] {
+  pub fn oov_decisions(&self) -> &[Vec<ResolvedOov>] {
     &self.oov_decisions
   }
 }
 
-/// Worker-emitted alignment result. Crate-private.
+// Worker-emitted alignment result. Crate-private.
 
-/// Returned by [`AlignmentPool::shutdown`] when one or more
-/// workers failed to wind down within the supplied timeout.
-/// `count` is the number of detached threads; each holds an
-/// `Aligner` (ONNX session + model memory) until its in-flight
-/// inference returns naturally.
+// Returned by [`AlignmentPool::shutdown`] when one or more
+// workers failed to wind down within the supplied timeout.
+// `count` is the number of detached threads; each holds an
+// `Aligner` (ONNX session + model memory) until its in-flight
+// inference returns naturally.
 
 /// Drive one alignment from start to finish.
 ///
@@ -364,7 +367,7 @@ pub fn run_one_alignment(
   if outer != 0 && outer != expected {
     return Err(WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::TokenizationFailed,
-      message: alloc::format!(
+      message: format_smolstr!(
         "AlignWorkItem::oov_decisions outer shape mismatch: \
  expected 0 (no OOV) or {expected} ({}), got {outer}. \
  This typically means stale per-run decisions are being \
@@ -418,7 +421,7 @@ pub fn run_one_alignment(
         run_under_lock(aligner, job, run_options, &job.abort_flag)
       }
       AlignmentLookup::Miss { fallback } => match fallback {
-        AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(alloc::vec::Vec::new())),
+        AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(Vec::new())),
         AlignmentFallback::Error => Err(WorkFailure::LanguageUnsupportedForAlignment {
           language: job.language.clone(),
         }),
@@ -475,7 +478,7 @@ pub fn run_one_alignment(
           job.chunk_id,
         );
       }
-      Ok(AlignmentResult::new(alloc::vec::Vec::new()))
+      Ok(AlignmentResult::new(Vec::new()))
     }
     // // canonicalise `WorkerHangTimeout::elapsed`. Inner code
     // (`Aligner::align`'s `timed_out` closure,
@@ -514,9 +517,9 @@ pub fn run_one_alignment(
 /// matches before dispatch. Mismatch fails loudly as
 /// `TokenizationFailed`, not silent policy bypass.
 fn validate_oov_decision_languages(
-  runs: &[crate::align::Run],
+  runs: &[Run],
   job_language: &Lang,
-  oov_decisions: &[alloc::vec::Vec<crate::core::ResolvedOov>],
+  oov_decisions: &[Vec<ResolvedOov>],
 ) -> Result<(), WorkFailure> {
   if runs.is_empty() {
     // Whole-chunk path: all decisions in oov_decisions[0]
@@ -527,7 +530,7 @@ fn validate_oov_decision_languages(
         if resolved.event().language() != job_language {
           return Err(WorkFailure::AlignmentFailed {
             kind: AlignmentFailureKind::TokenizationFailed,
-            message: alloc::format!(
+            message: format_smolstr!(
               "AlignWorkItem::oov_decisions[0][{i}].event.language = {:?} but \
  job.language = {:?}. This typically means stale decisions from a \
  previous chunk's run leaked into a whole-chunk job; the caller's \
@@ -558,9 +561,9 @@ fn validate_oov_decision_languages(
       if resolved.event().language() != expected_lang {
         return Err(WorkFailure::AlignmentFailed {
           kind: AlignmentFailureKind::TokenizationFailed,
-          message: alloc::format!(
-            "AlignWorkItem::oov_decisions[{run_idx}][{i}].event.language = {:?} \
- but runs[{run_idx}].language() = {:?}. This typically means stale \
+          message: format_smolstr!(
+            "AlignWorkItem::oov_decisions[{run_idx}][{i}].event.language = {} \
+ but runs[{run_idx}].language() = {}. This typically means stale \
  decisions from a previous chunk leaked into a per-run dispatch; \
  the caller's language-conditional policy would run against the \
  wrong key. Recompute via `AlignmentSet::detect_oov_per_run` for \
@@ -736,7 +739,7 @@ impl BoundsSourceCounters {
   }
 }
 
-/// Per-run dispatch path: for each [`crate::align::Run`] in
+/// Per-run dispatch path: for each [`Run`] in
 /// `job.runs`, look up the matching [`crate::Aligner`] and run
 /// `align_chunk` over the run's audio slice. Results are stitched
 /// into a single [`AlignmentResult`].
@@ -790,7 +793,7 @@ fn dispatch_runs(
   run_options: &RunOptions,
 ) -> Result<AlignmentResult, WorkFailure> {
   let mut counters = BoundsSourceCounters::default();
-  let mut all_words: alloc::vec::Vec<crate::types::Word> = alloc::vec::Vec::new();
+  let mut all_words: Vec<Word> = Vec::new();
   let dispatch_started_at = Instant::now();
 
   for (run_idx, run) in job.runs.iter().enumerate() {
@@ -994,7 +997,7 @@ fn dispatch_runs(
 /// extracted as a free
 /// function so the sort's contract is testable without
 /// standing up a real `Aligner` / ORT.
-fn sort_words_by_pts(words: &mut alloc::vec::Vec<crate::types::Word>) {
+fn sort_words_by_pts(words: &mut [Word]) {
   words.sort_by_key(|w| {
     let r = w.range();
     (r.start_pts(), r.end_pts())
@@ -1009,7 +1012,7 @@ fn sort_words_by_pts(words: &mut alloc::vec::Vec<crate::types::Word>) {
 /// emit those, but we tolerate them defensively rather than panic
 /// inside the alignment worker.
 ///
-/// **Coordinate contract.** [`crate::align::Run::audio_t0_ms`]
+/// **Coordinate contract.** [`Run::audio_t0_ms`]
 /// / [`audio_t1_ms`] MUST be **chunk-local** (origin at the
 /// start of the chunk's audio, not stream-absolute), in
 /// milliseconds, at the chunk's 16 kHz mono sample rate.
@@ -1029,7 +1032,7 @@ fn sort_words_by_pts(words: &mut alloc::vec::Vec<crate::types::Word>) {
 /// warning so operators see the contract violation instead
 /// of silent zero-word per-run alignment.
 fn run_audio_slice(
-  run: &crate::align::Run,
+  run: &Run,
   samples_len: usize,
   _chunk_first_sample_in_stream: u64,
 ) -> (usize, usize) {
@@ -1099,10 +1102,10 @@ fn clip_sub_segments(
   slice_lo: usize,
   slice_hi: usize,
   language: &Lang,
-) -> Result<alloc::vec::Vec<TimeRange>, WorkFailure> {
+) -> Result<Vec<TimeRange>, WorkFailure> {
   use core::num::NonZeroU32;
   let tb = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-  let mut out = alloc::vec::Vec::with_capacity(subs.len());
+  let mut out = Vec::with_capacity(subs.len());
   let lo_i = slice_lo as i64;
   let hi_i = slice_hi as i64;
   for sub in subs {
@@ -1110,7 +1113,7 @@ fn clip_sub_segments(
     if actual_tb.num() != 1 || actual_tb.den().get() != 16_000 {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "sub_segments must be in 1/16000 (chunk-local sample-index) timebase; got \
  {}/{}. Convert via `Transcriber::chunk_first_sample` + a 1/16000 timebase \
  before passing to the aligner.",
@@ -1135,7 +1138,7 @@ fn clip_sub_segments(
 #[allow(clippy::too_many_arguments)]
 fn run_one_per_run(
   aligner: &Mutex<Aligner>,
-  run: &crate::align::Run,
+  run: &Run,
   run_samples: &[f32],
   run_sub_segments: &[TimeRange],
   run_first_sample_in_stream: u64,
@@ -1147,7 +1150,7 @@ fn run_one_per_run(
   // ..., &run.language(), ...)`. The dispatcher in
   // `dispatch_runs` indexes this slice from
   // `job.oov_decisions[run_idx]`.
-  oov_decisions: &[crate::core::ResolvedOov],
+  oov_decisions: &[ResolvedOov],
 ) -> Result<AlignmentResult, WorkFailure> {
   let mut guard = match aligner.lock() {
     Ok(g) => g,
@@ -1214,7 +1217,7 @@ mod tests {
     for kind in recoverable {
       let f = WorkFailure::AlignmentFailed {
         kind,
-        message: alloc::string::String::new(),
+        message: SmolStr::new(""),
         language: crate::types::Lang::En,
       };
       assert!(
@@ -1238,8 +1241,8 @@ mod tests {
     for kind in fatal {
       let f = WorkFailure::AlignmentFailed {
         kind,
-        message: alloc::string::String::new(),
-        language: crate::types::Lang::En,
+        message: SmolStr::new(""),
+        language: Lang::En,
       };
       assert!(
         !alignment_failure_is_recoverable(&f),
@@ -1270,7 +1273,7 @@ mod tests {
     // ever shows up we surface it rather than swallow it.
     assert!(!alignment_failure_is_recoverable(&WorkFailure::AsrFailed {
       kind: AsrFailureKind::AllTemperaturesFailed,
-      message: alloc::string::String::new(),
+      message: SmolStr::new(""),
     }));
   }
 
@@ -1449,7 +1452,7 @@ mod tests {
   fn clip_sub_segments_offsets_into_run_local_space() {
     use core::num::NonZeroU32;
     let tb = mediatime::Timebase::new(1, NonZeroU32::new(16_000).unwrap());
-    let subs = alloc::vec![
+    let subs = vec![
       // Fully inside the run window.
       TimeRange::new(2_000, 3_000, tb),
       // Straddles the lower bound.
@@ -1487,14 +1490,14 @@ mod tests {
     };
     // Pre-sort: late, early, mid (interleaved as if from
     // different language runs). Post-sort: early, mid, late.
-    let mut words = alloc::vec![
+    let mut words = vec![
       mk(8000, 9000, "world"),
       mk(0, 1000, "hello"),
       mk(4000, 5000, "there"),
     ];
     sort_words_by_pts(&mut words);
-    let texts: alloc::vec::Vec<&str> = words.iter().map(|w| w.text()).collect();
-    assert_eq!(texts, alloc::vec!["hello", "there", "world"]);
+    let texts: Vec<&str> = words.iter().map(|w| w.text()).collect();
+    assert_eq!(texts, vec!["hello", "there", "world"]);
     // Strict monotone start PTS check.
     let mut prev = i64::MIN;
     for w in &words {
@@ -1518,7 +1521,7 @@ mod tests {
     let mk = |start: i64, end: i64, text: &str| {
       crate::types::Word::new(SmolStr::new(text), TimeRange::new(start, end, tb), 1.0)
     };
-    let mut words = alloc::vec![mk(0, 2000, "longer"), mk(0, 1000, "shorter"),];
+    let mut words = vec![mk(0, 2000, "longer"), mk(0, 1000, "shorter")];
     sort_words_by_pts(&mut words);
     assert_eq!(words[0].text(), "shorter");
     assert_eq!(words[1].text(), "longer");
@@ -1562,7 +1565,7 @@ mod tests {
     use crate::types::{AlignmentFailureKind, Lang};
     let f = WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::SemanticOutOfVocab,
-      message: alloc::string::String::from("pronounced symbol"),
+      message: SmolStr::new("pronounced symbol"),
       language: Lang::En,
     };
     assert!(
@@ -1578,7 +1581,7 @@ mod tests {
     use crate::types::{AlignmentFailureKind, Lang};
     let f = WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::TokenizationFailed,
-      message: alloc::string::String::new(),
+      message: SmolStr::new(""),
       language: Lang::En,
     };
     assert!(
@@ -1642,20 +1645,20 @@ mod tests {
         decision,
       )
     }
-    let oov_decisions: alloc::vec::Vec<alloc::vec::Vec<ResolvedOov>> = alloc::vec![
+    let oov_decisions: Vec<Vec<ResolvedOov>> = vec![
       // Run 0: caller chose `wildcard_all_decisions` — three Wildcards.
-      alloc::vec![
+      vec![
         synth(OovDecision::Wildcard, 0),
         synth(OovDecision::Wildcard, 1),
         synth(OovDecision::Wildcard, 2),
       ],
       // Run 1: caller chose `default_oov_decisions` — mixed.
-      alloc::vec![
+      vec![
         synth(OovDecision::Wildcard, 0),
         synth(OovDecision::FailClosed, 1),
       ],
       // Run 2: empty = no OOV expected.
-      alloc::vec::Vec::new(),
+      vec![],
     ];
     // Mirror `dispatch_runs`'s per-run extraction.
     for run_idx in 0..3 {
@@ -1695,7 +1698,7 @@ mod tests {
   #[test]
   fn validate_oov_decision_languages_whole_chunk_match_passes() {
     use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-    let resolved = alloc::vec![alloc::vec![ResolvedOov::new(
+    let resolved = vec![vec![ResolvedOov::new(
       OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
       OovDecision::Wildcard,
     )]];
@@ -1708,7 +1711,7 @@ mod tests {
     // Job language is Korean; supplied decision was made for
     // English — language-conditional policy would run against
     // the wrong key.
-    let resolved = alloc::vec![alloc::vec![ResolvedOov::new(
+    let resolved = vec![vec![ResolvedOov::new(
       OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
       OovDecision::Wildcard,
     )]];
@@ -1733,14 +1736,14 @@ mod tests {
       core::{OovDecision, OovEvent, OovKind, ResolvedOov},
     };
     use smol_str::SmolStr;
-    let runs = alloc::vec![
+    let runs = vec![
       Run::new(
         Lang::En,
         SmolStr::from("AT&T"),
         0,
         1_000,
         0,
-        BoundsSource::Segment
+        BoundsSource::Segment,
       ),
       Run::new(
         Lang::Ko,
@@ -1748,17 +1751,17 @@ mod tests {
         1_000,
         2_000,
         1,
-        BoundsSource::Segment
+        BoundsSource::Segment,
       ),
     ];
     // Run 1 (Korean) is wired with a stale English-stamped decision.
-    let resolved = alloc::vec![
-      alloc::vec![ResolvedOov::new(
+    let resolved = vec![
+      vec![ResolvedOov::new(
         OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
         OovDecision::Wildcard,
       )],
       // BUG: event language Lang::En but run language Lang::Ko.
-      alloc::vec![ResolvedOov::new(
+      vec![ResolvedOov::new(
         OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::En),
         OovDecision::Wildcard,
       )],
@@ -1784,7 +1787,7 @@ mod tests {
   /// presence/absence.
   #[test]
   fn validate_oov_decision_languages_empty_passes() {
-    let empty: alloc::vec::Vec<alloc::vec::Vec<crate::core::ResolvedOov>> = alloc::vec::Vec::new();
+    let empty: Vec<Vec<ResolvedOov>> = Vec::new();
     assert!(validate_oov_decision_languages(&[], &Lang::En, &empty).is_ok());
   }
 
@@ -1792,7 +1795,7 @@ mod tests {
   fn clip_sub_segments_rejects_non_16000_timebase() {
     use core::num::NonZeroU32;
     let tb_48k = mediatime::Timebase::new(1, NonZeroU32::new(48_000).unwrap());
-    let subs = alloc::vec![TimeRange::new(2_000, 3_000, tb_48k)];
+    let subs = vec![TimeRange::new(2_000, 3_000, tb_48k)];
     let result = clip_sub_segments(&subs, 1_600, 4_800, &Lang::En);
     match result {
       Err(WorkFailure::AlignmentFailed { kind, message, .. }) => {

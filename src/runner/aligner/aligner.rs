@@ -1,11 +1,11 @@
 //! `Aligner` — per-language wav2vec2 forced-alignment engine.
 
-use alloc::string::String;
 use core::time::Duration;
-use std::path::Path;
+use std::{borrow::Cow, path::Path, string::String};
 
 use mediatime::TimeRange;
 use ort::session::{RunOptions, Session};
+use smol_str::{SmolStr, format_smolstr};
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -104,18 +104,18 @@ impl Aligner {
   ) -> Result<Self, RunnerError> {
     let session = Session::builder()
       .map_err(|e| RunnerError::AlignerLoad {
-        message: alloc::format!("Session::builder failed: {e:?}"),
+        message: format_smolstr!("Session::builder failed: {e}"),
       })?
       .commit_from_file(model_path)
       .map_err(|e| RunnerError::AlignerLoad {
-        message: alloc::format!("commit_from_file({}) failed: {e:?}", model_path.display()),
+        message: format_smolstr!("commit_from_file({}) failed: {e}", model_path.display()),
       })?;
     let tokenizer = load_tokenizer_with_compat(tokenizer_path)?;
 
     let blank_token_id =
       detect_blank_token_id(&tokenizer).ok_or_else(|| RunnerError::AlignerLoad {
-        message: String::from(
-          "tokenizer has no <pad> / [PAD] entry; cannot determine CTC blank token",
+        message: format_smolstr!(
+          "tokenizer has no <pad> / [PAD] entry; cannot determine CTC blank token"
         ),
       })?;
     let unk_token_id = tokenizer
@@ -187,17 +187,18 @@ impl Aligner {
   pub fn detect_oov(
     &self,
     text: &str,
-  ) -> Result<alloc::vec::Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
+  ) -> Result<Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
     use crate::runner::aligner::algorithm::tokenize::detect_oov_events;
+
     let normalized = match self.normalizer.normalize(text) {
       Ok(n) => n,
       Err(crate::runner::aligner::normalizer::NormalizationError::EmptyText) => {
-        return Ok(alloc::vec::Vec::new());
+        return Ok(Vec::new());
       }
       Err(e) => {
         return Err(crate::types::WorkFailure::AlignmentFailed {
           kind: crate::types::AlignmentFailureKind::NormalizationFailed,
-          message: alloc::format!("normalize failed: {e:?}"),
+          message: format_smolstr!("normalize failed: {e}"),
           language: self.language.clone(),
         });
       }
@@ -360,7 +361,7 @@ impl Aligner {
     let abort_flag = core::sync::atomic::AtomicBool::new(false);
     let run_options = RunOptions::new().map_err(|e| WorkFailure::AlignmentFailed {
       kind: AlignmentFailureKind::ModelInferenceFailed,
-      message: alloc::format!("RunOptions::new failed: {e:?}"),
+      message: format_smolstr!("RunOptions::new failed: {e:?}"),
       language: self.language.clone(),
     })?;
     // Default OOV policy for the no-abort entrypoint:
@@ -592,7 +593,7 @@ impl Aligner {
     {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "non-finite sample at index {idx} (value {val:?}); upstream audio corruption — \
  refuse to encode, masking-as-silence would only hide the bug"
         ),
@@ -618,7 +619,7 @@ impl Aligner {
     let normalized = match self.normalizer.normalize(text) {
       Ok(nt) => nt,
       Err(crate::runner::aligner::normalizer::NormalizationError::EmptyText) => {
-        return Ok(AlignmentResult::new(alloc::vec::Vec::new()));
+        return Ok(AlignmentResult::new(Vec::new()));
       }
       Err(crate::runner::aligner::normalizer::NormalizationError::RuleFailed { detail }) => {
         return Err(WorkFailure::AlignmentFailed {
@@ -700,7 +701,7 @@ impl Aligner {
     // contract — `false` positions → exactly `0.0_f32` going
     // into the encoder — is preserved by zeroing non-speech
     // samples before handoff.
-    let normalized_samples: alloc::vec::Vec<f32> = samples
+    let normalized_samples: Vec<f32> = samples
       .iter()
       .zip(speech_mask.iter())
       .map(|(&s, &is_speech)| if is_speech { s } else { 0.0_f32 })
@@ -717,13 +718,13 @@ impl Aligner {
     // append zeros to the silence-mask-normalised buffer; the
     // padded samples are zero (silent) by construction, so the
     // existing speech-mask doesn't need updating to track them.
-    let padded_samples: alloc::borrow::Cow<'_, [f32]> = if normalized_samples.len() < 400 {
-      let mut buf = alloc::vec::Vec::with_capacity(400);
+    let padded_samples: Cow<'_, [f32]> = if normalized_samples.len() < 400 {
+      let mut buf = Vec::with_capacity(400);
       buf.extend_from_slice(&normalized_samples);
       buf.resize(400, 0.0_f32);
-      alloc::borrow::Cow::Owned(buf)
+      Cow::Owned(buf)
     } else {
-      alloc::borrow::Cow::Borrowed(&normalized_samples[..])
+      Cow::Borrowed(&normalized_samples[..])
     };
     // see
     // `classify_encode_abort` for the rationale — terminate-
@@ -759,7 +760,7 @@ impl Aligner {
         let n = SEG_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir_path = std::path::PathBuf::from(dir);
         let _ = std::fs::create_dir_all(&dir_path);
-        let em_path = dir_path.join(alloc::format!("wy_seg{n}.emission.bin"));
+        let em_path = dir_path.join(format_smolstr!("wy_seg{n}.emission.bin"));
         if let Ok(mut f) = std::fs::File::create(&em_path) {
           use std::io::Write;
           let _ = f.write_all(&(log_probs.t() as u32).to_le_bytes());
@@ -767,25 +768,24 @@ impl Aligner {
           // Write as f32 LE one cell at a time. The dump path is
           // diagnostic-only; the per-cell `to_le_bytes` is acceptable
           // overhead for the few-K-cells * once-per-segment frequency.
-          let mut buf: alloc::vec::Vec<u8> =
-            alloc::vec::Vec::with_capacity(log_probs.data().len() * 4);
+          let mut buf: Vec<u8> = Vec::with_capacity(log_probs.data().len() * 4);
           for v in log_probs.data() {
             buf.extend_from_slice(&v.to_le_bytes());
           }
           let _ = f.write_all(&buf);
         }
-        let tok_path = dir_path.join(alloc::format!("wy_seg{n}.tokens.json"));
+        let tok_path = dir_path.join(format_smolstr!("wy_seg{n}.tokens.json"));
         if let Ok(mut f) = std::fs::File::create(&tok_path) {
           use std::io::Write;
           // Hand-format JSON to avoid the serde_json prod dep.
-          let mut payload = alloc::format!("{{\"blank_id\":{},\"tokens\":[", self.blank_token_id);
+          let mut payload = format_smolstr!("{{\"blank_id\":{},\"tokens\":[", self.blank_token_id);
           for (i, t) in tokenized.token_ids().iter().enumerate() {
             if i > 0 {
               payload.push(',');
             }
-            payload.push_str(&alloc::format!("{}", t));
+            payload.push_str(&format_smolstr!("{}", t));
           }
-          payload.push_str(&alloc::format!(
+          payload.push_str(&format_smolstr!(
             "],\"n_samples\":{},\"T\":{},\"V\":{}}}",
             padded_samples.len(),
             log_probs.t(),
@@ -868,12 +868,12 @@ impl Aligner {
           &self.language,
         );
         if let Ok(trellis) = trellis {
-          let path = dir_path.join(alloc::format!("wy_seg{n}.trellis.bin"));
+          let path = dir_path.join(format_smolstr!("wy_seg{n}.trellis.bin"));
           if let Ok(mut f) = std::fs::File::create(&path) {
             use std::io::Write;
             let _ = f.write_all(&(log_probs.t() as u32).to_le_bytes());
             let _ = f.write_all(&(tokenized.token_ids().len() as u32).to_le_bytes());
-            let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(trellis.len() * 4);
+            let mut buf: Vec<u8> = Vec::with_capacity(trellis.len() * 4);
             for v in &trellis {
               buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -984,7 +984,7 @@ fn validate_direct_decision_languages(
     if resolved.event().language() != expected_lang {
       return Err(WorkFailure::AlignmentFailed {
         kind: crate::types::AlignmentFailureKind::TokenizationFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "align_chunk_with_abort: oov_decisions[{i}].event.language = {:?} \
  but this aligner's language is {:?}. Direct callers must pass \
  ResolvedOov produced for THIS aligner's language. Recompute via \
@@ -1057,15 +1057,15 @@ fn build_speech_mask(
   n_samples: usize,
   sub_segments: &[TimeRange],
   language: &Lang,
-) -> Result<alloc::vec::Vec<bool>, WorkFailure> {
+) -> Result<Vec<bool>, WorkFailure> {
   use crate::types::AlignmentFailureKind;
-  let mut mask = alloc::vec![false; n_samples];
+  let mut mask = vec![false; n_samples];
   let n_samples_i64 = n_samples as i64;
   for &seg in sub_segments {
     if seg.timebase().num() != 1 || seg.timebase().den().get() != SAMPLE_RATE_HZ {
       return Err(WorkFailure::AlignmentFailed {
         kind: AlignmentFailureKind::ModelInferenceFailed,
-        message: alloc::format!(
+        message: format_smolstr!(
           "Aligner::align expects sub_segments in chunk-local 1/{} timebase, \
  got {}/{}; caller passed sub_segments in the wrong timebase \
  (samples will not match audio if we proceed).",
@@ -1134,7 +1134,7 @@ fn validate_word_delimiter_present(
     return Ok(());
   }
   Err(RunnerError::AlignerLoad {
-    message: String::from(
+    message: SmolStr::from(
       "tokenizer is missing the `|` word-delimiter token, but the language's normaliser \
  declared `use_word_delimiter = true`. wav2vec2 word-segmented vocabularies require \
  a `|` token between spoken words. Either swap to a tokenizer that exposes `|`, or \
@@ -1198,12 +1198,12 @@ const fn coerce_speech_coverage(value: f32) -> f32 {
 /// only meaningful for the wav2vec2 shape.
 fn load_tokenizer_with_compat(path: &Path) -> Result<Tokenizer, RunnerError> {
   let bytes = std::fs::read(path).map_err(|e| RunnerError::AlignerLoad {
-    message: alloc::format!("read tokenizer {}: {e}", path.display()),
+    message: format_smolstr!("read tokenizer {}: {e}", path.display()),
   })?;
 
   let original_err = match Tokenizer::from_bytes(&bytes) {
     Ok(tok) => return Ok(tok),
-    Err(e) => alloc::format!("{e:?}"),
+    Err(e) => format_smolstr!("{e:?}"),
   };
 
   if let Some(patched) = inject_wordlevel_model_type(&bytes)
@@ -1213,7 +1213,7 @@ fn load_tokenizer_with_compat(path: &Path) -> Result<Tokenizer, RunnerError> {
   }
 
   Err(RunnerError::AlignerLoad {
-    message: alloc::format!(
+    message: format_smolstr!(
       "Tokenizer::from_file({}) failed: {original_err}",
       path.display()
     ),
@@ -1237,7 +1237,7 @@ fn load_tokenizer_with_compat(path: &Path) -> Result<Tokenizer, RunnerError> {
 /// `"type"` substrings could be misdetected and patched at the
 /// wrong byte range. The scanner below tracks `in_string` /
 /// `escape` state so quoted content is invisible to key matching.
-fn inject_wordlevel_model_type(bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+fn inject_wordlevel_model_type(bytes: &[u8]) -> Option<Vec<u8>> {
   // Validate UTF-8 once; thereafter operate on raw bytes.
   let _ = core::str::from_utf8(bytes).ok()?;
 
@@ -1255,7 +1255,7 @@ fn inject_wordlevel_model_type(bytes: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 
   // Inject the discriminator fields right after `{`.
   let injection = b"\n \"type\": \"WordLevel\",\n \"unk_token\": \"<unk>\",";
-  let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(bytes.len() + injection.len());
+  let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + injection.len());
   out.extend_from_slice(&bytes[..=model_open]);
   out.extend_from_slice(injection);
   out.extend_from_slice(&bytes[model_open + 1..]);
@@ -1466,7 +1466,7 @@ mod tests {
   fn validate_direct_decision_languages_rejects_cross_language_payload() {
     use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
     // Payload was made for Korean.
-    let stale = alloc::vec![ResolvedOov::new(
+    let stale = vec![ResolvedOov::new(
       OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::Ko),
       OovDecision::Wildcard,
     )];
@@ -1490,7 +1490,7 @@ mod tests {
   #[test]
   fn validate_direct_decision_languages_accepts_matching_payload() {
     use crate::core::{OovDecision, OovEvent, OovKind, ResolvedOov};
-    let ok = alloc::vec![ResolvedOov::new(
+    let ok = vec![ResolvedOov::new(
       OovEvent::new(OovKind::Symbol('&'), 2, 0, Lang::En),
       OovDecision::Wildcard,
     )];
@@ -2073,14 +2073,14 @@ mod tests {
       Lang::En,
       Path::new(model_path),
       Path::new(tokenizer_path),
-      alloc::boxed::Box::new(EnglishNormalizer::new()),
+      Box::new(EnglishNormalizer::new()),
     )
     .expect("Aligner::from_paths");
 
     // 16 kHz silence buffer — never read because `EmptyText`
     // short-circuits before encode runs.
-    let samples = alloc::vec![0.0_f32; 16_000];
-    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let samples = vec![0.0_f32; 16_000];
+    let sub_segments: Vec<TimeRange> = Vec::new();
     let abort = AtomicBool::new(false);
     let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
 
@@ -2142,13 +2142,13 @@ mod tests {
       Lang::En,
       Path::new(model_path),
       Path::new(tokenizer_path),
-      alloc::boxed::Box::new(EnglishNormalizer::new()),
+      Box::new(EnglishNormalizer::new()),
     )
     .expect("Aligner::from_paths");
 
     // 200 samples at 16 kHz = 12.5 ms. wav2vec2 needs ≥400.
-    let samples = alloc::vec![0.0_f32; 200];
-    let sub_segments: alloc::vec::Vec<TimeRange> = alloc::vec::Vec::new();
+    let samples = vec![0.0_f32; 200];
+    let sub_segments: Vec<TimeRange> = Vec::new();
     let abort = AtomicBool::new(false);
     let run_options = ort::session::RunOptions::new().expect("RunOptions::new");
 

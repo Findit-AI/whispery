@@ -24,14 +24,15 @@
 //! caller's runtime causes the in-flight inference to unwind
 //! at the next callback. No whispery-side threads are spawned.
 
-use alloc::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use crate::{
   core::{AsrParams, AsrResult},
   types::{ChunkId, WorkFailure},
 };
 
+#[cfg(feature = "runner")]
+use smol_str::format_smolstr;
 #[cfg(feature = "runner")]
 use whispercpp::{Context as WhisperContext, State as WhisperState};
 
@@ -147,7 +148,7 @@ impl WhisperAsrSource {
     let state = ctx
       .create_state()
       .map_err(|e| crate::runner::RunnerError::WhisperContextLoad {
-        message: alloc::format!("create_state failed: {e:?}"),
+        message: format_smolstr!("create_state failed: {e:?}"),
       })?;
     Ok(Self { ctx, state })
   }
@@ -190,7 +191,7 @@ impl AsrSource for WhisperAsrSource {
     {
       return Err(WorkFailure::AsrFailed {
         kind: crate::types::AsrFailureKind::BackendError,
-        message: alloc::format!(
+        message: format_smolstr!(
           "non-finite ASR sample at index {idx} (value {val:?}); upstream audio corruption — \
            refuse to encode rather than poison whisper.cpp's float math"
         ),

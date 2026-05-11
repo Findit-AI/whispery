@@ -2,6 +2,8 @@
 
 use core::time::Duration;
 
+use smol_str::SmolStr;
+
 use crate::types::TranscriberError;
 
 /// Runner-level structural failure.
@@ -19,7 +21,7 @@ pub enum RunnerError {
   #[error("failed to load whisper context: {message}")]
   WhisperContextLoad {
     /// Verbatim error from whisper-rs.
-    message: alloc::string::String,
+    message: SmolStr,
   },
 
   /// `Aligner::from_paths` failed at builder time. The wav2vec2
@@ -38,7 +40,7 @@ pub enum RunnerError {
   #[error("failed to load aligner: {message}")]
   AlignerLoad {
     /// Verbatim error from `ort` or `tokenizers`.
-    message: alloc::string::String,
+    message: SmolStr,
   },
 
   /// A worker channel is disconnected — typically because a worker

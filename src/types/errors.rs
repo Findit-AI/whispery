@@ -11,6 +11,8 @@
 
 use core::time::Duration;
 
+use smol_str::SmolStr;
+
 use crate::types::{ChunkId, Lang};
 
 /// Push or inject failure on the state machine.
@@ -114,7 +116,7 @@ pub enum WorkFailure {
     /// Failure category.
     kind: AsrFailureKind,
     /// Human-readable detail (typically the backend's error text).
-    message: alloc::string::String,
+    message: SmolStr,
   },
 
   /// Word-level forced alignment failed.
@@ -123,7 +125,7 @@ pub enum WorkFailure {
     /// Failure category.
     kind: AlignmentFailureKind,
     /// Human-readable detail.
-    message: alloc::string::String,
+    message: SmolStr,
     /// Language whose aligner failed.
     language: Lang,
   },
@@ -213,7 +215,7 @@ pub enum WorkerKind {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use alloc::string::ToString;
+  use std::string::ToString;
 
   #[test]
   fn pts_regression_displays_kind() {

@@ -1,7 +1,7 @@
 //! `Transcript` and `Word` — the per-chunk emission unit and its
 //! word-level alignment entries.
 
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 use mediatime::TimeRange;
 use smol_str::SmolStr;
@@ -206,6 +206,7 @@ pub(crate) mod for_test {
 
   use super::*;
   use core::num::NonZeroU32;
+  use std::vec;
 
   pub(crate) fn ms_timebase() -> mediatime::Timebase {
     mediatime::Timebase::new(1, NonZeroU32::new(1000).unwrap())
@@ -222,7 +223,7 @@ pub(crate) mod for_test {
       -0.5,
       0.05,
       0.0,
-      alloc::vec![range],
+      vec![range],
       ChunkId::from_raw(chunk_id),
     )
   }
@@ -239,13 +240,14 @@ pub(crate) mod for_test {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::vec;
 
   #[test]
   fn transcript_round_trip() {
     let t = for_test::transcript(
       7,
       "hello world",
-      alloc::vec![
+      vec![
         for_test::word("hello", 0, 500, 0.95),
         for_test::word("world", 500, 1000, 0.92),
       ],

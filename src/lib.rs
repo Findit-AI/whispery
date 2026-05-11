@@ -1,10 +1,4 @@
-//! whispery — Sans-I/O cut/batch/whisper/align state machine for
-//! speech-to-text indexing pipelines.
-//!
-//! See `docs/superpowers/specs/2026-04-28-whispery-cut-batch-whisper-design.md`
-//! for the full design.
-
-#![cfg_attr(not(feature = "std"), no_std)]
+#![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
@@ -19,8 +13,6 @@
 // in `runner::aligner::algorithm::normalize::neon`.
 #![deny(unsafe_code)]
 
-extern crate alloc;
-
 pub mod align;
 pub mod core;
 pub mod time;
@@ -29,6 +21,7 @@ pub mod types;
 pub use align::{BoundsSource, Run, SegmentLike, dispatch_segments};
 
 #[cfg(feature = "runner")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runner")))]
 pub use align::dispatch;
 
 // Re-exports of mediatime types that appear in whispery's public API
@@ -53,9 +46,11 @@ pub use core::{
 };
 
 #[cfg(feature = "runner")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runner")))]
 pub mod runner;
 
 #[cfg(feature = "runner")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runner")))]
 pub use runner::{AsrChunkContext, AsrSource, RunnerError, WhisperAsrSource};
 
 // Re-export whisper-cpp types that appear on the runner's public
@@ -69,9 +64,11 @@ pub use runner::{AsrChunkContext, AsrSource, RunnerError, WhisperAsrSource};
 // semver, but whisper-cpp is a path dep we own so the
 // constraint is internal.
 #[cfg(feature = "runner")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runner")))]
 pub use whispercpp::{Context as WhisperContext, ContextParams as WhisperContextParameters};
 
 #[cfg(feature = "alignment")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alignment")))]
 pub use runner::{
   AlignWorkItem, Aligner, AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet,
   AlignmentSetBuilder, ChineseNormalizer, DEFAULT_MAX_INTRA_SILENT_RUN,
@@ -86,6 +83,7 @@ pub use runner::{
 // semver. Cargo.toml pins ort to =2.0.0-rc.12; bumping it requires
 // a matching whispery-major bump.
 #[cfg(feature = "alignment")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alignment")))]
 pub use ort;
 
 /// **Internal use only — gated on `feature = "bench-internals"`.**

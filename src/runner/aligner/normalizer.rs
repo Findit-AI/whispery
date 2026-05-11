@@ -1,6 +1,8 @@
 //! Text-normaliser trait + canonical error type.
 
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use std::{borrow::Cow, string::String, vec::Vec};
+
+use smol_str::SmolStr;
 
 /// Why text normalisation failed. Used as
 /// `WorkFailure::AlignmentFailed.message` source; the kind is
@@ -17,7 +19,7 @@ pub enum NormalizationError {
   #[error("normaliser rule failed: {detail}")]
   RuleFailed {
     /// Verbatim error from the language-specific normaliser.
-    detail: String,
+    detail: SmolStr,
   },
 }
 
@@ -200,7 +202,7 @@ pub trait TextNormalizer: Send {
 
 /// Boxed `dyn TextNormalizer` for the [`crate::Aligner`]'s
 /// per-language normaliser slot.
-pub type DynTextNormalizer = alloc::boxed::Box<dyn TextNormalizer>;
+pub type DynTextNormalizer = std::boxed::Box<dyn TextNormalizer>;
 
 #[cfg(test)]
 mod tests {
@@ -210,7 +212,7 @@ mod tests {
   fn normalized_text_round_trip() {
     let nt = NormalizedText::new(
       String::from("hello world"),
-      alloc::vec![Cow::Borrowed("Hello"), Cow::Borrowed("world.")],
+      vec![Cow::Borrowed("Hello"), Cow::Borrowed("world.")],
     );
     assert_eq!(nt.normalized(), "hello world");
     assert_eq!(nt.original_words().len(), 2);
@@ -219,7 +221,6 @@ mod tests {
 
   #[test]
   fn normalization_error_displays_kinds() {
-    use alloc::string::ToString;
     assert!(NormalizationError::EmptyText.to_string().contains("empty"));
     assert!(
       NormalizationError::RuleFailed {

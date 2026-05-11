@@ -1,6 +1,8 @@
 //! `VadSegment` — silero-shaped speech segment in 16 kHz analysis
 //! indices.
 
+use std::format;
+
 /// Speech segment as 16 kHz analysis-frame indices. Whispery accepts
 /// silero-shaped input via this type and converts to output-timebase
 /// `TimeRange`s internally; the caller never does PTS arithmetic for
@@ -56,43 +58,44 @@ impl VadSegment {
 }
 
 #[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for VadSegment {
-  /// Custom impl: a derived `Deserialize` would skip
-  /// [`VadSegment::new`]'s `end_sample > start_sample` invariant
-  /// check, letting malformed input wrap `sample_count()` to a
-  /// huge value and panic deep inside the cut state machine.
-  /// Flagged this; here we re-validate at the
-  /// serde boundary and surface the violation as a typed
-  /// deserialization error instead.
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: serde::Deserializer<'de>,
-  {
-    use serde::de::Error as _;
+const _: () = {
+  impl<'de> serde::Deserialize<'de> for VadSegment {
+    /// Custom impl: a derived `Deserialize` would skip
+    /// [`VadSegment::new`]'s `end_sample > start_sample` invariant
+    /// check, letting malformed input wrap `sample_count()` to a
+    /// huge value and panic deep inside the cut state machine.
+    /// Flagged this; here we re-validate at the
+    /// serde boundary and surface the violation as a typed
+    /// deserialization error instead.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+      D: serde::Deserializer<'de>,
+    {
+      use serde::de::Error as _;
 
-    // Mirror the derived shape: a struct with two `u64` fields.
-    // We use a private inner type with `derive(Deserialize)` to
-    // get serde's standard field-naming and missing-field error
-    // text for free, then validate after reading.
-    #[derive(serde::Deserialize)]
-    struct Raw {
-      start_sample: u64,
-      end_sample: u64,
+      // Mirror the derived shape: a struct with two `u64` fields.
+      // We use a private inner type with `derive(Deserialize)` to
+      // get serde's standard field-naming and missing-field error
+      // text for free, then validate after reading.
+      #[derive(serde::Deserialize)]
+      struct Raw {
+        start_sample: u64,
+        end_sample: u64,
+      }
+      let r = Raw::deserialize(deserializer)?;
+      if r.end_sample <= r.start_sample {
+        return Err(D::Error::custom(format!(
+          "VadSegment requires end_sample > start_sample (got start_sample={}, end_sample={})",
+          r.start_sample, r.end_sample
+        )));
+      }
+      Ok(Self {
+        start_sample: r.start_sample,
+        end_sample: r.end_sample,
+      })
     }
-    let r = Raw::deserialize(deserializer)?;
-    if r.end_sample <= r.start_sample {
-      return Err(D::Error::custom(alloc::format!(
-        "VadSegment requires end_sample > start_sample (got start_sample={}, end_sample={})",
-        r.start_sample,
-        r.end_sample
-      )));
-    }
-    Ok(Self {
-      start_sample: r.start_sample,
-      end_sample: r.end_sample,
-    })
   }
-}
+};
 
 #[cfg(test)]
 mod tests {

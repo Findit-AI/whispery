@@ -108,10 +108,10 @@ impl AlignmentSet {
     &self,
     text: &str,
     language: &Lang,
-  ) -> Result<alloc::vec::Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
+  ) -> Result<Vec<crate::core::OovEvent>, crate::types::WorkFailure> {
     let aligner_mu = match self.lookup(language) {
       AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => aligner,
-      AlignmentLookup::Miss { .. } => return Ok(alloc::vec::Vec::new()),
+      AlignmentLookup::Miss { .. } => return Ok(Vec::new()),
     };
     let guard = aligner_mu.lock().unwrap_or_else(|p| p.into_inner());
     let mut events = guard.detect_oov(text)?;
@@ -155,9 +155,8 @@ impl AlignmentSet {
   pub fn detect_oov_per_run(
     &self,
     runs: &[crate::align::Run],
-  ) -> Result<alloc::vec::Vec<alloc::vec::Vec<crate::core::OovEvent>>, crate::types::WorkFailure>
-  {
-    let mut out = alloc::vec::Vec::with_capacity(runs.len());
+  ) -> Result<Vec<Vec<crate::core::OovEvent>>, crate::types::WorkFailure> {
+    let mut out = Vec::with_capacity(runs.len());
     for run in runs {
       out.push(self.detect_oov(run.text(), run.language())?);
     }

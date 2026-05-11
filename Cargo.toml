@@ -10,11 +10,56 @@ readme      = "README.md"
 keywords    = ["whisper", "asr", "speech-to-text", "indexing", "alignment"]
 categories  = ["multimedia::audio", "science"]
 
+[features]
+default  = ["runner"]
+serde    = ["runner", "dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde", "whispercpp?/serde"]
+runner   = ["dep:whispercpp", "dep:miniz_oxide"]
+alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
+# Apple-only GPU acceleration for whisper.cpp. `metal` runs the
+# encoder on the unified-memory Metal backend (works on every
+# Apple Silicon Mac); `coreml` additionally dispatches the encoder
+# to ANE if the caller has produced a CoreML companion `.mlmodelc`.
+# Both default OFF — the crate compiles BLAS-only on every
+# platform without these features. Enable both on Apple Silicon
+# for production.
+metal  = ["runner", "whispercpp/metal"]
+coreml = ["runner", "whispercpp/coreml"]
+# Re-exports `pub(crate)` alignment internals (scalar/NEON normaliser
+# variants, raw `ctc_viterbi`, `LogProbsTV`) under `whispery::__bench`
+# so the SIMD baseline bench can call them directly. Doc-hidden;
+# never enable in shipping builds. Requires `alignment` for the
+# wav2vec2-pipeline symbols it exposes.
+bench-internals = ["alignment"]
+# Relaxes `tokenize_with_word_map`'s default fail-closed-on-pronounced-
+# symbol policy so non-alphanumeric OOV chars also become wildcards
+# (matching WhisperX's `*`-placeholder behaviour 1:1). Default policy
+# drops the chunk on `&` / `,` / etc. that aren't on the skippable-
+# internal-punct whitelist; under this feature they all wildcard.
+# Trade-off: full WhisperX parity at the cost of whispery's stricter
+# guard against silently aligning pronounced symbols (`&` in `AT&T`)
+# to whichever vocab item happens to win the frame. Off by default;
+# opt in only if downstream consumers expect WhisperX-1:1 behaviour.
+# `whisperx-strict-tokenizer` feature removed in the Sans-I/O OOV
+# refactor. The runtime equivalent is now
+# `wildcard_all_decisions(&oov_events)` from `core::oov` —
+# pass the resulting `Vec<OovDecision>` to
+# `AlignWorkItem::from_run_alignment` (or
+# `Aligner::align_chunk_with_abort`). Per-deployment policy is
+# data, not a compile-time flag.
+# Diagnostic-only: write `wy_seg<N>.{emission,trellis}.bin` and a
+# `wy_seg<N>.tokens.json` companion to the directory pointed to by
+# `WHISPERY_PARITY_DUMP_TRELLIS` whenever set on a process running
+# `Aligner::align_chunk`. The dump uses hand-formatted JSON for the
+# tokens companion (no serde_json runtime dep) and `std::fs::File`
+# directly. Do NOT enable in shipping builds — the env hook + dump
+# bytes never check failures.
+parity-dump-emission = ["alignment"]
+
 [dependencies]
-mediatime = { version = "0.1.5", default-features = false }
-smol_str  = { version = "0.3", default-features = false }
-thiserror = { version = "2", default-features = false }
-smallvec  = { version = "1", default-features = false }
+mediatime = "0.1"
+smol_str  = "0.3"
+thiserror = "2"
+smallvec  = "1"
 # unicode-script: per-character Unicode `Script` property lookup,
 # used by the script-dispatch pass to split mixed-script Whisper
 # segments into language-tagged runs. Pure-Rust, no_std-compatible
@@ -43,13 +88,12 @@ whispercpp = { version = "0.2", optional = true, default-features = false }
 
 # miniz_oxide: pure-Rust DEFLATE used by the runner's
 # compression-ratio gate to match WhisperX/OpenAI Whisper's
-# `zlib.compress(text)` byte length 1:1. Codex round-37 round-31
-# [high]: the prior shingle proxy mis-rejected legitimately
+# `zlib.compress(text)` byte length 1:1. The prior shingle proxy mis-rejected legitimately
 # repetitive transcripts ("thank you thank you thank you thank
 # you" scored 3.9 vs zlib's 1.86 — well above the default 2.4
 # gate, dropping otherwise valid ASR text). Pure-Rust crate, no
 # C dep, ~30 KB.
-miniz_oxide = { version = "0.8", optional = true, default-features = false, features = ["with-alloc"] }
+miniz_oxide = { version = "0.9", optional = true, default-features = false, features = ["with-alloc"] }
 
 # Alignment feature deps. All optional — Plan A/B compile without them.
 # ort: ONNX runtime bindings. Pinned to =2.0.0-rc.12 because rc.13+
@@ -96,6 +140,9 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # starts up with already-parsed `&[(&str, u32)]` slices.
 serde_json = "1"
 
+[lints]
+workspace = true
+
 # Lint policy. Real correctness lints stay enforced. The allowed
 # entries below are decisions, not aspirations:
 #
@@ -112,7 +159,7 @@ serde_json = "1"
 #   the new check-cfg lint.
 # * `lints.clippy.*` — style lints we explicitly chose not to
 #   chase across the alignment / SIMD / Sans-I/O code base.
-[lints.rust]
+[workspace.lints.rust]
 dead_code = "allow"
 # `unused_mut` — three test-mod variables are bound `mut` for
 # parallelism with adjacent test cases that DO mutate them; the
@@ -129,63 +176,17 @@ unused_mut = "allow"
 unused_unsafe = "allow"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 
-[lints.clippy]
-collapsible_if = "allow"
-empty_line_after_doc_comments = "allow"
-manual_contains = "allow"
-manual_inspect = "allow"
-manual_is_multiple_of = "allow"
-module_inception = "allow"
-needless_range_loop = "allow"
-ptr_arg = "allow"
-same_item_push = "allow"
-too_many_arguments = "allow"
-
-[features]
-default  = ["std", "runner"]
-std      = ["mediatime/std", "smol_str/std", "serde?/std"]
-serde    = ["runner", "dep:serde", "dep:humantime-serde", "smol_str/serde", "mediatime/serde", "whispercpp?/serde"]
-runner   = ["dep:whispercpp", "dep:miniz_oxide", "std"]
-alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
-# Apple-only GPU acceleration for whisper.cpp. `metal` runs the
-# encoder on the unified-memory Metal backend (works on every
-# Apple Silicon Mac); `coreml` additionally dispatches the encoder
-# to ANE if the caller has produced a CoreML companion `.mlmodelc`.
-# Both default OFF — the crate compiles BLAS-only on every
-# platform without these features. Enable both on Apple Silicon
-# for production.
-metal  = ["runner", "whispercpp/metal"]
-coreml = ["runner", "whispercpp/coreml"]
-# Re-exports `pub(crate)` alignment internals (scalar/NEON normaliser
-# variants, raw `ctc_viterbi`, `LogProbsTV`) under `whispery::__bench`
-# so the SIMD baseline bench can call them directly. Doc-hidden;
-# never enable in shipping builds. Requires `alignment` for the
-# wav2vec2-pipeline symbols it exposes.
-bench-internals = ["alignment"]
-# Relaxes `tokenize_with_word_map`'s default fail-closed-on-pronounced-
-# symbol policy so non-alphanumeric OOV chars also become wildcards
-# (matching WhisperX's `*`-placeholder behaviour 1:1). Default policy
-# drops the chunk on `&` / `,` / etc. that aren't on the skippable-
-# internal-punct whitelist; under this feature they all wildcard.
-# Trade-off: full WhisperX parity at the cost of whispery's stricter
-# guard against silently aligning pronounced symbols (`&` in `AT&T`)
-# to whichever vocab item happens to win the frame. Off by default;
-# opt in only if downstream consumers expect WhisperX-1:1 behaviour.
-# `whisperx-strict-tokenizer` feature removed in the Sans-I/O OOV
-# refactor. The runtime equivalent is now
-# `wildcard_all_decisions(&oov_events)` from `core::oov` —
-# pass the resulting `Vec<OovDecision>` to
-# `AlignWorkItem::from_run_alignment` (or
-# `Aligner::align_chunk_with_abort`). Per-deployment policy is
-# data, not a compile-time flag.
-# Diagnostic-only: write `wy_seg<N>.{emission,trellis}.bin` and a
-# `wy_seg<N>.tokens.json` companion to the directory pointed to by
-# `WHISPERY_PARITY_DUMP_TRELLIS` whenever set on a process running
-# `Aligner::align_chunk`. The dump uses hand-formatted JSON for the
-# tokens companion (no serde_json runtime dep) and `std::fs::File`
-# directly. Do NOT enable in shipping builds — the env hook + dump
-# bytes never check failures.
-parity-dump-emission = ["alignment"]
+# [workspace.lints.clippy]
+# collapsible_if = "allow"
+# empty_line_after_doc_comments = "allow"
+# manual_contains = "allow"
+# manual_inspect = "allow"
+# manual_is_multiple_of = "allow"
+# module_inception = "allow"
+# needless_range_loop = "allow"
+# ptr_arg = "allow"
+# same_item_push = "allow"
+# too_many_arguments = "allow"
 
 [lib]
 name = "whispery"
