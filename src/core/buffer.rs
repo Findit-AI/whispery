@@ -120,7 +120,10 @@ impl SampleBuffer {
     let delta_pts_out = starts_at.pts() - expected_pts_out;
 
     let delta_samples: u64 = if delta_pts_out < 0 {
-      return Err(TranscriberError::PtsRegression(_));
+      return Err(TranscriberError::PtsRegression(PtsRegression::new(
+        PushKind::Samples,
+        delta_pts_out,
+      )));
     } else if delta_pts_out == 0 {
       0
     } else {
@@ -128,7 +131,9 @@ impl SampleBuffer {
       // zero-fill width / tolerance check.
       let g = Timebase::rescale_pts(delta_pts_out, effective_tb, ANALYSIS_TIMEBASE);
       if (g as u64) > self.gap_tolerance_samples {
-        return Err(TranscriberError::GapExceedsTolerance(_));
+        return Err(TranscriberError::GapExceedsTolerance(
+          GapExceedsTolerance::new(g as u64, self.gap_tolerance_samples),
+        ));
       }
       g as u64
     };
@@ -159,7 +164,10 @@ impl SampleBuffer {
     let delta_usize = match usize::try_from(delta_samples) {
       Ok(v) => v,
       Err(_) => {
-        return Err(TranscriberError::Backpressure(_));
+        return Err(TranscriberError::Backpressure(Backpressure::new(
+          usize::MAX,
+          self.cap,
+        )));
       }
     };
     let total_with_queued = self
@@ -171,11 +179,17 @@ impl SampleBuffer {
     let total_with_queued = match total_with_queued {
       Some(v) => v,
       None => {
-        return Err(TranscriberError::Backpressure(_));
+        return Err(TranscriberError::Backpressure(Backpressure::new(
+          usize::MAX,
+          self.cap,
+        )));
       }
     };
     if total_with_queued > self.cap {
-      return Err(TranscriberError::Backpressure(_));
+      return Err(TranscriberError::Backpressure(Backpressure::new(
+        total_with_queued,
+        self.cap,
+      )));
     }
 
     // Empty-packet must never mutate stream state. Three cases

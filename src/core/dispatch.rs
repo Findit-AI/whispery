@@ -12,7 +12,7 @@ use crate::{
     event::Event,
     transcriber::LanguagePolicy,
   },
-  types::{ChunkId, Lang, TranscriberError, Transcript, WorkFailure},
+  types::{AsrError, AsrFailure, ChunkId, Lang, TranscriberError, Transcript, WorkFailure},
 };
 
 /// Pick the most-frequent language in `observations`, with
