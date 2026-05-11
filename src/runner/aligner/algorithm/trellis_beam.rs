@@ -1741,9 +1741,9 @@ mod tests {
     };
     let message = payload.message();
     assert!(
-      payload.message().contains("trellis exceeds"),
+      message.contains("trellis exceeds"),
       "message must call out the budget; got {message}",
-      message = payload.message()
+      message = message
     );
   }
 }

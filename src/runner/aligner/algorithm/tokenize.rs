@@ -983,12 +983,12 @@ mod tests {
     let result =
       tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(payload))) => {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
         // Correct: stale-payload mismatch surfaces as
         // TokenizationFailed (loud), not SemanticOutOfVocab
         // (silent recoverable empty-words drop).
       }
-      Err(WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(payload))) => panic!(
+      Err(WorkFailure::Alignment(AlignmentError::SemanticOutOfVocab(_))) => panic!(
         "stale too-long decisions starting with FailClosed must surface as \
  TokenizationFailed (the loud diagnostic); SemanticOutOfVocab is the \
  silent recoverable path that masks the bug"
@@ -1139,9 +1139,7 @@ mod tests {
     let result = detect_oov_events(&tok, "hello world", 1, true, unk, &Lang::En, &[]);
     assert!(matches!(
       result,
-      Err(WorkFailure::Alignment(AlignmentError::Tokenization(
-        payload
-      )))
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_)))
     ));
   }
 

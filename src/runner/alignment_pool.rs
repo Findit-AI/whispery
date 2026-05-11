@@ -1790,9 +1790,9 @@ mod tests {
       Err(WorkFailure::Alignment(AlignmentError::ModelInference(payload))) => {
         let message = payload.message();
         assert!(
-          payload.message().contains("1/16000") && payload.message().contains("48000"),
+          message.contains("1/16000") && message.contains("48000"),
           "expected diagnostic citing both timebases; got {message}",
-          message = payload.message(),
+          message = message,
         );
       }
       other => panic!("expected ModelInferenceFailed, got {other:?}"),

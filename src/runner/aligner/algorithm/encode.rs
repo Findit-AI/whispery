@@ -700,9 +700,9 @@ mod tests {
     };
     let message = payload.message();
     assert!(
-      payload.message().contains("log-softmax output non-finite"),
+      message.contains("log-softmax output non-finite"),
       "diagnostic must call out the per-element finite check; got {message}",
-      message = payload.message()
+      message = message
     );
   }
 
@@ -764,7 +764,7 @@ mod tests {
       panic!("expected AlignmentFailed");
     };
     let message = payload.message();
-    assert!(payload.message().contains("negative time dim"));
+    assert!(message.contains("negative time dim"));
   }
 
   #[test]
@@ -791,9 +791,9 @@ mod tests {
     };
     let message = payload.message();
     assert!(
-      payload.message().contains("zero encoder frames"),
+      message.contains("zero encoder frames"),
       "diagnostic must explain the short-chunk cause; got {message}",
-      message = payload.message()
+      message = message
     );
   }
 
@@ -809,9 +809,9 @@ mod tests {
     };
     let message = payload.message();
     assert!(
-      payload.message().contains("shape/data mismatch") || payload.message().contains("buffer has"),
+      message.contains("shape/data mismatch") || message.contains("buffer has"),
       "diagnostic must call out the shape/data inconsistency; got {message}",
-      message = payload.message()
+      message = message
     );
   }
 
@@ -845,9 +845,9 @@ mod tests {
     };
     let message = payload.message();
     assert!(
-      payload.message().contains("smaller stride"),
+      message.contains("smaller stride"),
       "diagnostic must call out the smaller-stride case; got {message}",
-      message = payload.message()
+      message = message
     );
   }
 
@@ -869,9 +869,9 @@ mod tests {
     };
     let message = payload.message();
     assert!(
-      payload.message().contains("larger stride"),
+      message.contains("larger stride"),
       "diagnostic must call out the larger-stride case; got {message}",
-      message = payload.message()
+      message = message
     );
   }
 
@@ -908,9 +908,9 @@ mod tests {
     };
     let message = payload.message();
     assert!(
-      payload.message().contains("doesn't match tokenizer vocab"),
+      message.contains("doesn't match tokenizer vocab"),
       "diagnostic must call out the vocab mismatch; got {message}",
-      message = payload.message()
+      message = message
     );
   }
 
@@ -920,9 +920,10 @@ mod tests {
   fn validate_vocab_dim_rejects_undersized_model_output() {
     use crate::types::Lang;
     let err = validate_vocab_dim(16, 32, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
-      panic!("expected AlignmentFailed");
-    };
+    assert!(matches!(
+      err,
+      WorkFailure::Alignment(AlignmentError::ModelInference(_))
+    ));
   }
 
   // -------- end stride / vocab-dim guards --------
@@ -937,9 +938,9 @@ mod tests {
     };
     let message = payload.to_string();
     assert!(
-      payload.to_string().contains("doesn't match"),
+      message.contains("doesn't match"),
       "must call out length mismatch; got {message}",
-      message = payload.to_string()
+      message = message
     );
   }
 
@@ -963,9 +964,9 @@ mod tests {
     };
     let message = payload.to_string();
     assert!(
-      payload.to_string().contains("overflow") || payload.to_string().contains("doesn't fit"),
+      message.contains("overflow") || message.contains("doesn't fit"),
       "must call out overflow; got {message}",
-      message = payload.to_string()
+      message = message
     );
   }
 
@@ -991,9 +992,9 @@ mod tests {
     };
     let message = payload.to_string();
     assert!(
-      payload.to_string().contains("frame 2"),
+      message.contains("frame 2"),
       "must locate the bad frame; got {message}",
-      message = payload.to_string()
+      message = message
     );
   }
 

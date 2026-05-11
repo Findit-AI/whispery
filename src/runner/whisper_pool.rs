@@ -1011,7 +1011,7 @@ mod tests {
     let flag = Arc::new(AtomicBool::new(false));
     let res = full_params_from(&p, 0.0, flag);
     match res {
-      Err(WorkFailure::Asr(AsrError::Backend(payload))) => {}
+      Err(WorkFailure::Asr(AsrError::Backend(_))) => {}
       other => panic!("expected AsrFailed/BackendError; got {other:?}"),
     }
   }

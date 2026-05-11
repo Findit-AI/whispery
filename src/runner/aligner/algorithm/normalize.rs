@@ -42,15 +42,12 @@
 //! supports `wasm32`. The kernel would compile but never run from
 //! a real consumer.
 //!
-//! **Dispatch.** `feature = "std"` enables runtime CPU-feature
-//! detection via `is_x86_feature_detected!` (cached in a static
-//! atomic, so per-call cost is one relaxed load + branch). Without
-//! `std` we fall back to compile-time `cfg!(target_feature)`
-//! (matching the same-named features the user enabled at build
-//! time). Every backend computes identical results to the scalar
-//! reference within f32 tolerance — per-target tests in `tests`
-//! enforce a ≤ 1e-4 abs-error contract on a 480 k-sample synthetic
-//! input.
+//! **Dispatch.** Runtime CPU-feature detection via
+//! `is_x86_feature_detected!` (cached in a static atomic, so
+//! per-call cost is one relaxed load + branch). Every backend
+//! computes identical results to the scalar reference within f32
+//! tolerance — per-target tests in `tests` enforce a ≤ 1e-4
+//! abs-error contract on a 480 k-sample synthetic input.
 //!
 //! **Why not autovectorise.** The two-pass mean / variance reduction
 //! mixes f64 accumulation with f32 inputs to avoid catastrophic
@@ -173,13 +170,11 @@ fn samples_within_simd_safe_range(samples: &[f32]) -> bool {
 }
 
 /// Public entry point — picks the best implementation available at
-/// runtime (under `feature = "std"`) or compile time (without).
-/// `pub` for the `feature = "bench-internals"` re-export; consumers
-/// who don't enable that feature can't reach this path.
+/// runtime. `pub` for the `feature = "bench-internals"` re-export;
+/// consumers who don't enable that feature can't reach this path.
 ///
 /// Uses the stable `cfg_select!` (Rust 1.95+, in the core prelude)
-/// for the per-arch dispatcher. The colconv crate uses the same
-/// pattern; both crates' MSRVs match the macro's stabilisation.
+/// for the per-arch dispatcher.
 #[inline]
 pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
   // Precision guard: SIMD backends reduce in f32 before widening
@@ -206,43 +201,28 @@ pub fn zero_mean_unit_var_normalize(samples: &[f32]) -> Vec<f32> {
 }
 
 /// x86_64 dispatch helper — picks AVX-512 → AVX2 → SSE4.1 →
-/// scalar via runtime feature detection (`feature = "std"`) or
-/// compile-time `target_feature` cfgs (no-std). Lifted out of
-/// the public dispatcher so the per-arch `cfg_select!` arm
-/// stays a one-liner.
+/// scalar via runtime feature detection
+/// (`is_x86_feature_detected!`). Lifted out of the public
+/// dispatcher so the per-arch `cfg_select!` arm stays a one-liner.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn x86_dispatch(samples: &[f32]) -> Vec<f32> {
   // Runtime feature detection. `is_x86_feature_detected!`
   // caches its result in a static atomic, so per-call cost is
   // one relaxed load + branch.
-  #[cfg(feature = "std")]
-  {
-    if std::is_x86_feature_detected!("avx512f") {
-      // SAFETY: feature checked.
-      return unsafe { x86_avx512::zero_mean_unit_var_normalize(samples) };
-    }
-    if std::is_x86_feature_detected!("avx2") {
-      return unsafe { x86_avx2::zero_mean_unit_var_normalize(samples) };
-    }
-    if std::is_x86_feature_detected!("sse4.1") {
-      return unsafe { x86_sse41::zero_mean_unit_var_normalize(samples) };
-    }
+  if std::is_x86_feature_detected!("avx512f") {
+    // SAFETY: feature checked.
+    return unsafe { x86_avx512::zero_mean_unit_var_normalize(samples) };
   }
-  // No-std compile-time fallback. Matches the runtime fallback
-  // order: AVX-512F first, then AVX2, then SSE4.1, else scalar.
-  cfg_select! {
-  all(not(feature = "std"), target_feature = "avx512f") => {
-  unsafe { x86_avx512::zero_mean_unit_var_normalize(samples) }
+  if std::is_x86_feature_detected!("avx2") {
+    // SAFETY: feature checked.
+    return unsafe { x86_avx2::zero_mean_unit_var_normalize(samples) };
   }
-  all(not(feature = "std"), target_feature = "avx2") => {
-  unsafe { x86_avx2::zero_mean_unit_var_normalize(samples) }
+  if std::is_x86_feature_detected!("sse4.1") {
+    // SAFETY: feature checked.
+    return unsafe { x86_sse41::zero_mean_unit_var_normalize(samples) };
   }
-  all(not(feature = "std"), target_feature = "sse4.1") => {
-  unsafe { x86_sse41::zero_mean_unit_var_normalize(samples) }
-  }
-  _ => scalar::zero_mean_unit_var_normalize(samples),
-  }
+  scalar::zero_mean_unit_var_normalize(samples)
 }
 
 /// Scalar reference implementation. Always compiled; used directly
