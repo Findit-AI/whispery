@@ -675,7 +675,9 @@ impl Transcriber {
     // panic later in rescale_pts.
     let tb = starts_at.timebase();
     if tb.num() == 0 {
-      return Err(TranscriberError::InvalidTimebase(InvalidTimebase::new(tb.num())));
+      return Err(TranscriberError::InvalidTimebase(InvalidTimebase::new(
+        tb.num(),
+      )));
     }
     // Count cut_pending audio (pre-extracted Arcs) toward the
     // buffer cap so a slow runner can't accumulate queued audio
@@ -869,10 +871,16 @@ impl Transcriber {
     // PtsRegression. Atomic rejection: vad_watermark stays put.
     let high_water = self.buffer.absolute_sample_offset();
     if sample_index > high_water {
-      return Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(sample_index, high_water)));
+      return Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(
+        sample_index,
+        high_water,
+      )));
     }
     if sample_index < self.vad_watermark {
-      return Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::VadSegment, sample_index as i64 - self.vad_watermark as i64)));
+      return Err(TranscriberError::PtsRegression(PtsRegression::new(
+        PushKind::VadSegment,
+        (sample_index as i64) - (self.vad_watermark as i64),
+      )));
     }
     self.vad_watermark = sample_index;
 
@@ -1031,11 +1039,15 @@ impl Transcriber {
     // boundary; rescale_pts later would panic.
     let tb = starts_at.timebase();
     if tb.num() == 0 {
-      return Err(TranscriberError::InvalidTimebase(InvalidTimebase::new(tb.num())));
+      return Err(TranscriberError::InvalidTimebase(InvalidTimebase::new(
+        tb.num(),
+      )));
     }
     if let Some(expected_tb) = self.buffer.output_timebase() {
       if starts_at.timebase() != expected_tb {
-        return Err(TranscriberError::InconsistentTimebase(InconsistentTimebase::new(expected_tb, starts_at.timebase())));
+        return Err(TranscriberError::InconsistentTimebase(
+          InconsistentTimebase::new(expected_tb, starts_at.timebase()),
+        ));
       }
     }
 
@@ -1106,7 +1118,7 @@ mod tests {
     let r = t.handle_vad_segment(VadSegment::new(150, 250)); // overlaps
     assert!(matches!(
       r,
-      Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::VadSegment, )))
+      Err(TranscriberError::PtsRegression(_))
     ));
   }
 
@@ -1494,7 +1506,7 @@ mod tests {
     let bad_tb = Timebase::new(0, NonZeroU32::new(48_000).unwrap());
     let r = t.handle_samples(Timestamp::new(0, bad_tb), &[0.0; 100]);
     assert!(
-      matches!(r, Err(TranscriberError::InvalidTimebase(InvalidTimebase::new(0)))),
+      matches!(r, Err(TranscriberError::InvalidTimebase(p)) if p.numerator() == 0),
       "expected InvalidTimebase, got {:?}",
       r
     );
@@ -1508,7 +1520,7 @@ mod tests {
     let bad_tb = Timebase::new(0, NonZeroU32::new(48_000).unwrap());
     let r = t.handle_restart(Timestamp::new(0, bad_tb));
     assert!(
-      matches!(r, Err(TranscriberError::InvalidTimebase(InvalidTimebase::new(0)))),
+      matches!(r, Err(TranscriberError::InvalidTimebase(p)) if p.numerator() == 0),
       "expected InvalidTimebase, got {:?}",
       r
     );
@@ -1856,7 +1868,7 @@ mod tests {
     let r = t.handle_vad_segment(VadSegment::new(5_000, 8_000));
     assert!(matches!(
       r,
-      Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::VadSegment, )))
+      Err(TranscriberError::PtsRegression(_))
     ));
   }
 
@@ -1870,7 +1882,7 @@ mod tests {
     let r = t.handle_no_speech_through(10_000);
     assert!(matches!(
       r,
-      Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::VadSegment, )))
+      Err(TranscriberError::PtsRegression(_))
     ));
   }
 
@@ -1900,7 +1912,7 @@ mod tests {
     assert!(
       matches!(
         r,
-        Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(5_000, 1_000)))
+        Err(TranscriberError::VadAheadOfAudio(_))
       ),
       "expected VadAheadOfAudio, got {:?}",
       r
@@ -1943,7 +1955,7 @@ mod tests {
     assert!(
       matches!(
         r,
-        Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(2000, 1000)))
+        Err(TranscriberError::VadAheadOfAudio(_))
       ),
       "expected VadAheadOfAudio, got {:?}",
       r
@@ -2040,7 +2052,7 @@ mod tests {
     // about-to-push.
     let segs = [VadSegment::new(0, 5_000)];
     match t.precheck_vad_segments(&segs, 0) {
-      Err(TranscriberError::VadAheadOfAudio(VadAheadOfAudio::new(5_000, 1_000))) => {}
+      Err(TranscriberError::VadAheadOfAudio(_)) => {}
       other => panic!("expected VadAheadOfAudio; got {other:?}"),
     }
   }
@@ -2055,7 +2067,7 @@ mod tests {
       VadSegment::new(1_000, 1_500), // start < running watermark (3_000)
     ];
     match t.precheck_vad_segments(&segs, 0) {
-      Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::VadSegment, ))) => {}
+      Err(TranscriberError::PtsRegression(_)) => {}
       other => panic!("expected PtsRegression; got {other:?}"),
     }
   }

@@ -232,13 +232,13 @@ pub enum AsrError {
   /// All temperatures in the retry ladder were tried and every
   /// result violated the log-prob or compression-ratio thresholds.
   #[error("ASR all temperatures failed: {0}")]
-  AllTemperaturesFailed(AsrFailure),
+  AllTemperaturesExhausted(AsrFailure),
   /// Auto-detected language is not in whisper.cpp's supported set.
   #[error("ASR unsupported language: {0}")]
   UnsupportedLanguage(AsrFailure),
   /// Backend returned an error during inference.
   #[error("ASR backend error: {0}")]
-  BackendError(AsrFailure),
+  Backend(AsrFailure),
 }
 
 /// Diagnostic payload shared across [`AsrError`] variants.
@@ -268,13 +268,13 @@ impl AsrFailure {
 pub enum AlignmentError {
   /// wav2vec2 ONNX inference failed.
   #[error("alignment model inference failed: {0}")]
-  ModelInferenceFailed(AlignmentFailure),
+  ModelInference(AlignmentFailure),
   /// Tokenization of the normalised text failed.
   #[error("alignment tokenization failed: {0}")]
-  TokenizationFailed(AlignmentFailure),
+  Tokenization(AlignmentFailure),
   /// Text normalisation step failed.
   #[error("alignment normalization failed: {0}")]
-  NormalizationFailed(AlignmentFailure),
+  Normalization(AlignmentFailure),
   /// CTC Viterbi found no valid alignment path.
   #[error("no alignment path: {0}")]
   NoAlignmentPath(AlignmentFailure),
@@ -396,7 +396,7 @@ mod tests {
 
   #[test]
   fn work_failure_clones() {
-    let f = WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new(
+    let f = WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new(
       "oops".into(),
     )));
     let _ = f.clone();

@@ -993,7 +993,7 @@ mod tests {
     d.on_emit(fake_chunk(0, 2_000), ChunkId::from_raw(0), &b);
     d.handle_failure(
       ChunkId::from_raw(0),
-      WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new("x".into()))),
+      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new("x".into()))),
     )
     .unwrap();
     d.after_inject(&mut b, None, u64::MAX);
@@ -1220,7 +1220,7 @@ mod tests {
       .unwrap();
     let r = d.handle_failure(
       ChunkId::from_raw(1),
-      WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new(SmolStr::from("late failure")))),
+      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new(SmolStr::from("late failure")))),
     );
     assert!(matches!(r, Err(TranscriberError::UnknownChunk(_))));
   }
@@ -1361,7 +1361,7 @@ mod tests {
     // Chunk 0 fails ASR.
     d.handle_failure(
       ChunkId::from_raw(0),
-      WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new("fail".into()))),
+      WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new("fail".into()))),
     )
     .unwrap();
     d.after_inject(&mut b, Some(0), u64::MAX);

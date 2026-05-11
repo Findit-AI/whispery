@@ -97,7 +97,9 @@ impl SampleBuffer {
     let (effective_tb, effective_anchor, would_be_first_push) = match self.output_tb {
       Some(expected_tb) => {
         if starts_at.timebase() != expected_tb {
-          return Err(TranscriberError::InconsistentTimebase(InconsistentTimebase::new(expected_tb, starts_at.timebase())));
+          return Err(TranscriberError::InconsistentTimebase(
+            InconsistentTimebase::new(expected_tb, starts_at.timebase()),
+          ));
         }
         (expected_tb, self.base_pts_out_anchor, false)
       }
@@ -118,7 +120,7 @@ impl SampleBuffer {
     let delta_pts_out = starts_at.pts() - expected_pts_out;
 
     let delta_samples: u64 = if delta_pts_out < 0 {
-      return Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::Samples, delta_pts_out)));
+      return Err(TranscriberError::PtsRegression(_));
     } else if delta_pts_out == 0 {
       0
     } else {
@@ -126,7 +128,7 @@ impl SampleBuffer {
       // zero-fill width / tolerance check.
       let g = Timebase::rescale_pts(delta_pts_out, effective_tb, ANALYSIS_TIMEBASE);
       if (g as u64) > self.gap_tolerance_samples {
-        return Err(TranscriberError::GapExceedsTolerance(GapExceedsTolerance::new(g as u64, self.gap_tolerance_samples)));
+        return Err(TranscriberError::GapExceedsTolerance(_));
       }
       g as u64
     };
@@ -157,7 +159,7 @@ impl SampleBuffer {
     let delta_usize = match usize::try_from(delta_samples) {
       Ok(v) => v,
       Err(_) => {
-        return Err(TranscriberError::Backpressure(Backpressure::new(usize::MAX, self.cap)));
+        return Err(TranscriberError::Backpressure(_));
       }
     };
     let total_with_queued = self
@@ -169,11 +171,11 @@ impl SampleBuffer {
     let total_with_queued = match total_with_queued {
       Some(v) => v,
       None => {
-        return Err(TranscriberError::Backpressure(Backpressure::new(usize::MAX, self.cap)));
+        return Err(TranscriberError::Backpressure(_));
       }
     };
     if total_with_queued > self.cap {
-      return Err(TranscriberError::Backpressure(Backpressure::new(total_with_queued, self.cap)));
+      return Err(TranscriberError::Backpressure(_));
     }
 
     // Empty-packet must never mutate stream state. Three cases
@@ -374,7 +376,7 @@ mod tests {
     let result = b.append(ts_at_48k(47_000), &[0.0; 100], 0);
     assert!(matches!(
       result,
-      Err(TranscriberError::PtsRegression(PtsRegression::new(crate::types::PushKind::Samples, )))
+      Err(TranscriberError::PtsRegression(_))
     ));
   }
 

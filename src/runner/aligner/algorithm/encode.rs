@@ -108,7 +108,7 @@ pub(crate) fn encode_log_softmax(
 ) -> Result<LogProbsTV, WorkFailure> {
   let t_samples = samples_for_aligner.len();
   if t_samples == 0 {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(SmolStr::from("samples_for_aligner is empty"), language.clone()))));
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(SmolStr::from("samples_for_aligner is empty"), language.clone()))));
   }
 
   // Reject non-finite samples up front with a typed in-band
@@ -123,7 +123,7 @@ pub(crate) fn encode_log_softmax(
   let input_shape: [i64; 2] = [1, t_samples as i64];
   let input_tensor =
     Tensor::from_array((input_shape, samples_for_aligner.to_vec())).map_err(|e| {
-      WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("Tensor::from_array failed: {e:?}"), language.clone())))
+      WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("Tensor::from_array failed: {e:?}"), language.clone())))
     })?;
 
   // Most wav2vec2 ONNX exports use the input name "input_values".
@@ -133,20 +133,20 @@ pub(crate) fn encode_log_softmax(
   // alignment worker's watchdog can interrupt a stuck graph.
   let outputs = session
     .run_with_options(ort::inputs![input_tensor], run_options)
-    .map_err(|e| WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("Session::run_with_options failed: {e:?}"), language.clone()))))?;
+    .map_err(|e| WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("Session::run_with_options failed: {e:?}"), language.clone()))))?;
 
   // Take the first (only) output. wav2vec2 has a single logits
   // output; we pull index 0 by name-agnostic iteration.
   let mut iter = outputs.into_iter();
-  let (_, output_value) = iter.next().ok_or_else(|| WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(SmolStr::from("Session::run returned no outputs"), language.clone()))))?;
+  let (_, output_value) = iter.next().ok_or_else(|| WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(SmolStr::from("Session::run returned no outputs"), language.clone()))))?;
 
   let (shape, raw): (&Shape, &[f32]) =
     output_value
       .try_extract_tensor::<f32>()
-      .map_err(|e| WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("try_extract_tensor::<f32> failed: {e:?}"), language.clone()))))?;
+      .map_err(|e| WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("try_extract_tensor::<f32> failed: {e:?}"), language.clone()))))?;
 
   if shape.len() != 3 || shape[0] != 1 {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("expected output shape (1, T, V); got {shape:?}"), language.clone()))));
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("expected output shape (1, T, V); got {shape:?}"), language.clone()))));
   }
 
   // Validate the shape integers and their product against the
@@ -195,12 +195,12 @@ pub(crate) fn validate_output_dims(
   // V == 0 means the model declared no vocabulary axis — never
   // legitimate. Always fatal.
   if raw_v <= 0 {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("ORT output has non-positive vocab dim: V={raw_v}"), language.clone()))));
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("ORT output has non-positive vocab dim: V={raw_v}"), language.clone()))));
   }
   // Negative T is always a backend bug (truncated /
   // sign-flipped shape descriptor).
   if raw_t < 0 {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("ORT output has negative time dim: T={raw_t}"), language.clone()))));
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("ORT output has negative time dim: T={raw_t}"), language.clone()))));
   }
   // T == 0 — the model returned a well-formed empty output.
   // With an empty buffer that's a legitimate "chunk too short
@@ -210,7 +210,7 @@ pub(crate) fn validate_output_dims(
   // model bug.
   if raw_t == 0 {
     if raw_len != 0 {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
           "ORT output declared T=0 but buffer has {raw_len} elements; shape/data mismatch"
         ), language.clone()))));
     }
@@ -224,25 +224,25 @@ pub(crate) fn validate_output_dims(
   let t = match usize::try_from(raw_t) {
     Ok(v) => v,
     Err(_) => {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("ORT output T={raw_t} doesn't fit in usize"), language.clone()))));
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("ORT output T={raw_t} doesn't fit in usize"), language.clone()))));
     }
   };
   let v = match usize::try_from(raw_v) {
     Ok(v) => v,
     Err(_) => {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!("ORT output V={raw_v} doesn't fit in usize"), language.clone()))));
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!("ORT output V={raw_v} doesn't fit in usize"), language.clone()))));
     }
   };
   let total = match t.checked_mul(v) {
     Some(p) => p,
     None => {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
           "ORT output dimensions overflow: T={t} * V={v} doesn't fit in usize"
         ), language.clone()))));
     }
   };
   if total != raw_len {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
         "ORT output buffer length {raw_len} doesn't match declared T={t} × V={v} = {total}"
       ), language.clone()))));
   }
@@ -289,7 +289,7 @@ pub(crate) fn validate_stride_extent(
   let upper_bound = chunk_extent_u64.saturating_add(slack);
   let lower_bound = chunk_extent_u64.saturating_sub(slack);
   if frame_extent > upper_bound {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
         "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
  sample-equivalents exceeds chunk ({chunk_extent} samples) + 2-frame slack \
  ({upper_bound}); model export uses a smaller stride than `hop_samples` \
@@ -297,7 +297,7 @@ pub(crate) fn validate_stride_extent(
       ), language.clone()))));
   }
   if frame_extent < lower_bound {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
         "ORT output stride mismatch: T={t} × hop={hop_samples} = {frame_extent} \
  sample-equivalents below chunk ({chunk_extent} samples) − 2-frame slack \
  ({lower_bound}); model export uses a larger stride than `hop_samples` \
@@ -329,7 +329,7 @@ pub(crate) fn validate_vocab_dim(
   language: &Lang,
 ) -> Result<(), WorkFailure> {
   if v != expected_v {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
         "ORT output vocab dim V={v} doesn't match tokenizer vocab size {expected_v}; \
  model and tokenizer are paired incorrectly — Viterbi would otherwise read \
  posteriors from columns that don't correspond to the tokenizer's tokens"
@@ -364,7 +364,7 @@ pub(crate) fn log_softmax_with_finite_guard(
   for t_idx in 0..t {
     let row = &raw[t_idx * v..(t_idx + 1) * v];
     if let Some(bad_v) = row.iter().position(|x| !x.is_finite()) {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
           "ORT returned non-finite logit at frame {t_idx}, vocab {bad_v}: {}",
           row[bad_v]
         ), language.clone()))));
@@ -397,7 +397,7 @@ pub(crate) fn log_softmax_with_finite_guard(
       // f64 input. So this branch fires only on the all-(-inf)
       // case, which the existing all-`NEG_INFINITY` regression
       // also covers.
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
           "log-softmax shifted normaliser non-finite at frame {t_idx}: \
  sum.ln()={log_z_shifted}, max={max}"
         ), language.clone()))));
@@ -417,7 +417,7 @@ pub(crate) fn log_softmax_with_finite_guard(
       let lp_f64 = ((x as f64) - max_f64) - log_z_shifted;
       let lp = lp_f64 as f32;
       if !lp.is_finite() {
-        return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+        return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
             "log-softmax output non-finite at frame {t_idx}: \
  x={x}, max={max}, sum_ln={log_z_shifted}, lp={lp}"
           ), language.clone()))));
@@ -445,7 +445,7 @@ pub(crate) fn log_softmax_with_finite_guard(
 /// real ORT fixture.
 pub(crate) fn reject_non_finite_input(samples: &[f32], language: &Lang) -> Result<(), WorkFailure> {
   if let Some(bad_idx) = samples.iter().position(|s| !s.is_finite()) {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
         "samples_for_aligner contains non-finite value at index {bad_idx}: {}",
         samples[bad_idx]
       ), language.clone()))));
@@ -486,7 +486,7 @@ mod tests {
     let samples = vec![0.1_f32, 0.2, f32::NAN, 0.4];
     let err = reject_non_finite_input(&samples, &Lang::En).unwrap_err();
     match err {
-      WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) => {
+      WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
         let message = payload.message();
         assert!(
           message.contains("index 2"),
@@ -544,7 +544,7 @@ mod tests {
     let raw = vec![0.0_f32, f32::NAN, 0.0]; // 1×3
     let err = log_softmax_with_finite_guard(&raw, 1, 3, &Lang::En).unwrap_err();
     match err {
-      WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) => {
+      WorkFailure::Alignment(AlignmentError::ModelInference(payload)) => {
         let message = payload.message();
         assert!(
           message.contains("non-finite logit"),
@@ -599,7 +599,7 @@ mod tests {
     use crate::types::Lang;
     let raw = vec![f32::MAX, -f32::MAX];
     let err = log_softmax_with_finite_guard(&raw, 1, 2, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) = err else {
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
     let message = payload.message();
@@ -663,7 +663,7 @@ mod tests {
   fn validate_output_dims_rejects_negative_t() {
     use crate::types::Lang;
     let err = validate_output_dims(-1, 32, 32, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) = err else {
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
     let message = payload.message();
@@ -677,7 +677,7 @@ mod tests {
     // V=0 is always fatal — model has no vocab axis.
     assert!(matches!(
       err,
-      WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(_))
+      WorkFailure::Alignment(AlignmentError::ModelInference(_))
     ));
   }
 
@@ -706,7 +706,7 @@ mod tests {
   fn validate_output_dims_zero_t_with_nonempty_buffer_stays_fatal() {
     use crate::types::Lang;
     let err = validate_output_dims(0, 32, 5, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) = &err else {
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = &err else {
       panic!("T=0 with non-empty buffer must stay fatal; got {err:?}");
     };
     let message = payload.message();
@@ -741,7 +741,7 @@ mod tests {
     // 100 frames × 320 = 32 000 sample-equivalents for a
     // 16 000-sample chunk. Way past the upper bound (16 640).
     let err = validate_stride_extent(100, 320, 16_000, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) = err else {
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
     let message = payload.message();
@@ -764,7 +764,7 @@ mod tests {
     // sample chunk. Half the expected — far below the lower
     // bound (15 360 = 16 000 − 640).
     let err = validate_stride_extent(25, 320, 16_000, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) = err else {
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
     let message = payload.message();
@@ -802,7 +802,7 @@ mod tests {
   fn validate_vocab_dim_rejects_oversized_model_output() {
     use crate::types::Lang;
     let err = validate_vocab_dim(1024, 32, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) = err else {
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
     let message = payload.message();
@@ -818,7 +818,7 @@ mod tests {
   fn validate_vocab_dim_rejects_undersized_model_output() {
     use crate::types::Lang;
     let err = validate_vocab_dim(16, 32, &Lang::En).unwrap_err();
-    let WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload)) = err else {
+    let WorkFailure::Alignment(AlignmentError::ModelInference(payload)) = err else {
       panic!("expected AlignmentFailed");
     };
     }

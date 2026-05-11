@@ -148,7 +148,7 @@ fn consume_oov_decision(
   let decision = oov_decisions
     .get(*oov_consumed)
     .map(|r| r.decision())
-    .ok_or_else(|| WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    .ok_or_else(|| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "oov_decisions ran out at index {} ({site_label}); call detect_oov_events \
  first to size the decisions vec correctly",
         *oov_consumed,
@@ -238,7 +238,7 @@ pub fn detect_oov_events(
   let mut events: Vec<OovEvent> = Vec::new();
   let words: Vec<&str> = normalized.split_whitespace().collect();
   if words.len() != word_count {
-    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "word_count mismatch: caller={}, normalized has {}",
         word_count,
         words.len(),
@@ -248,7 +248,7 @@ pub fn detect_oov_events(
   // word_count-long; surface a hard error otherwise rather
   // than risk indexing-skew between detect + tokenize.
   if !wildcard_boundary_per_word.is_empty() && wildcard_boundary_per_word.len() != word_count {
-    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "wildcard_boundary_per_word.len() = {} != word_count = {}",
         wildcard_boundary_per_word.len(),
         word_count,
@@ -294,7 +294,7 @@ pub fn detect_oov_events(
       tmp_buf.push(projected);
       let encoding = tokenizer
         .encode(tmp_buf.as_str(), /* add_special_tokens = */ false)
-        .map_err(|e| WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!("encode({:?}) failed: {e:?}", projected), language.clone()))))?;
+        .map_err(|e| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!("encode({:?}) failed: {e:?}", projected), language.clone()))))?;
       let ids = encoding.get_ids();
       let is_unk_or_empty = ids.is_empty()
         || match unk_token_id {
@@ -426,7 +426,7 @@ pub fn tokenize_with_word_map(
     wildcard_boundary_per_word,
   )?;
   if pre_events.len() != oov_decisions.len() {
-    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "oov_decisions length {} does not match the {} OOV events detected for this \
  text; this typically means the caller passed decisions from a different \
  chunk's text. Re-run `detect_oov_events` for the chunk's normalised text \
@@ -449,7 +449,7 @@ pub fn tokenize_with_word_map(
   // not positional identity.
   for (i, (pre, resolved)) in pre_events.iter().zip(oov_decisions.iter()).enumerate() {
     if !resolved.event().matches_position(pre) {
-      return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
           "oov_decisions[{i}] was produced for a different OOV event than the one \
  this chunk's text actually has at position {i}: supplied={:?} but \
  detected={:?}. This typically means the caller reused decisions from a \
@@ -470,14 +470,14 @@ pub fn tokenize_with_word_map(
     // Sanity: caller's claimed word_count must match the
     // normalised text. Off-by-one here would mis-index Word
     // emission in step 9.
-    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "word_count mismatch: caller={}, normalized has {}",
         word_count,
         words.len()
       ), language.clone()))));
   }
   if !wildcard_boundary_per_word.is_empty() && wildcard_boundary_per_word.len() != word_count {
-    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "wildcard_boundary_per_word.len() = {} != word_count = {}",
         wildcard_boundary_per_word.len(),
         word_count
@@ -558,7 +558,7 @@ pub fn tokenize_with_word_map(
       tmp_buf.push(projected);
       let encoding = tokenizer
         .encode(tmp_buf.as_str(), /* add_special_tokens = */ false)
-        .map_err(|e| WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!("encode({:?}) failed: {e:?}", projected), language.clone()))))?;
+        .map_err(|e| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!("encode({:?}) failed: {e:?}", projected), language.clone()))))?;
       let ids = encoding.get_ids();
       // Single-char encode usually yields exactly one token.
       // If for some reason it doesn't (a tokenizer with
@@ -602,13 +602,13 @@ pub fn tokenize_with_word_map(
         // out-of-range case as a `TokenizationFailed` so the
         // caller learns about the tokenizer/model mismatch.
         for &id in ids {
-          let signed_id = i32::try_from(id).map_err(|_| WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+          let signed_id = i32::try_from(id).map_err(|_| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
               "tokenizer returned id {} which exceeds i32::MAX or aliases the wildcard \
  sentinel; tokenizer / model mismatch?",
               id
             ), language.clone()))))?;
           if signed_id < 0 {
-            return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+            return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
                 "tokenizer returned negative-after-cast id {} (raw {}); refusing to alias \
  wildcard sentinel",
                 signed_id,
@@ -663,12 +663,12 @@ pub fn tokenize_with_word_map(
     {
       // Same overflow / sentinel-alias guard as the per-char
       // path above ([high]).
-      let signed_d = i32::try_from(d).map_err(|_| WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+      let signed_d = i32::try_from(d).map_err(|_| WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
           "tokenizer returned `|` delimiter id {} which exceeds i32::MAX",
           d
         ), language.clone()))))?;
       if signed_d < 0 {
-        return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+        return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
             "tokenizer returned negative-after-cast `|` delimiter id {} (raw {})",
             signed_d,
             d
@@ -695,7 +695,7 @@ pub fn tokenize_with_word_map(
   // wildcard the `&` instead of fail-closing). Reject the
   // mismatch loudly.
   if oov_consumed != oov_decisions.len() {
-    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "oov_decisions length {} does not match the {} OOV chars actually \
  encountered; this typically means the caller passed decisions \
  from a different chunk's text. Re-run `detect_oov_events` for \
@@ -864,7 +864,7 @@ mod tests {
     let result =
       tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))) => {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
         assert!(
           message.contains("oov_decisions length 2") && message.contains("1 OOV events detected"),
           "diagnostic should cite the length mismatch; got {message:?}",
@@ -900,7 +900,7 @@ mod tests {
     let result =
       tokenize_with_word_map(&tok, "AT&T", 1, true, true, unk, &[], &Lang::En, &too_long);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))) => {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
         // Correct: stale-payload mismatch surfaces as
         // TokenizationFailed (loud), not SemanticOutOfVocab
         // (silent recoverable empty-words drop).
@@ -952,7 +952,7 @@ mod tests {
       &stale_resolved,
     );
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))) => {
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => {
         assert!(
           message.contains("different OOV event"),
           "diagnostic should cite the per-position identity mismatch; got {message:?}",
@@ -1056,7 +1056,7 @@ mod tests {
     let result = detect_oov_events(&tok, "hello world", 1, true, unk, &Lang::En, &[]);
     assert!(matches!(
       result,
-      Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(_)))
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_)))
     ));
   }
 
@@ -1480,7 +1480,7 @@ mod tests {
     .expect_err("length mismatch must surface TokenizationFailed");
     assert!(matches!(
       err,
-      WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))
+      WorkFailure::Alignment(AlignmentError::Tokenization(_))
     ));
   }
 }

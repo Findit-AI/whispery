@@ -206,7 +206,7 @@ pub fn get_trellis(
   }
   let v = log_probs.v();
   if (blank_id as usize) >= v {
-    return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
         "blank token id {blank_id} >= model output vocab dim {v}; tokenizer/model mismatch?"
       ), language.clone()))));
   }
@@ -215,13 +215,13 @@ pub fn get_trellis(
       continue;
     }
     if tok < 0 {
-      return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
           "token id {tok} at position {i} is negative (only the wildcard \
  sentinel {WILDCARD_TOKEN_ID} is allowed); tokenizer bug?"
         ), language.clone()))));
     }
     if (tok as usize) >= v {
-      return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
           "token id {tok} at position {i} >= model output vocab dim {v}; \
  tokenizer/model mismatch?"
         ), language.clone()))));
@@ -904,7 +904,7 @@ pub fn align_to_word_segments(
   // Sanity: `word_idx_per_token` must align 1:1 with `tokens`.
   // Caller bug otherwise.
   if tokens.len() != word_idx_per_token.len() {
-    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "tokens.len() = {} != word_idx_per_token.len() = {}; tokenizer bug?",
         tokens.len(),
         word_idx_per_token.len()
@@ -1624,7 +1624,7 @@ mod tests {
     let err = get_trellis(&log_probs, &[1, 99], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
-      WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))
+      WorkFailure::Alignment(AlignmentError::Tokenization(_))
     ));
   }
 
@@ -1643,7 +1643,7 @@ mod tests {
     let err = get_trellis(&log_probs, &[1, -2], 0, never(), &Lang::En).unwrap_err();
     assert!(matches!(
       err,
-      WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))
+      WorkFailure::Alignment(AlignmentError::Tokenization(_))
     ));
   }
 

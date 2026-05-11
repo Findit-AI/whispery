@@ -338,7 +338,10 @@ pub fn run_one_alignment(
   // intent immediately and return `WorkerHangTimeout` instead
   // of starting the alignment pipeline.
   if job.abort_flag.load(Ordering::Relaxed) {
-    return Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment, started_at.elapsed())));
+    return Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(
+      WorkerKind::Alignment,
+      started_at.elapsed(),
+    )));
   }
 
   // validate the
@@ -362,7 +365,7 @@ pub fn run_one_alignment(
   // tokenizer surfaces `TokenizationFailed` if a chunk hits
   // OOV anyway). Any other size mismatch is rejected.
   if outer != 0 && outer != expected {
-    return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+    return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
         "AlignWorkItem::oov_decisions outer shape mismatch: \
  expected 0 (no OOV) or {expected} ({}), got {outer}. \
  This typically means stale per-run decisions are being \
@@ -459,9 +462,9 @@ pub fn run_one_alignment(
         // diagnostic strings stay accessible to callers via
         // the typed `WorkFailure` they own.
         let language = match err {
-          AlignmentError::ModelInferenceFailed(p)
-          | AlignmentError::TokenizationFailed(p)
-          | AlignmentError::NormalizationFailed(p)
+          AlignmentError::ModelInference(p)
+          | AlignmentError::Tokenization(p)
+          | AlignmentError::Normalization(p)
           | AlignmentError::NoAlignmentPath(p)
           | AlignmentError::EmptyText(p)
           | AlignmentError::SemanticOutOfVocab(p) => p.language(),
@@ -520,7 +523,7 @@ fn validate_oov_decision_languages(
     if let Some(chunk_decisions) = oov_decisions.first() {
       for (i, resolved) in chunk_decisions.iter().enumerate() {
         if resolved.event().language() != job_language {
-          return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+          return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
               "AlignWorkItem::oov_decisions[0][{i}].event.language = {:?} but \
  job.language = {:?}. This typically means stale decisions from a \
  previous chunk's run leaked into a whole-chunk job; the caller's \
@@ -547,7 +550,7 @@ fn validate_oov_decision_languages(
     let expected_lang = run.language();
     for (i, resolved) in run_decisions.iter().enumerate() {
       if resolved.event().language() != expected_lang {
-        return Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(format_smolstr!(
+        return Err(WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(format_smolstr!(
             "AlignWorkItem::oov_decisions[{run_idx}][{i}].event.language = {} \
  but runs[{run_idx}].language() = {}. This typically means stale \
  decisions from a previous chunk leaked into a per-run dispatch; \
@@ -758,7 +761,10 @@ fn check_abort_between_runs(
   dispatch_started_at: Instant,
 ) -> Result<(), WorkFailure> {
   if abort_flag.load(Ordering::Relaxed) {
-    return Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment, dispatch_started_at.elapsed())));
+    return Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(
+      WorkerKind::Alignment,
+      dispatch_started_at.elapsed(),
+    )));
   }
   Ok(())
 }
@@ -913,9 +919,9 @@ fn dispatch_runs(
           // leaking the user's speech into stderr.
           if let WorkFailure::Alignment(err) = &failure {
             let language = match err {
-              AlignmentError::ModelInferenceFailed(p)
-              | AlignmentError::TokenizationFailed(p)
-              | AlignmentError::NormalizationFailed(p)
+              AlignmentError::ModelInference(p)
+              | AlignmentError::Tokenization(p)
+              | AlignmentError::Normalization(p)
               | AlignmentError::NoAlignmentPath(p)
               | AlignmentError::EmptyText(p)
               | AlignmentError::SemanticOutOfVocab(p) => p.language(),
@@ -1088,7 +1094,7 @@ fn clip_sub_segments(
   for sub in subs {
     let actual_tb = sub.timebase();
     if actual_tb.num() != 1 || actual_tb.den().get() != 16_000 {
-      return Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(AlignmentFailure::new(format_smolstr!(
+      return Err(WorkFailure::Alignment(AlignmentError::ModelInference(AlignmentFailure::new(format_smolstr!(
           "sub_segments must be in 1/16000 (chunk-local sample-index) timebase; got \
  {}/{}. Convert via `Transcriber::chunk_first_sample` + a 1/16000 timebase \
  before passing to the aligner.",
@@ -1233,7 +1239,7 @@ mod tests {
     ));
     // Logically impossible on the alignment path, but if it
     // ever shows up we surface it rather than swallow it.
-    assert!(!alignment_failure_is_recoverable(&WorkFailure::Asr(AsrError::AllTemperaturesFailed(AsrFailure::new(SmolStr::new(""))))));
+    assert!(!alignment_failure_is_recoverable(&WorkFailure::Asr(AsrError::AllTemperaturesExhausted(AsrFailure::new(SmolStr::new(""))))));
   }
 
   /// `BoundsSourceCounters` accumulates the dispatcher's
@@ -1504,7 +1510,7 @@ mod tests {
     assert!(
       matches!(
         result,
-        Err(WorkFailure::WorkerHang(WorkerHangTimeout::new(WorkerKind::Alignment, )))
+        Err(WorkFailure::WorkerHang(_))
       ),
       "abort flag set → expected WorkerHangTimeout(Alignment); got {result:?}",
     );
@@ -1531,7 +1537,7 @@ mod tests {
   #[test]
   fn tokenization_failed_stays_fatal() {
     use crate::types::{Lang};
-    let f = WorkFailure::Alignment(AlignmentError::TokenizationFailed(AlignmentFailure::new(SmolStr::new(""), Lang::En)));
+    let f = WorkFailure::Alignment(AlignmentError::Tokenization(AlignmentFailure::new(SmolStr::new(""), Lang::En)));
     assert!(
       !alignment_failure_is_recoverable(&f),
       "TokenizationFailed signals a tokenizer/model mismatch; must stay fatal",
@@ -1665,7 +1671,7 @@ mod tests {
     )]];
     let result = validate_oov_decision_languages(&[], &Lang::Ko, &resolved);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))) => assert!(
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => assert!(
         message.contains("oov_decisions[0][0].event.language") && message.contains("job.language"),
         "diagnostic should cite the whole-chunk mismatch; got {message:?}",
       ),
@@ -1712,7 +1718,7 @@ mod tests {
     ];
     let result = validate_oov_decision_languages(&runs, &Lang::En, &resolved);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::TokenizationFailed(_))) => assert!(
+      Err(WorkFailure::Alignment(AlignmentError::Tokenization(_))) => assert!(
         message.contains("oov_decisions[1][0]") && message.contains("runs[1].language()"),
         "diagnostic should cite the run index of the mismatch; got {message:?}",
       ),
@@ -1738,7 +1744,7 @@ mod tests {
     let subs = vec![TimeRange::new(2_000, 3_000, tb_48k)];
     let result = clip_sub_segments(&subs, 1_600, 4_800, &Lang::En);
     match result {
-      Err(WorkFailure::Alignment(AlignmentError::ModelInferenceFailed(payload))) => {
+      Err(WorkFailure::Alignment(AlignmentError::ModelInference(payload))) => {
         let message = payload.message();
         assert!(
           message.contains("1/16000") && message.contains("48000"),

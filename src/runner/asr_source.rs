@@ -189,7 +189,7 @@ impl AsrSource for WhisperAsrSource {
       .enumerate()
       .find(|(_, s)| !s.is_finite())
     {
-      return Err(WorkFailure::Asr(AsrError::BackendError(AsrFailure::new(format_smolstr!(
+      return Err(WorkFailure::Asr(AsrError::Backend(AsrFailure::new(format_smolstr!(
           "non-finite ASR sample at index {idx} (value {val:?}); upstream audio corruption — \
            refuse to encode rather than poison whisper.cpp's float math"
         )))));
