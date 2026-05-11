@@ -992,7 +992,6 @@ pub fn dispatch(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::vec;
 
   /// Minimal mock implementing [`SegmentLike`] for unit tests.
   /// Times are in centiseconds (matches whisper.cpp's native unit

@@ -74,7 +74,8 @@ pub struct AsrChunkContext<'a> {
   /// the abort callback wired into `Params`).
   abort_flag: &'a Arc<AtomicBool>,
   /// Caller-supplied chunk identity — surfaces back into
-  /// [`WorkFailure::AsrFailed`] / `WorkerHangTimeout`
+  /// [`WorkFailure::Asr`](crate::types::WorkFailure::Asr) /
+  /// [`WorkFailure::WorkerHang`](crate::types::WorkFailure::WorkerHang)
   /// telemetry. Whispery does not assign chunk ids itself.
   chunk_id: ChunkId,
 }

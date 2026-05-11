@@ -4,9 +4,11 @@ use std::{borrow::Cow, string::String, vec::Vec};
 
 use smol_str::SmolStr;
 
-/// Why text normalisation failed. Used as
-/// `WorkFailure::AlignmentFailed.message` source; the kind is
-/// always `::NormalizationFailed`.
+/// Why text normalisation failed. Wrapped into
+/// [`WorkFailure::Alignment(AlignmentError::Normalization(_))`](crate::types::AlignmentError::Normalization)
+/// at the aligner boundary; the diagnostic text on the resulting
+/// [`AlignmentFailure`](crate::types::AlignmentFailure) is the
+/// `Display` rendering of this enum.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum NormalizationError {
   /// Input was empty after stripping whitespace and punctuation;

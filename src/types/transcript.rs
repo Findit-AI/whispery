@@ -206,7 +206,6 @@ pub(crate) mod for_test {
 
   use super::*;
   use core::num::NonZeroU32;
-  use std::vec;
 
   pub(crate) fn ms_timebase() -> mediatime::Timebase {
     mediatime::Timebase::new(1, NonZeroU32::new(1000).unwrap())
@@ -240,7 +239,6 @@ pub(crate) mod for_test {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::vec;
 
   #[test]
   fn transcript_round_trip() {
