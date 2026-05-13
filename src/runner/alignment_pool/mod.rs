@@ -309,7 +309,7 @@ impl AlignWorkItem {
 /// hold a `RunOptions` handle and call `terminate()` from
 /// another thread; had this wired via
 /// an internal watchdog thread, but the round-1.0 Sans-I/O
-/// pivot moved threading out of whispery — callers who need
+/// pivot moved threading out of asry — callers who need
 /// it construct their own watchdog around `Aligner::align`.
 /// Drive one [`AlignWorkItem`] end-to-end against the
 /// supplied [`AlignmentSet`]. Caller passes the
@@ -480,7 +480,7 @@ pub fn run_one_alignment(
           | AlignmentError::SemanticOutOfVocab(p) => p.language(),
         };
         eprintln!(
-          "whispery alignment recovered chunk={:?} kind={err:?} language={language:?}",
+          "asry alignment recovered chunk={:?} kind={err:?} language={language:?}",
           job.chunk_id,
         );
       }
@@ -954,7 +954,7 @@ fn dispatch_runs(
             };
             let run_chars = run.text().chars().count();
             eprintln!(
-              "whispery alignment recovered chunk={:?} run_language={:?} run_bounds={:?} \
+              "asry alignment recovered chunk={:?} run_language={:?} run_bounds={:?} \
  run_chars={run_chars} kind={err:?} dropped_failure_language={language:?}",
               job.chunk_id,
               run.language(),
@@ -1077,7 +1077,7 @@ fn run_audio_slice(
   // dispatch logger then counts it as unaligned.
   if lo_u64 >= samples_len as u64 {
     eprintln!(
-      "whispery alignment Run bounds appear out-of-chunk: \
+      "asry alignment Run bounds appear out-of-chunk: \
  audio_t0_ms={t0} audio_t1_ms={t1} chunk_samples_len={samples_len}; \
  check your AsrSource — Run::audio_t*_ms must be chunk-local ms, not stream-absolute"
     );

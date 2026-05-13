@@ -9,7 +9,7 @@
 use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
-use whispery::{AsrResult, Command, Event, Lang, Transcriber, TranscriberOptions, VadSegment};
+use asry::{AsrResult, Command, Event, Lang, Transcriber, TranscriberOptions, VadSegment};
 
 fn main() {
   // Output timebase: original media at 48 kHz.

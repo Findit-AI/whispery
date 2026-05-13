@@ -3,7 +3,7 @@
 use core::{num::NonZeroU32, time::Duration};
 
 use mediatime::{Timebase, Timestamp};
-use whispery::{
+use asry::{
   AsrResult, Command, Event, Lang, LanguagePolicy, Transcriber, TranscriberOptions, VadSegment,
 };
 

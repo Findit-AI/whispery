@@ -737,7 +737,7 @@ impl Aligner {
     .map_err(|e| classify_encode_abort(abort_flag, e))?;
 
     // Diagnostic: when the parity harness sets
-    // `WHISPERY_PARITY_DUMP_TRELLIS` to a directory, write a
+    // `ASRY_PARITY_DUMP_TRELLIS` to a directory, write a
     // per-segment `wy_seg<N>.emission.bin` and (after the trellis
     // step below) `wy_seg<N>.trellis.bin` plus a
     // `wy_seg<N>.tokens.json` companion. The `<N>` counter is a
@@ -754,7 +754,7 @@ impl Aligner {
     {
       use core::sync::atomic::AtomicUsize;
       static SEG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-      if let Ok(dir) = std::env::var("WHISPERY_PARITY_DUMP_TRELLIS") {
+      if let Ok(dir) = std::env::var("ASRY_PARITY_DUMP_TRELLIS") {
         let n = SEG_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir_path = std::path::PathBuf::from(dir);
         let _ = std::fs::create_dir_all(&dir_path);
@@ -855,7 +855,7 @@ impl Aligner {
     {
       use core::sync::atomic::AtomicUsize;
       static TRELLIS_COUNTER: AtomicUsize = AtomicUsize::new(0);
-      if let Ok(dir) = std::env::var("WHISPERY_PARITY_DUMP_TRELLIS") {
+      if let Ok(dir) = std::env::var("ASRY_PARITY_DUMP_TRELLIS") {
         let n = TRELLIS_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir_path = std::path::PathBuf::from(dir);
         let trellis = crate::runner::aligner::algorithm::trellis_beam::get_trellis(
@@ -1226,7 +1226,7 @@ fn load_tokenizer_with_compat(path: &Path) -> Result<Tokenizer, RunnerError> {
 /// don't guess).
 ///
 /// Implemented with a hand-rolled quote-aware JSON scanner rather
-/// than a full `serde_json::Value` round-trip, because whispery
+/// than a full `serde_json::Value` round-trip, because asry
 /// avoids the `serde_json` runtime dep on the alignment feature
 /// (the bundled vocab is parsed at build time; parity-dump JSON
 /// is hand-formatted). Flagged that the previous
@@ -2036,7 +2036,7 @@ mod tests {
   /// short-circuit returns before `encode_log_softmax` runs).
   ///
   /// Skips when the build.rs fixture isn't present (offline /
-  /// `WHISPERY_OFFLINE=1`); aligner_load already verifies the
+  /// `ASRY_OFFLINE=1`); aligner_load already verifies the
   /// fixture loads, so we know `Aligner::from_paths` succeeds
   /// when the env vars are set.
   #[test]
@@ -2047,11 +2047,11 @@ mod tests {
 
     use crate::runner::aligner::normalizers::EnglishNormalizer;
 
-    let model_path = match option_env!("WHISPERY_W2V_MODEL") {
+    let model_path = match option_env!("ASRY_W2V_MODEL") {
       Some(p) => p,
       None => return,
     };
-    let tokenizer_path = match option_env!("WHISPERY_W2V_TOKENIZER") {
+    let tokenizer_path = match option_env!("ASRY_W2V_TOKENIZER") {
       Some(p) => p,
       None => return,
     };
@@ -2116,11 +2116,11 @@ mod tests {
 
     use crate::runner::aligner::normalizers::EnglishNormalizer;
 
-    let model_path = match option_env!("WHISPERY_W2V_MODEL") {
+    let model_path = match option_env!("ASRY_W2V_MODEL") {
       Some(p) => p,
       None => return,
     };
-    let tokenizer_path = match option_env!("WHISPERY_W2V_TOKENIZER") {
+    let tokenizer_path = match option_env!("ASRY_W2V_TOKENIZER") {
       Some(p) => p,
       None => return,
     };
@@ -2186,11 +2186,11 @@ mod tests {
 
     use crate::runner::aligner::default_normalizer_for;
 
-    let model_path = match option_env!("WHISPERY_W2V_JA_MODEL") {
+    let model_path = match option_env!("ASRY_W2V_JA_MODEL") {
       Some(p) => p,
       None => return,
     };
-    let tokenizer_path = match option_env!("WHISPERY_W2V_JA_TOKENIZER") {
+    let tokenizer_path = match option_env!("ASRY_W2V_JA_TOKENIZER") {
       Some(p) => p,
       None => return,
     };
@@ -2239,11 +2239,11 @@ mod tests {
 
     use crate::runner::aligner::default_normalizer_for;
 
-    let model_path = match option_env!("WHISPERY_W2V_ZH_MODEL") {
+    let model_path = match option_env!("ASRY_W2V_ZH_MODEL") {
       Some(p) => p,
       None => return,
     };
-    let tokenizer_path = match option_env!("WHISPERY_W2V_ZH_TOKENIZER") {
+    let tokenizer_path = match option_env!("ASRY_W2V_ZH_TOKENIZER") {
       Some(p) => p,
       None => return,
     };
@@ -2301,11 +2301,11 @@ mod tests {
 
     use crate::runner::aligner::default_normalizer_for;
 
-    let model_path = match option_env!("WHISPERY_W2V_KO_MODEL") {
+    let model_path = match option_env!("ASRY_W2V_KO_MODEL") {
       Some(p) => p,
       None => return,
     };
-    let tokenizer_path = match option_env!("WHISPERY_W2V_KO_TOKENIZER") {
+    let tokenizer_path = match option_env!("ASRY_W2V_KO_TOKENIZER") {
       Some(p) => p,
       None => return,
     };
@@ -2408,8 +2408,8 @@ mod tests {
   fn spanish_aligner_loads_and_short_circuits_on_empty_text() {
     let _ = try_smoke_latin_aligner(
       Lang::Es,
-      option_env!("WHISPERY_W2V_ES_MODEL"),
-      option_env!("WHISPERY_W2V_ES_TOKENIZER"),
+      option_env!("ASRY_W2V_ES_MODEL"),
+      option_env!("ASRY_W2V_ES_TOKENIZER"),
     );
   }
 
@@ -2419,8 +2419,8 @@ mod tests {
   fn french_aligner_loads_and_short_circuits_on_empty_text() {
     let _ = try_smoke_latin_aligner(
       Lang::Fr,
-      option_env!("WHISPERY_W2V_FR_MODEL"),
-      option_env!("WHISPERY_W2V_FR_TOKENIZER"),
+      option_env!("ASRY_W2V_FR_MODEL"),
+      option_env!("ASRY_W2V_FR_TOKENIZER"),
     );
   }
 
@@ -2430,8 +2430,8 @@ mod tests {
   fn german_aligner_loads_and_short_circuits_on_empty_text() {
     let _ = try_smoke_latin_aligner(
       Lang::De,
-      option_env!("WHISPERY_W2V_DE_MODEL"),
-      option_env!("WHISPERY_W2V_DE_TOKENIZER"),
+      option_env!("ASRY_W2V_DE_MODEL"),
+      option_env!("ASRY_W2V_DE_TOKENIZER"),
     );
   }
 
@@ -2441,8 +2441,8 @@ mod tests {
   fn italian_aligner_loads_and_short_circuits_on_empty_text() {
     let _ = try_smoke_latin_aligner(
       Lang::It,
-      option_env!("WHISPERY_W2V_IT_MODEL"),
-      option_env!("WHISPERY_W2V_IT_TOKENIZER"),
+      option_env!("ASRY_W2V_IT_MODEL"),
+      option_env!("ASRY_W2V_IT_TOKENIZER"),
     );
   }
 
@@ -2452,8 +2452,8 @@ mod tests {
   fn portuguese_aligner_loads_and_short_circuits_on_empty_text() {
     let _ = try_smoke_latin_aligner(
       Lang::Pt,
-      option_env!("WHISPERY_W2V_PT_MODEL"),
-      option_env!("WHISPERY_W2V_PT_TOKENIZER"),
+      option_env!("ASRY_W2V_PT_MODEL"),
+      option_env!("ASRY_W2V_PT_TOKENIZER"),
     );
   }
 }

@@ -1,6 +1,6 @@
 //! [`AsrSource`] — pluggable, thread-free ASR backend trait.
 //!
-//! Whispery is positioned as Sans-I/O: the library exposes
+//! Asry is positioned as Sans-I/O: the library exposes
 //! sync compute primitives, and threading / cancellation /
 //! lifecycle is the caller's responsibility. `AsrSource` is
 //! the canonical primitive for "give me a chunk of audio,
@@ -22,7 +22,7 @@
 //! Whisper.cpp's `set_abort_callback` already polls the flag
 //! at progress-callback boundaries; flipping it from the
 //! caller's runtime causes the in-flight inference to unwind
-//! at the next callback. No whispery-side threads are spawned.
+//! at the next callback. No asry-side threads are spawned.
 
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -76,7 +76,7 @@ pub struct AsrChunkContext<'a> {
   /// Caller-supplied chunk identity — surfaces back into
   /// [`WorkFailure::Asr`](crate::types::WorkFailure::Asr) /
   /// [`WorkFailure::WorkerHang`](crate::types::WorkFailure::WorkerHang)
-  /// telemetry. Whispery does not assign chunk ids itself.
+  /// telemetry. Asry does not assign chunk ids itself.
   chunk_id: ChunkId,
 }
 
@@ -127,7 +127,7 @@ impl<'a> AsrChunkContext<'a> {
 /// instance; users construct N of these for N parallel
 /// inference slots.
 ///
-/// **No internal threads.** Whispery wires whisper.cpp's
+/// **No internal threads.** Asry wires whisper.cpp's
 /// abort callback to the caller-supplied `abort_flag`; the
 /// caller's runtime is responsible for flipping the flag
 /// (timer, cancellation token, signal handler, etc.).

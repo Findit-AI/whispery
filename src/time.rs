@@ -1,18 +1,18 @@
-//! Time constants for whispery.
+//! Time constants for asry.
 //!
-//! whispery operates on **two timebases**:
+//! asry operates on **two timebases**:
 //!
 //! - **Internal (analysis) timebase = `1/16_000`.** All cut decisions,
 //!   `SampleBuffer` indexing, and CTC alignment happen in 16 kHz
 //!   sample-index space.
 //! - **External (output) timebase = caller-chosen.** Every public
-//!   [`mediatime::TimeRange`] whispery emits is in the timebase of
+//!   [`mediatime::TimeRange`] asry emits is in the timebase of
 //!   the caller's first `handle_samples` call.
 
 use core::num::NonZeroU32;
 use mediatime::Timebase;
 
-/// Internal analysis sample rate. All audio fed to whispery must
+/// Internal analysis sample rate. All audio fed to asry must
 /// already be resampled to this rate (caller's responsibility).
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 
@@ -32,7 +32,7 @@ const SAMPLE_RATE_NZ: NonZeroU32 = nz(SAMPLE_RATE_HZ);
 
 /// Internal analysis timebase (`1 / 16_000`). Used by the cut state
 /// machine, the sample buffer, and the alignment pipeline. Not part
-/// of whispery's public output surface — every emitted `TimeRange`
+/// of asry's public output surface — every emitted `TimeRange`
 /// is in the caller's external timebase.
 pub const ANALYSIS_TIMEBASE: Timebase = Timebase::new(1, SAMPLE_RATE_NZ);
 

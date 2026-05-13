@@ -190,7 +190,7 @@ impl Word {
   /// Per-word language, when the script-dispatch pass tagged this
   /// word's run. `None` when alignment was driven without
   /// dispatch (e.g. the legacy single-language path or the
-  /// placeholder builder used in tests). Whispery's runner
+  /// placeholder builder used in tests). Asry's runner
   /// always populates this for words emitted via
   /// `crate::align::dispatch`.
   pub fn language(&self) -> Option<&Lang> {

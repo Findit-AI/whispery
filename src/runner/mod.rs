@@ -3,7 +3,7 @@
 //!
 //! ## Migration in progress
 //!
-//! Whispery is moving to a Sans-I/O posture (per its
+//! Asry is moving to a Sans-I/O posture (per its
 //! `Cargo.toml` charter, matching whisperX's function-style
 //! API): threading and lifecycle become the caller's
 //! responsibility. The new public primitives are:
@@ -26,9 +26,9 @@
 //! use core::num::NonZeroU32;
 //! use std::sync::{Arc, atomic::AtomicBool};
 //! use mediatime::{TimeRange, Timebase};
-//! use whispery::{AlignWorkItem, run_one_alignment};
-//! use whispery::core::Command;
-//! use whispery::ort::session::RunOptions;
+//! use asry::{AlignWorkItem, run_one_alignment};
+//! use asry::core::Command;
+//! use asry::ort::session::RunOptions;
 //!
 //! let abort_flag = Arc::new(AtomicBool::new(false));
 //! // Allocate a FRESH `RunOptions` per alignment chunk
@@ -58,14 +58,14 @@
 //!       // by the events `detect_oov` produces for that run's
 //!       // text + language. Whole-chunk fallback (when `runs`
 //!       // is empty) gets one inner vec.
-//!       let oov_decisions: Vec<Vec<whispery::core::ResolvedOov>> =
+//!       let oov_decisions: Vec<Vec<asry::core::ResolvedOov>> =
 //!         if runs.is_empty() {
 //!           let events = alignment_set.detect_oov(&text, &language)?;
-//!           vec![whispery::core::default_oov_decisions(&events)]
+//!           vec![asry::core::default_oov_decisions(&events)]
 //!         } else {
 //!           alignment_set.detect_oov_per_run(&runs)?
 //!             .iter()
-//!             .map(|ev| whispery::core::default_oov_decisions(ev))
+//!             .map(|ev| asry::core::default_oov_decisions(ev))
 //!             .collect()
 //!         };
 //!       // `AlignWorkItem::from_run_alignment` flips the

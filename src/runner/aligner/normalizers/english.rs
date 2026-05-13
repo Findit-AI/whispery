@@ -5,7 +5,7 @@
 //! [`crate::runner::aligner::normalizers::LatinNormalizer`]
 //! parameterised by `Lang::En`. This file keeps the
 //! [`EnglishNormalizer`] symbol stable so existing call sites
-//! (`whispery::EnglishNormalizer`, `runner::EnglishNormalizer`,
+//! (`asry::EnglishNormalizer`, `runner::EnglishNormalizer`,
 //! tests, examples, parity binaries) keep compiling unchanged.
 //!
 //! Behaviour is identical to the legacy `EnglishNormalizer`:

@@ -1,11 +1,11 @@
 [package]
-name        = "whispery"
+name        = "asry"
 version     = "0.1.0"
 edition      = "2024"
 rust-version = "1.95"
 license     = "MIT OR Apache-2.0"
 description = "Sans-I/O cut/batch/whisper/align state machine for speech-to-text indexing pipelines"
-repository  = "https://github.com/findit-studio/whispery"
+repository  = "https://github.com/Findit-AI/asry"
 readme      = "README.md"
 keywords    = ["whisper", "asr", "speech-to-text", "indexing", "alignment"]
 categories  = ["multimedia::audio", "science"]
@@ -25,7 +25,7 @@ alignment = ["runner", "dep:ort", "dep:tokenizers", "dep:ndarray"]
 metal  = ["runner", "whispercpp/metal"]
 coreml = ["runner", "whispercpp/coreml"]
 # Re-exports `pub(crate)` alignment internals (scalar/NEON normaliser
-# variants, raw `ctc_viterbi`, `LogProbsTV`) under `whispery::__bench`
+# variants, raw `ctc_viterbi`, `LogProbsTV`) under `asry::__bench`
 # so the SIMD baseline bench can call them directly. Doc-hidden;
 # never enable in shipping builds. Requires `alignment` for the
 # wav2vec2-pipeline symbols it exposes.
@@ -35,7 +35,7 @@ bench-internals = ["alignment"]
 # (matching WhisperX's `*`-placeholder behaviour 1:1). Default policy
 # drops the chunk on `&` / `,` / etc. that aren't on the skippable-
 # internal-punct whitelist; under this feature they all wildcard.
-# Trade-off: full WhisperX parity at the cost of whispery's stricter
+# Trade-off: full WhisperX parity at the cost of asry's stricter
 # guard against silently aligning pronounced symbols (`&` in `AT&T`)
 # to whichever vocab item happens to win the frame. Off by default;
 # opt in only if downstream consumers expect WhisperX-1:1 behaviour.
@@ -48,7 +48,7 @@ bench-internals = ["alignment"]
 # data, not a compile-time flag.
 # Diagnostic-only: write `wy_seg<N>.{emission,trellis}.bin` and a
 # `wy_seg<N>.tokens.json` companion to the directory pointed to by
-# `WHISPERY_PARITY_DUMP_TRELLIS` whenever set on a process running
+# `ASRY_PARITY_DUMP_TRELLIS` whenever set on a process running
 # `Aligner::align_chunk`. The dump uses hand-formatted JSON for the
 # tokens companion (no serde_json runtime dep) and `std::fs::File`
 # directly. Do NOT enable in shipping builds — the env hook + dump
@@ -189,7 +189,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 # too_many_arguments = "allow"
 
 [lib]
-name = "whispery"
+name = "asry"
 path = "src/lib.rs"
 
 [[example]]

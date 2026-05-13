@@ -17,8 +17,8 @@ use crate::runner::aligner::{
 /// # #[cfg(feature = "alignment")]
 /// # {
 /// use std::path::Path;
-/// use whispery::{AlignmentSet, AlignmentSetBuilder, AlignerKey, Aligner};
-/// use whispery::{AlignmentFallback, EnglishNormalizer, Lang};
+/// use asry::{AlignmentSet, AlignmentSetBuilder, AlignerKey, Aligner};
+/// use asry::{AlignmentFallback, EnglishNormalizer, Lang};
 ///
 /// let aligner = Aligner::from_paths(
 /// Lang::En,

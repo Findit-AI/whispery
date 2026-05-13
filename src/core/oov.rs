@@ -3,7 +3,7 @@
 //!
 //! ## Where these flow
 //!
-//! Whispery's alignment dispatcher is Sans-I/O: the library
+//! Asry's alignment dispatcher is Sans-I/O: the library
 //! never owns ASR / alignment workers, never calls back into
 //! caller code, and never blocks on user policy. Per-chunk
 //! OOV policy is supplied alongside the alignment work item
@@ -42,7 +42,7 @@
 //! wrong word ranges on pronounced symbols (`&` in `AT&T` is
 //! pronounced as the word "and"; aligning it to whichever vocab
 //! item wins the frame yields confidently-wrong timing).
-//! Whispery's earlier defaults baked the policy into the
+//! Asry's earlier defaults baked the policy into the
 //! tokenizer (`whisperx-strict-tokenizer` Cargo feature
 //! flipped between fail-closed and wildcard-all) — that
 //! denied the caller per-language / per-deployment / per-call
@@ -86,7 +86,7 @@ pub enum OovKind {
   BoundaryPunct,
   /// Internal-punctuation wildcard: a `.` (or other
   /// `is_skippable_internal_punct` char) appears inside a
-  /// word; whispery emits a wildcard at the source position
+  /// word; asry emits a wildcard at the source position
   /// so dotted acronyms like `U.S.A` align as `U * S * A`.
   /// Carries the offending char for callers that want to
   /// distinguish (e.g. allow `.` but fail other internal
@@ -294,7 +294,7 @@ impl ResolvedOov {
 /// cripple normal English alignment.
 ///
 /// Encodes the "WhisperX-style alphanumeric, fail-closed-on-
-/// pronounced" behaviour whispery shipped before the
+/// pronounced" behaviour asry shipped before the
 /// `whisperx-strict-tokenizer` Cargo feature was removed.
 ///
 /// Pure caller-side helper. Callers wanting per-language /

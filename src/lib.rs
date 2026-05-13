@@ -31,14 +31,14 @@ pub use align::{BoundsSource, Run, SegmentLike, dispatch_segments};
 #[cfg_attr(docsrs, doc(cfg(feature = "runner")))]
 pub use align::dispatch;
 
-// Re-exports of mediatime types that appear in whispery's public API
+// Re-exports of mediatime types that appear in asry's public API
 // (so consumers don't need to add a separate `mediatime` dependency
 // just to name them; they may still do so to call methods like
 // `rescale_to`).
 //
-// SemVer note: re-exporting mediatime types ties whispery's public
+// SemVer note: re-exporting mediatime types ties asry's public
 // API to mediatime's. A breaking change in mediatime (major-version
-// bump) is automatically a breaking change for whispery, so the
+// bump) is automatically a breaking change for asry, so the
 // `mediatime` dependency is pinned to a single major in Cargo.toml.
 pub use mediatime::{TimeRange, Timebase, Timestamp};
 
@@ -63,13 +63,13 @@ pub mod runner;
 pub use runner::{AsrChunkContext, AsrSource, RunnerError, WhisperAsrSource};
 
 // Re-export whisper-cpp types that appear on the runner's public
-// API. The aliases preserve whispery's existing
+// API. The aliases preserve asry's existing
 // `WhisperContext` / `WhisperContextParameters` public symbols
 // (so external callers don't see the migration) while mapping
 // onto the in-house `whisper-cpp` crate.
 //
 // SemVer note: same shape as the mediatime situation —
-// re-exporting pins whispery's public API to whisper-cpp's
+// re-exporting pins asry's public API to whisper-cpp's
 // semver, but whisper-cpp is a path dep we own so the
 // constraint is internal.
 #[cfg(feature = "runner")]
@@ -88,9 +88,9 @@ pub use runner::{
 
 // Re-export ort types that appear on the alignment public API.
 //
-// SemVer note: re-exporting pins whispery's public API to ort's
+// SemVer note: re-exporting pins asry's public API to ort's
 // semver. Cargo.toml pins ort to =2.0.0-rc.12; bumping it requires
-// a matching whispery-major bump.
+// a matching asry-major bump.
 #[cfg(feature = "alignment")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alignment")))]
 pub use ort;

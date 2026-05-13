@@ -9,7 +9,7 @@ use smol_str::{SmolStr, format_smolstr};
 use crate::types::{AlignmentError, AlignmentFailure, Lang, WorkFailure};
 
 // NOTE on the (1, T) reshape: the plan's literal pseudocode uses
-// `ndarray::Array2::from_shape_vec((1, T), …)`, but whispery declares
+// `ndarray::Array2::from_shape_vec((1, T), …)`, but asry declares
 // `ndarray = "0.16"` while `ort 2.0.0-rc.12` re-exports `ndarray
 // 0.17` internally — `Tensor::from_array(Array<T, D>)` only resolves
 // for ort's own ndarray version, so the two `ndarray` crates collide

@@ -9,9 +9,9 @@ mmap above it. Two-phase ownership (`SpillBytesMut` writer → `freeze` →
 `SpillBytes` reader, `Arc`-cloneable + `Send + Sync`) gives mutable fill
 plus cheap-clone fan-out.
 
-We want both dia and whispery to use the same implementation. A new
+We want both dia and asry to use the same implementation. A new
 crate (working name **TBD** — `spillbuf`? `spill-bytes`?) hosts the type
-and the `SpillOptions` config; dia and whispery depend on it.
+and the `SpillOptions` config; dia and asry depend on it.
 
 ### Migration steps
 
@@ -24,12 +24,12 @@ and the `SpillOptions` config; dia and whispery depend on it.
       existing call sites (`pdist`, `reconstruct/algo.rs`, `aggregate/count.rs`,
       `streaming/offline_diarizer.rs`) need no change. Bump dia's
       Cargo.toml.
-- [ ] whispery: add the crate as a dependency under the existing
+- [ ] asry: add the crate as a dependency under the existing
       `runner` feature (it's `std`-only). No-std pure-core stays clean.
 
-### Whispery integration — what actually spills
+### Asry integration — what actually spills
 
-Inventory of whispery allocations and the verdict for each:
+Inventory of asry allocations and the verdict for each:
 
 | Allocation | Size | Sized once? | `T: Pod`? | Verdict |
 |---|---|---|---|---|
@@ -104,9 +104,9 @@ transparently copies itself to a tempfile-mmap when `grow()` would push
 past a runtime threshold. Untyped (`&[u8]`), single-threaded,
 length-prefixed slice records.
 
-**Why it's not a fit for whispery:**
+**Why it's not a fit for asry:**
 
-| Aspect | What whispery needs | What zuffer offers |
+| Aspect | What asry needs | What zuffer offers |
 |---|---|---|
 | The only push-grow buffer (`SampleBuffer.samples`) | ring buffer (append + **trim-from-front** + random read by absolute sample index) | stack (append + reset only — no front-trim) |
 | All large allocations | sized once at construction (per-chunk audio, trellis, emission) | growable |
@@ -119,7 +119,7 @@ trims a prefix on every chunk emit — the zuffer API has no equivalent
 operation. Reshaping zuffer into a ring buffer would be a redesign,
 not a polish.
 
-**Where zuffer's *idea* would matter for whispery:** if a future
+**Where zuffer's *idea* would matter for asry:** if a future
 feature lets users buffer arbitrarily long audio without VAD-driven
 chunk emission, peak `SampleBuffer.samples` size would no longer be
 bounded by `chunk_size_samples`. Today it is — the cut state machine

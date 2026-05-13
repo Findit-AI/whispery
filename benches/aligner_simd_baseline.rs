@@ -21,10 +21,10 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use std::hint::black_box;
 
 #[cfg(target_arch = "aarch64")]
-use whispery::__bench::neon;
+use asry::__bench::neon;
 #[cfg(target_arch = "x86_64")]
-use whispery::__bench::{x86_avx2, x86_avx512, x86_sse41};
-use whispery::{
+use asry::__bench::{x86_avx2, x86_avx512, x86_sse41};
+use asry::{
   __bench::{LogProbsTV, get_trellis, scalar, zero_mean_unit_var_normalize},
   Lang,
 };

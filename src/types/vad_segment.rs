@@ -1,7 +1,7 @@
 //! `VadSegment` — silero-shaped speech segment in 16 kHz analysis
 //! indices.
 
-/// Speech segment as 16 kHz analysis-frame indices. Whispery accepts
+/// Speech segment as 16 kHz analysis-frame indices. Asry accepts
 /// silero-shaped input via this type and converts to output-timebase
 /// `TimeRange`s internally; the caller never does PTS arithmetic for
 /// VAD inputs.

@@ -1,26 +1,26 @@
 //! Port of WhisperX's `tests/test_word_timestamp_interpolation.py`
-//! (8 tests) onto whispery's CTC alignment pipeline.
+//! (8 tests) onto asry's CTC alignment pipeline.
 //!
 //! Source: `whisperX/tests/test_word_timestamp_interpolation.py`
 //! covers wildcard / unknown-character handling end-to-end through
 //! `align()`. The Python tests use a `MagicMock` torchaudio model
 //! plus a hand-crafted emission matrix; here we reach the same
 //! invariants by building a `LogProbsTV` directly (skipping the
-//! ONNX encode stage) and calling whispery's
+//! ONNX encode stage) and calling asry's
 //! `align_to_word_segments` orchestrator from the doc-hidden
 //! `__bench` namespace.
 //!
 //! ## Strategies
 //!
 //! 1. **Default policy (tests 1-6, 8):** unconditional `#[test]`.
-//!    Whispery wildcards alphanumeric OOV chars, matching WhisperX
+//!    Asry wildcards alphanumeric OOV chars, matching WhisperX
 //!    on every test that doesn't involve a non-alphanumeric
 //!    pronounced symbol.
 //! 2. **Relaxed policy (test 7):** gated behind
 //!    `#[cfg(feature = "whisperx-strict-tokenizer")]`. Test 7
 //!    (`test_issue_1372_digits_comma_no_timestamps`) uses `"4,9"`
 //!    where the comma is a non-alphanumeric pronounced char.
-//!    Default whispery drops the chunk; the strict-tokenizer
+//!    Default asry drops the chunk; the strict-tokenizer
 //!    feature relaxes that policy to wildcard the comma instead,
 //!    matching WhisperX 1:1.
 //!
@@ -30,7 +30,7 @@
 //! `LogProbsTV` lattice input, the `tokenize_with_word_map`
 //! function, and the `WordSegment` output type are crate-internal.
 //! Out-of-tree consumers reach them only via the doc-hidden
-//! `whispery::__bench` namespace, which is gated on the
+//! `asry::__bench` namespace, which is gated on the
 //! `bench-internals` Cargo feature. The integration test is itself
 //! gated on `bench-internals` (see `Cargo.toml`'s
 //! `required-features = ["bench-internals"]`).
@@ -40,7 +40,7 @@
 use core::sync::atomic::AtomicBool;
 use tokenizers::Tokenizer;
 
-use whispery::{
+use asry::{
   __bench::{
     LogProbsTV, WILDCARD_TOKEN_ID, WordSegment, align_to_word_segments, tokenize_with_word_map,
   },
@@ -177,7 +177,7 @@ fn build_synthetic_emission(num_frames: usize, tokens: &[i32]) -> LogProbsTV {
 }
 
 /// Run align() end-to-end on `text` with `num_frames` frames over
-/// `duration_s` seconds. Uses whispery's historical default OOV
+/// `duration_s` seconds. Uses asry's historical default OOV
 /// policy. Returns one `AlignedWord` per non-empty word in the
 /// text (mirroring WhisperX's `result["word_segments"]`).
 fn run_align(text: &str, num_frames: usize, duration_s: f32) -> Vec<AlignedWord> {
@@ -185,7 +185,7 @@ fn run_align(text: &str, num_frames: usize, duration_s: f32) -> Vec<AlignedWord>
     text,
     num_frames,
     duration_s,
-    whispery::core::default_oov_decisions,
+    asry::core::default_oov_decisions,
   )
 }
 
@@ -198,14 +198,14 @@ fn run_align_with_policy(
   text: &str,
   num_frames: usize,
   duration_s: f32,
-  policy: fn(&[whispery::core::OovEvent]) -> Vec<whispery::core::ResolvedOov>,
+  policy: fn(&[asry::core::OovEvent]) -> Vec<asry::core::ResolvedOov>,
 ) -> Vec<AlignedWord> {
   let tokenizer = load_tokenizer();
   let unk = tokenizer.token_to_id("<unk>");
   let words: Vec<&str> = text.split_whitespace().collect();
   let word_count = words.len();
 
-  let oov_events = whispery::__bench::detect_oov_events(
+  let oov_events = asry::__bench::detect_oov_events(
     &tokenizer,
     text,
     word_count,
@@ -238,7 +238,7 @@ fn run_align_with_policy(
     }
   };
 
-  // Whispery's chunk-drop path returns empty token_ids. Mirror
+  // Asry's chunk-drop path returns empty token_ids. Mirror
   // WhisperX's "no word_segments" response by returning empty.
   if tokenized.token_ids().is_empty() {
     return Vec::new();
@@ -280,7 +280,7 @@ fn run_align_with_policy(
 const DEFAULT_NUM_FRAMES: usize = 100;
 
 // =====================================================================
-// Strategy 1: 7 tests against whispery's default policy.
+// Strategy 1: 7 tests against asry's default policy.
 // =====================================================================
 
 /// **Test 1**: baseline — known chars get timestamps + score.
@@ -405,7 +405,7 @@ fn known_neighbour_score_is_positive_around_unknown() {
 // `whisperx-strict-tokenizer` Cargo feature, now unconditional:
 // the test calls `tokenize_with_word_map` with
 // `wildcard_all_decisions` (the runtime equivalent the feature
-// flipped to). Default policy is whispery's
+// flipped to). Default policy is asry's
 // `default_oov_decisions` (run_align uses that); test 7 opts
 // into the WhisperX 1:1 policy via data, no Cargo feature.
 // =====================================================================
@@ -413,7 +413,7 @@ fn known_neighbour_score_is_positive_around_unknown() {
 /// **Test 7** (regression for whisperX issue #1372): `"4,9"` (digits
 /// + comma) must align under WhisperX semantics.
 ///
-/// Whispery's default policy drops the chunk because `,` is a non-
+/// Asry's default policy drops the chunk because `,` is a non-
 /// alphanumeric pronounced char (the German speaker pronounces it
 /// "Komma"). Calling `tokenize_with_word_map` with
 /// `wildcard_all_decisions` opts into WhisperX's `*` placeholder
@@ -428,7 +428,7 @@ fn issue_1372_digits_comma_no_timestamps() {
     "halt mit 4,9 nicht ins parlament",
     200,
     DEFAULT_DURATION_S,
-    whispery::core::wildcard_all_decisions,
+    asry::core::wildcard_all_decisions,
   );
   let by_word: std::collections::HashMap<&str, &AlignedWord> =
     result.iter().map(|w| (w.word.as_str(), w)).collect();

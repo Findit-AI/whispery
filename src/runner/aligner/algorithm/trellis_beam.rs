@@ -24,7 +24,7 @@
 //! `WordSegment`s directly, so the lattice-state encoding never
 //! reaches `compose.rs`.
 //!
-//! Whispery-specific concerns kept here:
+//! Asry-specific concerns kept here:
 //! - **Watchdog / abort flag** — checked once per frame row in the
 //! forward DP and once per beam-step iteration so a pathological
 //! token sequence × T pair can't hold the alignment worker past
@@ -120,7 +120,7 @@ impl CharSegment {
 /// One word-level segment, the output of `merge_words`.
 ///
 /// `pub` for the `feature = "bench-internals"` re-export — out-of-
-/// tree code only sees this through doc-hidden `whispery::__bench`.
+/// tree code only sees this through doc-hidden `asry::__bench`.
 #[derive(Debug, Clone)]
 pub struct WordSegment {
   /// Word index in `original_words` / `word_idx_per_token`.
@@ -627,7 +627,7 @@ pub fn backtrack_beam(
       // decision, and would also break parity for the same
       // reason. Both options reduce to the same code path.
       //
-      // **Do not "fix" this comparator.** Whispery's contract is
+      // **Do not "fix" this comparator.** Asry's contract is
       // empirical parity with WhisperX's recorded outputs; the
       // theoretical-DP form is unreachable without a coordinated
       // upstream change. The synthetic regression
@@ -840,7 +840,7 @@ pub(crate) fn merge_repeats(path: &[PathPointPublic]) -> Vec<CharSegment> {
 ///
 /// `is_separator(token_index)` returns `true` when the i-th
 /// token is the word-delimiter `|`. WhisperX uses
-/// `segments[i2].label == "|"`; whispery passes
+/// `segments[i2].label == "|"`; asry passes
 /// `word_idx_per_token[i] == None` for the same purpose.
 ///
 /// `word_idx_for_token(token_index)` maps the token to its
@@ -1183,7 +1183,7 @@ mod tests {
   /// This test pins the empirical-parity behaviour against a
   /// reviewer-style synthetic counterexample: a 2-token trellis
   /// where the predecessor's accumulated value points one way
-  /// and the current-frame emission points the other. Whispery's
+  /// and the current-frame emission points the other. Asry's
   /// path follows the predecessor value (matching WhisperX's
   /// recorded paths); a future refactor that adds emission terms
   /// would change the resulting path and trip this assertion.

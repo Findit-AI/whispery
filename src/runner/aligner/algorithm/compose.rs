@@ -4,7 +4,7 @@
 //! The lattice/path bits live in
 //! [`crate::runner::aligner::algorithm::trellis_beam`]; this module
 //! turns the [`WordSegment`]s produced by `merge_words` into
-//! emitted [`Word`]s, applying whispery's silence-aware post-pass
+//! emitted [`Word`]s, applying asry's silence-aware post-pass
 //! on top of WhisperX's bit-exact frame ranges.
 
 use core::{num::NonZeroU32, time::Duration};
@@ -40,7 +40,7 @@ pub const DEFAULT_MIN_SPEECH_COVERAGE: f32 = 0.5;
 pub const DEFAULT_MAX_INTRA_SILENT_RUN: Duration = Duration::from_millis(80);
 
 /// Single source of truth for the effective samples-per-frame
-/// ratio whispery uses to map encoder frame indices back to
+/// ratio asry uses to map encoder frame indices back to
 /// audio sample indices. Mirrors WhisperX's `alignment.py:279`
 /// `ratio = duration * waveform_segment.size(0) / (trellis.size(0) - 1)`.
 /// See the comment on [`compose_words`]'s `n_samples` /
@@ -271,7 +271,7 @@ pub(crate) fn build_speech_frames(
 ///
 /// `speech_frames` is a length-`T` vector marking which encoder
 /// output frames overlap real speech (true) versus silence-masked
-/// audio (false). Whispery's correctness layer:
+/// audio (false). Asry's correctness layer:
 ///
 /// - **Drop words with low speech coverage**
 /// (`min_speech_coverage`).
@@ -353,7 +353,7 @@ where
       continue;
     }
 
-    // Whispery silence-aware post-pass: compute the speech
+    // Asry silence-aware post-pass: compute the speech
     // coverage and longest contiguous silent run inside the
     // word's bounding span. Both are configurable on `Aligner`;
     // both default to the values described in
