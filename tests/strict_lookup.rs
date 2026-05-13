@@ -16,9 +16,9 @@
 
 #![cfg(feature = "alignment")]
 
-// We name these types via the existing `whispery::runner` path
+// We name these types via the existing `asry::runner` path
 // to keep the test self-contained.
-use whispery::{
+use asry::{
   Lang,
   runner::{AlignmentFallback, AlignmentLookup, AlignmentSetBuilder},
 };

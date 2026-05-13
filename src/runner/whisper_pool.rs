@@ -312,7 +312,7 @@ fn build_template(params: &AsrParams) -> Result<FullParams, WorkFailure> {
     // user-supplied content.
     if let Err(e) = p.set_initial_prompt(prompt.as_str()) {
       eprintln!(
-        "whispery asr initial_prompt rejected by whisper.cpp; \
+        "asry asr initial_prompt rejected by whisper.cpp; \
  continuing without prompt prompt_chars={} error={e:?}",
         prompt.chars().count(),
       );

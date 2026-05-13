@@ -6,7 +6,7 @@
 //!
 //! This test is the direct counterpart to that build.rs path: when
 //! the fixture is present (the `alignment` feature is on AND
-//! `WHISPERY_OFFLINE` is unset), it asserts that `Aligner::from_paths`
+//! `ASRY_OFFLINE` is unset), it asserts that `Aligner::from_paths`
 //! returns `Ok` against the fetched + patched files. Without this
 //! test the patch could silently regress and only `alignment_e2e`
 //! (currently `#[ignore]`'d for unrelated drain-hang reasons) would
@@ -16,10 +16,10 @@
 
 use std::path::Path;
 
-use whispery::{Aligner, EnglishNormalizer, Lang};
+use asry::{Aligner, EnglishNormalizer, Lang};
 
-const W2V_MODEL: Option<&str> = option_env!("WHISPERY_W2V_MODEL");
-const W2V_TOKENIZER: Option<&str> = option_env!("WHISPERY_W2V_TOKENIZER");
+const W2V_MODEL: Option<&str> = option_env!("ASRY_W2V_MODEL");
+const W2V_TOKENIZER: Option<&str> = option_env!("ASRY_W2V_TOKENIZER");
 
 #[test]
 fn from_paths_loads_bundled_wav2vec2_fixtures() {

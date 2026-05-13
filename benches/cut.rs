@@ -4,9 +4,9 @@
 use core::{num::NonZeroU32, time::Duration};
 use std::hint::black_box;
 
+use asry::{Transcriber, TranscriberOptions, VadSegment};
 use criterion::{Criterion, criterion_group, criterion_main};
 use mediatime::{Timebase, Timestamp};
-use whispery::{Transcriber, TranscriberOptions, VadSegment};
 
 fn bench_push_vad(c: &mut Criterion) {
   c.bench_function("handle_vad_segment_x1000", |b| {

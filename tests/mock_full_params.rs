@@ -23,7 +23,7 @@
 
 use std::sync::{Arc, atomic::AtomicBool};
 
-use whispery::core::{AsrParams, SamplingStrategy};
+use asry::core::{AsrParams, SamplingStrategy};
 
 /// Build full_params at every step of a 6-attempt 0.0..1.0 ladder and
 /// assert the params accept the operations a layered-ladder-disabled

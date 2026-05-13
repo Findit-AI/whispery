@@ -2,7 +2,7 @@
 
 #![cfg(feature = "alignment")]
 
-use whispery::{EnglishNormalizer, TextNormalizer};
+use asry::{EnglishNormalizer, TextNormalizer};
 
 #[test]
 fn english_preserves_casing_in_original_words() {

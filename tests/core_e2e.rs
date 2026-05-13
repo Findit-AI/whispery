@@ -2,10 +2,10 @@
 
 use core::{num::NonZeroU32, time::Duration};
 
-use mediatime::{Timebase, Timestamp};
-use whispery::{
+use asry::{
   AsrResult, Command, Event, Lang, LanguagePolicy, Transcriber, TranscriberOptions, VadSegment,
 };
+use mediatime::{Timebase, Timestamp};
 
 fn tb_48k() -> Timebase {
   Timebase::new(1, NonZeroU32::new(48_000).unwrap())

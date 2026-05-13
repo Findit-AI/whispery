@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
-  WHISPERY_FETCH_FIXTURES: '1'
+  ASRY_FETCH_FIXTURES: '1'
 
 jobs:
   # Check formatting (platform-independent, one OS is enough)
@@ -74,14 +74,14 @@ jobs:
 
   # Run tests on some extra platforms
   # `cross`, `sanitizer`, `miri-sb`, `miri-tb` removed: they are
-  # template defaults that don't fit whispery's architecture.
+  # template defaults that don't fit asry's architecture.
   # `Lang` is re-exported from `whispercpp` (gated on `runner`),
   # so even the "pure Rust" build path requires linking
   # whisper.cpp (cmake + C++) and — on the alignment path — ONNX
   # Runtime via load-dynamic. Neither dependency:
   #   * cross-compiles cleanly to the cross-job target list
   #     (wasm, i686, android, etc.) — `cmake + Foundation`
-  #     framework lookups fail before we ever see whispery
+  #     framework lookups fail before we ever see asry
   #     code,
   #   * is meaningfully sanitizable / miri-evaluable from
   #     downstream — any UB those tools would find lives in
@@ -116,7 +116,7 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
     - name: Run build
       # Explicit feature combos rather than `cargo hack
-      # --feature-powerset`: whispery's features aren't
+      # --feature-powerset`: asry's features aren't
       # orthogonal — `Lang` is re-exported from `whispercpp`
       # (gated on `runner`), so any combo without `runner`
       # fails to compile. Apple-only `metal` / `coreml` only
@@ -159,15 +159,15 @@ jobs:
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable
     # Audio parity fixtures (~283 MB of WAV + RTTM) live in the
-    # sibling repo `Findit-AI/audio-fixtures`, NOT in whispery's
+    # sibling repo `Findit-AI/audio-fixtures`, NOT in asry's
     # git history. The fetch is opt-in via
-    # `WHISPERY_FETCH_FIXTURES=1` so the default `cargo test`
+    # `ASRY_FETCH_FIXTURES=1` so the default `cargo test`
     # path stays network-free and fast. Tests that need the
     # fixtures gate themselves on the populated path
     # (`tests/parity/fixtures/<name>/clip_16k.wav`) and
     # short-circuit when absent.
     - name: Fetch audio parity fixtures
-      if: env.WHISPERY_FETCH_FIXTURES == '1'
+      if: env.ASRY_FETCH_FIXTURES == '1'
       shell: bash
       run: bash scripts/fetch_fixtures.sh
     - name: Run test
@@ -205,7 +205,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-coverage-
       - name: Fetch audio parity fixtures
-        if: env.WHISPERY_FETCH_FIXTURES == '1'
+        if: env.ASRY_FETCH_FIXTURES == '1'
         shell: bash
         run: bash scripts/fetch_fixtures.sh
       - name: Run tarpaulin

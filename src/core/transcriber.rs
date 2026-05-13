@@ -215,7 +215,7 @@ impl TranscriberOptions {
   }
 
   /// Maximum chunks in flight. Default 6 (worker_count + 2 for a
-  /// 4-worker runner; whispery's core has no runner context, so
+  /// 4-worker runner; asry's core has no runner context, so
   /// the default is fixed).
   pub const fn max_in_flight(&self) -> usize {
     self.max_in_flight
@@ -386,7 +386,7 @@ impl Default for TranscriberOptions {
 /// `Transcriber` is `Send` (movable across threads) but `!Sync`
 /// (every public mutating method takes `&mut self`). A consumer that
 /// wants to drive it from multiple threads must wrap it in
-/// `Mutex<Transcriber>` themselves; whispery does not provide
+/// `Mutex<Transcriber>` themselves; asry does not provide
 /// internal synchronisation.
 pub struct Transcriber {
   config: TranscriberOptions,
@@ -1783,7 +1783,7 @@ mod tests {
     // Push 16 000 samples (close to cap, but under).
     t.handle_samples(ts(0), &[0.0; 16_000]).unwrap();
     assert_eq!(t.buffered_samples(), 16_000);
-    // Tell whispery VAD has analyzed through sample 16_000 with
+    // Tell asry VAD has analyzed through sample 16_000 with
     // no segments. Buffer should drop everything; the next push
     // can land cleanly even though a contiguous push without
     // the signal would have hit Backpressure (16 000 + 16 000

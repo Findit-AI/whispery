@@ -21,13 +21,13 @@ pub use latin::LatinNormalizer;
 use crate::{runner::aligner::normalizer::TextNormalizer, types::Lang};
 
 /// Pick a built-in normalizer best suited to the given language,
-/// or `None` if whispery doesn't yet ship one whose vocabulary
+/// or `None` if asry doesn't yet ship one whose vocabulary
 /// rules match the language's typical wav2vec2 tokenizer.
 ///
 /// Mirrors WhisperX's `DEFAULT_ALIGN_MODELS_*` coverage: every
 /// language whisperX has a default model for can plug a matching
 /// normalizer through this function — except those whose script
-/// needs custom rules whispery hasn't shipped yet (Arabic,
+/// needs custom rules asry hasn't shipped yet (Arabic,
 /// Cyrillic, Devanagari, Hebrew, Telugu, Malayalam, Georgian,
 /// Greek, Thai). For those, `None` is returned and the caller
 /// must `Box::new` a custom `TextNormalizer` impl.
@@ -55,7 +55,7 @@ use crate::{runner::aligner::normalizer::TextNormalizer, types::Lang};
 ///    Hangul Jamo / Compatibility Jamo / Syllables, no word
 ///    delimiter, `KoreanNormalizer`.
 ///
-/// Returning `None` is whispery saying "we don't have a
+/// Returning `None` is asry saying "we don't have a
 /// pre-built normalizer for this language; you must supply one
 /// yourself". This is intentional — silently picking the wrong
 /// normalizer (e.g., feeding Arabic text through the
@@ -104,7 +104,7 @@ pub fn default_normalizer_for(lang: &Lang) -> Option<Box<dyn TextNormalizer>> {
     | Lang::Pl
     | Lang::Lv => Some(Box::new(LatinNormalizer::new(lang.clone()))),
 
-    // Languages WhisperX supports but whispery has no normalizer
+    // Languages WhisperX supports but asry has no normalizer
     // for yet (different scripts that need custom punctuation /
     // casing / RTL rules). Caller must supply a custom
     // TextNormalizer.
@@ -156,7 +156,7 @@ mod default_normalizer_tests {
   #[test]
   fn unsupported_languages_return_none() {
     // Arabic, Hindi, Russian, Hebrew, Greek — distinct scripts
-    // requiring custom normalizers whispery hasn't shipped.
+    // requiring custom normalizers asry hasn't shipped.
     for lang in [Lang::Ar, Lang::Hi, Lang::Ru, Lang::He, Lang::El] {
       assert!(
         default_normalizer_for(&lang).is_none(),

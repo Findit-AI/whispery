@@ -329,7 +329,7 @@ impl TokenInfo {
 }
 
 /// Centiseconds → milliseconds. whisper.cpp's native time unit
-/// is 10 ms; whispery's API is milliseconds. Multiplication is
+/// is 10 ms; asry's API is milliseconds. Multiplication is
 /// exact for valid centisecond values (no rounding).
 const fn cs_to_ms(cs: i64) -> i64 {
   cs.saturating_mul(10)
@@ -943,7 +943,7 @@ mod runner_glue {
       // falls through to segment / wholeclip bounds.
       if any_token_seen && accumulated.as_slice() != segment_text.as_bytes() {
         std::eprintln!(
-          "[whispery] script_dispatch: token-byte stream diverges from segment text \
+          "[asry] script_dispatch: token-byte stream diverges from segment text \
  (tokens={} bytes={} segment={} bytes); falling back to segment bounds for this \
  segment to avoid mis-attributing DTW timestamps. Likely cause: model tokenisation \
  normalises bytes (leading-space stripping, special-token rendering) the dispatcher \

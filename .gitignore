@@ -19,7 +19,7 @@ Cargo.lock
 
 .claude/
 
-target/whispery-test-fixtures/
+target/asry-test-fixtures/
 docs/
 models/
 
@@ -27,5 +27,5 @@ models/
 # CI (or `scripts/fetch_fixtures.sh` for local runs) populates
 # tests/parity/fixtures/ at test time. The directory MUST stay
 # untracked here so the ~283 MB of WAV blobs never end up in
-# whispery's git history.
+# asry's git history.
 tests/parity/fixtures/

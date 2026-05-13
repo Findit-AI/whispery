@@ -13,7 +13,7 @@ use crate::{
 ///
 /// `pub` for the `feature = "bench-internals"` re-export at the
 /// crate root — out-of-tree code only sees this type through the
-/// doc-hidden `whispery::__bench` namespace.
+/// doc-hidden `asry::__bench` namespace.
 #[derive(Debug)]
 pub struct TokenizedText {
   /// Vocab indices in tokenisation order (Y in spec terms),
@@ -105,14 +105,14 @@ impl TokenizedText {
 /// `clean_char.append('*')` placeholder + `tokens =
 /// [model_dictionary.get(c, -1) for c in text_clean]` flow.
 ///
-/// **Whispery-specific guard (default policy):** non-alphanumeric
+/// **Asry-specific guard (default policy):** non-alphanumeric
 /// chars (e.g. `&` in `AT&T`) that aren't on the whitelist of
 /// skippable internal punctuation still drop the whole chunk's
 /// alignment. WhisperX would silently align them as wildcards too,
 /// but those chars represent semantic content the model can't
 /// reasonably align (the `&` in `AT&T` is "and"); silently aligning
 /// to whichever vocab item happens to win the frame would produce
-/// honest-looking but wrong word ranges. Whispery fails closed at
+/// honest-looking but wrong word ranges. Asry fails closed at
 /// chunk granularity instead.
 ///
 /// **WhisperX-equivalent runtime policy:** callers that want
@@ -189,7 +189,7 @@ fn boundary_fail_closed(language: &Lang, position: &str) -> WorkFailure {
 
 /// `pub` for the `feature = "bench-internals"` re-export at the
 /// crate root. Out-of-tree code only reaches this through
-/// `whispery::__bench`, which is doc-hidden and gated on the
+/// `asry::__bench`, which is doc-hidden and gated on the
 /// `bench-internals` feature.
 #[allow(
   clippy::too_many_arguments,
@@ -381,7 +381,7 @@ pub fn detect_oov_events(
 ///
 /// `pub` for the `feature = "bench-internals"` re-export at
 /// the crate root. Out-of-tree code only reaches this through
-/// `whispery::__bench`, which is doc-hidden and gated on
+/// `asry::__bench`, which is doc-hidden and gated on
 /// `bench-internals`.
 pub fn tokenize_with_word_map(
   tokenizer: &Tokenizer,
@@ -403,7 +403,7 @@ pub fn tokenize_with_word_map(
   // trailing punctuation indistinguishable in the CTC graph.
   //
   // Empty slice means "zero wildcards for every word" (legacy
-  // / non-English-normaliser path); whispery's
+  // / non-English-normaliser path); asry's
   // [`crate::EnglishNormalizer`] populates it from the
   // boundary-punctuation strip count.
   wildcard_boundary_per_word: &[crate::runner::aligner::normalizer::WildcardBoundary],
@@ -1291,9 +1291,9 @@ mod tests {
     );
   }
 
-  /// Whispery-specific guard preserved: non-alphanumeric
+  /// Asry-specific guard preserved: non-alphanumeric
   /// pronounced char (`&` in `AT&T`) still drops the chunk's
-  /// alignment. WhisperX would silently align it; whispery
+  /// alignment. WhisperX would silently align it; asry
   /// fails closed because the `&` is pronounced as "and" and
   /// aligning to whichever vocab item wins the frame produces
   /// a wrong range.
